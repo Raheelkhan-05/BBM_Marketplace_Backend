@@ -90,3 +90,13 @@ export async function sendBusinessVerifiedEmail(toEmail, businessName) {
     html,
   });
 }
+
+// Add alongside sendWelcomeEmail / sendBusinessPendingEmail / sendBusinessVerifiedEmail,
+// reusing whatever transport those already use.
+export async function sendOtpEmail(email, otp) {
+  return sendMail({
+    to: email,
+    subject: "Your verification code",
+    html: `<p>Your verification code is <strong>${otp}</strong>. It expires in 5 minutes.</p>`,
+  });
+}

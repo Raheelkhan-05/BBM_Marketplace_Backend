@@ -41,6 +41,33 @@ export async function devRequestPhoneOtp(req, res) {
   }
 }
 
+// Insert-or-fetch: two concurrent dev-verify calls for the same phone can
+// both reach this point after the initial profile lookup missed. Rather
+// than trusting the insert to always be the first writer, upsert on the
+// primary key and just re-select if a concurrent request beat us to it.
+async function upsertPhoneProfile(userId, phone) {
+  const { data, error } = await supabaseAdmin
+    .from("profiles")
+    .upsert(
+      { id: userId, phone, phone_verified: true, onboarding_step: "contact" },
+      { onConflict: "id", ignoreDuplicates: false }
+    )
+    .select("id")
+    .single();
+
+  if (!error) return data;
+
+  // Even upsert can race on truly simultaneous inserts under READ COMMITTED;
+  // if so, the row now exists — just fetch it.
+  console.warn("[dev-verify] upsert raced, refetching:", error.message);
+  const { data: refetched } = await supabaseAdmin
+    .from("profiles")
+    .select("id")
+    .eq("id", userId)
+    .maybeSingle();
+  return refetched || null;
+}
+
 // POST /api/auth/phone/dev-verify  { phone, otp }
 // Accepts any 6-digit string as the code. Finds-or-creates the profile
 // row for this phone, then issues our own short-lived JWT (NOT a real
@@ -66,16 +93,34 @@ export async function devVerifyPhoneOtp(req, res) {
       .maybeSingle();
 
     if (!profile) {
-      const { data: created, error: createErr } = await supabaseAdmin
-        .from("profiles")
-        .insert({ phone, roles: ["buyer"] })
-        .select("id")
-        .single();
-      if (createErr) {
-        console.error("[dev-verify] profile create failed:", createErr.message);
+      const { data: created, error: createUserErr } = await supabaseAdmin.auth.admin.createUser({
+        phone,
+        phone_confirm: true,
+        user_metadata: { auth_mode: "dev_bypass" },
+      });
+
+      if (createUserErr) {
+        const alreadyExists = /already|exists|registered/i.test(createUserErr.message || "");
+        if (!alreadyExists) {
+          console.error("[dev-verify] auth user create failed:", createUserErr.message);
+          return res.status(500).json({ success: false, message: "Couldn't create account. Try again." });
+        }
+
+        const { data: list, error: listErr } = await supabaseAdmin.auth.admin.listUsers();
+        const existingAuthUser = !listErr && list?.users?.find((u) => u.phone === phone);
+        if (!existingAuthUser) {
+          console.error("[dev-verify] createUser said 'exists' but no match found:", createUserErr.message);
+          return res.status(500).json({ success: false, message: "Couldn't create account. Try again." });
+        }
+
+        profile = await upsertPhoneProfile(existingAuthUser.id, phone);
+      } else {
+        profile = await upsertPhoneProfile(created.user.id, phone);
+      }
+
+      if (!profile) {
         return res.status(500).json({ success: false, message: "Couldn't create account. Try again." });
       }
-      profile = created;
     }
 
     const token = jwt.sign(

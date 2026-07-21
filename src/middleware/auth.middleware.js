@@ -32,7 +32,7 @@ export async function requireAuth(req, res, next) {
     try {
       const payload = jwt.verify(token, process.env.DEV_AUTH_JWT_SECRET);
       if (payload.auth_mode === "dev_bypass") {
-        req.user = { id: payload.sub, phone: payload.phone };
+        req.user = { id: payload.sub, phone: payload.phone, auth_mode: "dev_bypass" };
         req.token = token;
         return next();
       }
