@@ -1,5 +1,3 @@
-// src/app.js
-
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -9,22 +7,44 @@ export function createApp() {
   const app = express();
 
   app.use(helmet());
+
+  const allowedOrigins = (
+    process.env.CLIENT_ORIGINS ||
+    "http://localhost:5173"
+  )
+    .split(",")
+    .map(origin => origin.trim());
+
   app.use(
     cors({
-      origin: process.env.CLIENT_ORIGIN || "http://localhost:5173",
+      origin(origin, callback) {
+        // Allow non-browser requests (Postman, curl, server-to-server)
+        if (!origin) {
+          return callback(null, true);
+        }
+
+        if (allowedOrigins.includes(origin)) {
+          return callback(null, true);
+        }
+
+        return callback(new Error(`CORS blocked for origin: ${origin}`));
+      },
       credentials: true,
     })
   );
+
   app.use(express.json());
 
   app.get("/health", (req, res) => res.json({ ok: true }));
 
   app.use("/api/auth", authRoutes);
 
-  // Central error handler — keeps stack traces out of API responses.
   app.use((err, req, res, next) => {
     console.error(err);
-    res.status(500).json({ success: false, message: "Something went wrong." });
+    res.status(500).json({
+      success: false,
+      message: "Something went wrong.",
+    });
   });
 
   return app;
