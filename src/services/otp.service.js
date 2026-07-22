@@ -28,15 +28,25 @@ export async function issueOtp({ purpose, channel, value, userId = null }) {
       session_id: sessionId, expires_at: new Date(Date.now() + OTP_TTL_MS).toISOString(),
     });
     if (error) throw error;
-  } else {
-    const otp = generateOtp();
-    const { error } = await supabaseAdmin.from("otp_sessions").insert({
-      purpose, channel, user_id: userId, value,
-      otp_hash: hashOtp(otp), expires_at: new Date(Date.now() + OTP_TTL_MS).toISOString(),
-    });
-    if (error) throw error;
-    sendOtpEmail(value, otp).catch((e) => console.error("[otp] email send failed:", e.message));
+  // src/services/otp.service.js
+} else {
+  const otp = generateOtp();
+  const { error } = await supabaseAdmin.from("otp_sessions").insert({
+    purpose, channel, user_id: userId, value,
+    otp_hash: hashOtp(otp), expires_at: new Date(Date.now() + OTP_TTL_MS).toISOString(),
+  });
+  if (error) throw error;
+
+  // await instead of fire-and-forget — Vercel freezes the function
+  // right after the response is sent, so background sends don't
+  // reliably complete there the way they do on a long-running localhost process.
+  try {
+    await sendOtpEmail(value, otp);
+  } catch (e) {
+    console.error("[otp] email send failed:", e.message);
+    throw Object.assign(new Error("Couldn't send the code. Try again."), { status: 502 });
   }
+}
 }
 
 // Returns { ok: true, record } or { ok: false, message, status? }
