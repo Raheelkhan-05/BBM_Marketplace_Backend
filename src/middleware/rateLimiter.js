@@ -13,3 +13,12 @@ export const authWriteLimiter = rateLimit({
   legacyHeaders: false,
   message: { success: false, message: "Too many requests. Please try again shortly." },
 });
+
+// src/middleware/rateLimiter.js — add alongside authWriteLimiter
+export const otpLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many requests. Please try again shortly." },
+});

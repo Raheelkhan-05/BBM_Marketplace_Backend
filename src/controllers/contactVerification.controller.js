@@ -1,101 +1,53 @@
 // src/controllers/contactVerification.controller.js
-//
-// Verifies whichever of email/phone was NOT used as the login identifier.
-// Writes straight to profiles.{field} + profiles.{field}_verified on
-// success — the frontend never sends this value through registerProfile.
-
-import crypto from "crypto";
 import { supabaseAdmin } from "../config/supabase.js";
-import { sendOtpEmail } from "../services/mail.service.js";
+import { issueOtp, checkOtp } from "../services/otp.service.js";
 
-const OTP_TTL_MS = 5 * 60 * 1000;
-const MAX_ATTEMPTS = 5;
-
-function generateOtp() {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-function hashOtp(otp) {
-  return crypto.createHash("sha256").update(otp).digest("hex");
-}
-
-// POST /api/auth/contact/request-otp  { field: 'email'|'phone', value }
 export async function requestContactOtp(req, res) {
   const { field, value } = req.body || {};
   if (!["email", "phone"].includes(field) || !value) {
     return res.status(400).json({ success: false, message: "Invalid field." });
   }
-  if (field === "email" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+  const normalized = field === "email" ? value.trim().toLowerCase() : value;
+  if (field === "email" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) {
     return res.status(400).json({ success: false, message: "Enter a valid email address." });
   }
-  if (field === "phone" && !/^[6-9]\d{9}$/.test(value)) {
+  if (field === "phone" && !/^[6-9]\d{9}$/.test(normalized)) {
     return res.status(400).json({ success: false, message: "Enter a valid 10-digit mobile number." });
   }
 
-  const otp = generateOtp();
-  const { error } = await supabaseAdmin.from("contact_verifications").insert({
-    user_id: req.user.id,
-    field,
-    value,
-    otp_hash: hashOtp(otp),
-    expires_at: new Date(Date.now() + OTP_TTL_MS).toISOString(),
-  });
-  if (error) {
-    console.error("[contact-otp] insert failed:", error.message);
-    return res.status(500).json({ success: false, message: "Couldn't send the code. Try again." });
+  const { data: taken } = await supabaseAdmin
+    .from("profiles").select("id").eq(field, normalized).neq("id", req.user.id).maybeSingle();
+  if (taken) {
+    return res.status(409).json({
+      success: false,
+      message: field === "email" ? "This email is already linked to another account." : "This number is already linked to another account.",
+    });
   }
 
-  if (field === "email") {
-    sendOtpEmail(value, otp).catch((e) => console.error("[contact-otp] email send failed:", e.message));
-  } else {
-    // DEV MODE: no SMS provider wired yet (same situation as
-    // phoneDevAuth.controller.js). Log the code instead of sending it.
-    console.log(`[contact-otp][DEV] OTP for ${value}: ${otp}`);
+  try {
+    await issueOtp({ purpose: "contact_verify", channel: field, value: normalized, userId: req.user.id });
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("[contact-otp] request failed:", e.message);
+    return res.status(502).json({ success: false, message: "Couldn't send the code. Try again." });
   }
-
-  return res.json({ success: true });
 }
 
-// POST /api/auth/contact/verify-otp  { field, value, otp }
 export async function verifyContactOtp(req, res) {
   const { field, value, otp } = req.body || {};
   if (!["email", "phone"].includes(field) || !value || !otp) {
     return res.status(400).json({ success: false, message: "Invalid request." });
   }
+  const normalized = field === "email" ? value.trim().toLowerCase() : value;
 
-  const { data: record } = await supabaseAdmin
-    .from("contact_verifications")
-    .select("*")
-    .eq("user_id", req.user.id)
-    .eq("field", field)
-    .eq("value", value)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  const result = await checkOtp({ purpose: "contact_verify", channel: field, value: normalized, otp, userId: req.user.id });
+  if (!result.ok) return res.status(result.status || 400).json({ success: false, message: result.message });
 
-  if (!record) {
-    return res.status(400).json({ success: false, message: "Request a new code first." });
-  }
-  if (new Date(record.expires_at) < new Date()) {
-    return res.status(400).json({ success: false, message: "Code expired. Request a new one." });
-  }
-  if (record.attempts >= MAX_ATTEMPTS) {
-    return res.status(429).json({ success: false, message: "Too many attempts. Request a new code." });
-  }
-  if (hashOtp(otp) !== record.otp_hash) {
-    await supabaseAdmin.from("contact_verifications").update({ attempts: record.attempts + 1 }).eq("id", record.id);
-    return res.status(400).json({ success: false, message: "Incorrect code." });
-  }
-
-  const patch = field === "email"
-    ? { email: value, email_verified: true }
-    : { phone: value, phone_verified: true };
-
+  const patch = field === "email" ? { email: normalized, email_verified: true } : { phone: normalized, phone_verified: true };
   const { error } = await supabaseAdmin.from("profiles").update(patch).eq("id", req.user.id);
   if (error) {
-    console.error("[contact-otp] profile update failed:", error.message);
+    if (error.code === "23505") return res.status(409).json({ success: false, message: "This is already linked to another account." });
     return res.status(500).json({ success: false, message: "Couldn't verify. Try again." });
   }
-
-  await supabaseAdmin.from("contact_verifications").delete().eq("id", record.id);
   return res.json({ success: true });
 }

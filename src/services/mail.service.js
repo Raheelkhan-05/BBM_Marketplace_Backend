@@ -94,9 +94,16 @@ export async function sendBusinessVerifiedEmail(toEmail, businessName) {
 // Add alongside sendWelcomeEmail / sendBusinessPendingEmail / sendBusinessVerifiedEmail,
 // reusing whatever transport those already use.
 export async function sendOtpEmail(email, otp) {
-  return sendMail({
+  return transporter.sendMail({
+    from: FROM,
     to: email,
     subject: "Your verification code",
-    html: `<p>Your verification code is <strong>${otp}</strong>. It expires in 5 minutes.</p>`,
+    html: shell(
+      "Your verification code",
+      `<p style="margin:0;font-size:14px;line-height:1.6;color:#475569;">
+         Your code is <strong style="font-size:18px;letter-spacing:2px;">${otp}</strong>.
+         It expires in 5 minutes.
+       </p>`
+    ),
   });
 }
