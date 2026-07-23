@@ -1,4 +1,3 @@
-// src/middleware/auth.middleware.js
 import jwt from "jsonwebtoken";
 
 const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET;
@@ -7,7 +6,7 @@ export async function requireAuth(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
 
-  if (!token) {
+  if (!token || token === "undefined" || token === "null") {
     return res.status(401).json({ success: false, message: "Missing authorization token." });
   }
   if (!AUTH_JWT_SECRET) {
