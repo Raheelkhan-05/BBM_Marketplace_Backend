@@ -27,15 +27,22 @@ export async function listSellers(req, res) {
   res.json({ success: true, sellers: data });
 }
 
+// controllers/adminController.js — getSellerDetail: also return the GST reference block
 export async function getSellerDetail(req, res) {
   const { id } = req.params;
-  const [{ data: seller, error }, { data: photos }, { data: certifications }] = await Promise.all([
+  const [{ data: seller, error }, { data: photos }, { data: certifications }, { data: products }] = await Promise.all([
     supabase.from("seller_profiles").select("*, profiles:user_id(name, phone, email)").eq("id", id).maybeSingle(),
     supabase.from("seller_photos").select("*").eq("seller_id", id).order("sort_order"),
     supabase.from("seller_certifications").select("*").eq("seller_id", id),
+    supabase.from("seller_products").select("*").eq("seller_id", id).order("sort_order"),
   ]);
   if (error || !seller) return res.status(404).json({ success: false, message: "Seller not found." });
-  res.json({ success: true, seller, photos: photos || [], certifications: certifications || [] });
+
+  const { data: business } = seller.business_profile_id
+    ? await supabase.from("business_profiles").select("*").eq("id", seller.business_profile_id).maybeSingle()
+    : { data: null };
+
+  res.json({ success: true, seller, business, photos: photos || [], certifications: certifications || [], products: products || [] });
 }
 
 export async function updateSellerAsAdmin(req, res) {
@@ -62,56 +69,90 @@ export async function updateSellerAsAdmin(req, res) {
   res.json({ success: true, seller: data });
 }
 
+// Approve either a first-time submission OR a staged edit on an already-live shop
 export async function approveSeller(req, res) {
   const { id } = req.params;
   const adminId = req.user.id;
 
-  const { data: seller, error } = await supabase
-    .from("seller_profiles")
-    .update({ status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: adminId, rejection_reason: null })
-    .eq("id", id)
-    .select("*, profiles:user_id(email, phone, name)")
-    .single();
+  const { data: seller } = await supabase.from("seller_profiles").select("*, profiles:user_id(email, phone, name)").eq("id", id).maybeSingle();
+  if (!seller) return res.status(404).json({ success: false, message: "Seller not found." });
+
+  let update = { reviewed_at: new Date().toISOString(), reviewed_by: adminId, rejection_reason: null };
+
+  if (seller.status === "pending_review") {
+    update.status = "approved";
+  } else if (seller.status === "approved" && seller.has_pending_changes) {
+    update = { ...update, ...seller.pending_changes, pending_changes: null, has_pending_changes: false };
+  } else {
+    return res.status(400).json({ success: false, message: "Nothing pending for this seller." });
+  }
+
+  const { data: updated, error } = await supabase.from("seller_profiles").update(update).eq("id", id).select("*, profiles:user_id(email, phone, name)").single();
   if (error) return res.status(500).json({ success: false, message: error.message });
 
+  // Clear pending flags on photos/certs together with the profile
+  await Promise.all([
+    supabase.from("seller_photos").update({ pending: false }).eq("seller_id", id).eq("pending", true),
+    supabase.from("seller_certifications").update({ pending: false }).eq("seller_id", id).eq("pending", true),
+  ]);
+
+  const wasFirstApproval = seller.status === "pending_review";
   notifyUser({
-    userId: seller.user_id, type: "seller_approved",
-    title: "Your shop is live! 🎉",
-    body: `${seller.display_name} is now visible to buyers on BBM.`,
-    link: `/shop/${seller.shop_slug}`,
-    email: seller.profiles?.email,
-    emailSubject: "Your BBM seller shop is now live",
-    emailHtml: `<p>Hi ${seller.profiles?.name || "there"},</p><p>Great news — your shop <strong>${seller.display_name}</strong> has been approved and is now live to buyers.</p><p><a href="${process.env.APP_BASE_URL}/shop/${seller.shop_slug}">View your shop</a></p>`,
+    userId: updated.user_id, type: wasFirstApproval ? "seller_approved" : "seller_edit_approved",
+    title: wasFirstApproval ? "Your shop is live! 🎉" : "Your shop updates are live",
+    body: wasFirstApproval ? `${updated.display_name} is now visible to buyers on BBM.` : "Your recent changes have been approved and are now visible to buyers.",
+    link: `/shop/${updated.shop_slug}`,
+    email: updated.profiles?.email,
+    emailSubject: wasFirstApproval ? "Your BBM seller shop is now live" : "Your BBM shop updates are approved",
+    emailHtml: `<p>Hi ${updated.profiles?.name || "there"},</p><p>${wasFirstApproval ? `Your shop <strong>${updated.display_name}</strong> has been approved and is now live to buyers.` : "The changes you made to your shop are now approved and visible to buyers."}</p><p><a href="${process.env.APP_BASE_URL}/shop/${updated.shop_slug}">View your shop</a></p>`,
   }).catch((e) => console.error("[approveSeller] notify failed", e));
 
-  res.json({ success: true, seller });
+  res.json({ success: true, seller: updated });
 }
 
+
+
+// Reject either a first-time submission OR discard a staged edit
 export async function rejectSeller(req, res) {
   const { id } = req.params;
   const { reason } = req.body || {};
   if (!reason?.trim()) return res.status(400).json({ success: false, message: "A rejection reason is required." });
-
   const adminId = req.user.id;
-  const { data: seller, error } = await supabase
-    .from("seller_profiles")
-    .update({ status: "rejected", reviewed_at: new Date().toISOString(), reviewed_by: adminId, rejection_reason: reason.trim() })
-    .eq("id", id)
-    .select("*, profiles:user_id(email, name)")
-    .single();
+
+  const { data: seller } = await supabase.from("seller_profiles").select("*, profiles:user_id(email, name)").eq("id", id).maybeSingle();
+  if (!seller) return res.status(404).json({ success: false, message: "Seller not found." });
+
+  let update = { reviewed_at: new Date().toISOString(), reviewed_by: adminId, rejection_reason: reason.trim() };
+  let shopStaysLive = false;
+
+  if (seller.status === "pending_review") {
+    update.status = "rejected";
+  } else if (seller.status === "approved" && seller.has_pending_changes) {
+    update = { ...update, pending_changes: null, has_pending_changes: false };
+    shopStaysLive = true;
+    // discard staged photos/certs too
+    await Promise.all([
+      supabase.from("seller_photos").delete().eq("seller_id", id).eq("pending", true),
+      supabase.from("seller_certifications").delete().eq("seller_id", id).eq("pending", true),
+    ]);
+  } else {
+    return res.status(400).json({ success: false, message: "Nothing pending for this seller." });
+  }
+
+  const { data: updated, error } = await supabase.from("seller_profiles").update(update).eq("id", id).select("*, profiles:user_id(email, name)").single();
   if (error) return res.status(500).json({ success: false, message: error.message });
 
   notifyUser({
-    userId: seller.user_id, type: "seller_rejected",
-    title: "Action needed on your shop details",
+    userId: updated.user_id, type: "seller_rejected",
+    title: shopStaysLive ? "Your recent shop update wasn't approved" : "Action needed on your shop details",
     body: reason.trim(),
-    link: "/seller/onboarding",
-    email: seller.profiles?.email,
-    emailSubject: "Update needed on your BBM seller application",
-    emailHtml: `<p>Hi ${seller.profiles?.name || "there"},</p><p>We reviewed your seller application for <strong>${seller.display_name}</strong> and need a few changes before approving it:</p><blockquote>${reason.trim()}</blockquote><p><a href="${process.env.APP_BASE_URL}/seller/onboarding">Update your details</a></p>`,
+    link: shopStaysLive ? "/shop/dashboard" : "/seller/onboarding",
+    email: updated.profiles?.email,
+    emailSubject: shopStaysLive ? "Update to your BBM shop wasn't approved" : "Update needed on your BBM seller application",
+    emailHtml: `<p>Hi ${updated.profiles?.name || "there"},</p><p>${shopStaysLive ? "We reviewed the recent changes to your live shop and need a few adjustments before they can go live:" : `We reviewed your seller application for <strong>${updated.display_name}</strong> and need a few changes before approving it:`}</p><blockquote>${reason.trim()}</blockquote>`,
   }).catch((e) => console.error("[rejectSeller] notify failed", e));
 
-  res.json({ success: true, seller });
+  res.json({ success: true, seller: updated });
 }
 
 // Search users by phone/email/name to promote — small result set, no need for pagination yet
