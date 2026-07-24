@@ -29,3 +29,22 @@ export async function getShopBySlug(req, res) {
     products: products || [],
   });
 }
+
+// GET /api/shop/search?q=steel&limit=8
+export async function searchShops(req, res) {
+  const { q, limit = 8 } = req.query;
+  if (!q || q.trim().length < 2) return res.json({ success: true, shops: [] });
+
+  const term = q.trim();
+
+  const { data, error } = await supabase
+    .from("seller_profiles")
+    .select("id, shop_slug, display_name, logo_url, city, state, business_type, categories, products_brands")
+    .eq("status", "approved") // only ever surface live, approved shops publicly
+    .or(`display_name.ilike.%${term}%,categories.cs.["${term}"],products_brands.cs.["${term}"]`)
+    .order("display_name")
+    .limit(Number(limit) || 8);
+
+  if (error) return res.status(500).json({ success: false, message: error.message });
+  res.json({ success: true, shops: data || [] });
+}
