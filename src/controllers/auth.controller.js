@@ -17,11 +17,11 @@ export async function getMe(req, res) {
   }
 
   // inside getMe, alongside the existing profile fetch
-  const { data: seller } = await supabase.from("seller_profiles").select("status").eq("user_id", req.user.id).maybeSingle();
+  const { data: seller } = await supabase.from("seller_profiles").select("status, shop_slug").eq("user_id", req.user.id).maybeSingle();
 
   const { data: businessProfile } = await supabaseAdmin
     .from("business_profiles").select("*").eq("user_id", req.user.id).maybeSingle();
-  return res.json({ success: true, profile, businessProfile: businessProfile || null, seller_status: seller?.status ?? null });
+  return res.json({ success: true, profile, businessProfile: businessProfile || null, shop_slug: seller?.shop_slug ?? null, seller_status: seller?.status ?? null });
 }
 
 // POST /api/auth/gst-lookup  { gstin }
