@@ -6,6 +6,7 @@ import sellerRoutes from "./routes/seller.routes.js";
 import adminRoutes from "./routes/admin.routes.js";
 import notificationRoutes from "./routes/notifications.routes.js";
 import shopRoutes from "./routes/shop.routes.js"
+import hierarchySearchRoutes from "./routes/hierarchysearch.routes.js";
 
 export function createApp() {
   const app = express();
@@ -46,6 +47,7 @@ export function createApp() {
   app.use("/api/admin", adminRoutes);
   app.use("/api/notifications", notificationRoutes);
   app.use("/api/shop", shopRoutes);
+  app.use("/api/search", hierarchySearchRoutes);
 
   app.use((err, req, res, next) => {
     console.error(err);
