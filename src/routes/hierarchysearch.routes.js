@@ -5,6 +5,7 @@ import {
     searchProducts,
     searchSellersForProduct,
     searchHierarchy,
+    searchBrands,
     smartSearch,
 } from "../controllers/hierarchysearch.controller.js";
 import { resolveWithAI } from "../controllers/aiCatalogResolve.controller.js";
@@ -17,6 +18,7 @@ const router = Router();
 router.get("/categories", searchCategories);
 router.get("/subcategories", searchSubcategories);
 router.get("/products", searchProducts);
+router.get("/brands", searchBrands);
 router.get("/sellers", searchSellersForProduct);
 
 // Convenience single endpoint — what the frontend hook actually calls

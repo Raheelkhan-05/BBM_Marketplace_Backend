@@ -26,9 +26,13 @@ Reject (valid=false, short buyer-facing rejection_reason) if the photo:
   an endangered-species/wildlife product, human remains, sexual content,
   or anything else not legitimately tradable B2B
 
-If valid, return a short (2-4 word) generic search term for the product a
-buyer would type — no brand names, no marketing language, just the plain
-product name (e.g. "ball bearing", "hex bolt", "office chair").
+If valid, return a search term for the product:
+- If the packaging/label shows a clear brand name and specific product line
+  (e.g. "Castrol MAGNATEC 15W-40", "SKF 6205"), return that FULL brand +
+  product name exactly as it reads on the label — do not strip the brand.
+- If no brand is identifiable (generic/unbranded item, or brand not
+  legible), return a short 2-4 word generic product name instead
+  (e.g. "ball bearing", "hex bolt", "office chair").
 `.trim();
 
 const SCHEMA = {

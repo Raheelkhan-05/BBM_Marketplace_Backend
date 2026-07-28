@@ -15,7 +15,7 @@ export async function generateCatalogImage(prompt) {
     const result = await openai.images.generate({
         model: "gpt-image-2",
         prompt,
-        size: "1024x1024",
+        size: "1536x1024", // widest native size — frontend crops to 2.67:1 via object-cover
         quality: "low",
         background: "opaque",
     });

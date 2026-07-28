@@ -66,10 +66,29 @@ export async function searchProducts(req, res) {
     res.json({ success: true, level: "product", items: data || [] });
 }
 
+// GET /api/search/brands?productId=...&q=castrol&limit=20
+export async function searchBrands(req, res) {
+    const { productId, q = "", limit } = req.query;
+    if (!productId) return res.status(400).json({ success: false, message: "productId is required." });
+
+    let query = supabase
+        .from("hs_product_brands")
+        .select("id, product_id, name, brand_name, slug, image, description, attributes")
+        .eq("product_id", productId)
+        .order("name")
+        .limit(clampLimit(limit));
+
+    if (q.trim()) query = query.ilike("name", `%${q.trim()}%`);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    res.json({ success: true, level: "brand", items: data || [] });
+}
+
 // GET /api/search/sellers?productId=...&q=national&limit=20
 // Joins hs_product_sellers -> seller_profiles in a single round trip.
 export async function searchSellersForProduct(req, res) {
-    const { productId, q = "", limit } = req.query;
+    const { productId, brandId, q = "", limit } = req.query;
     if (!productId) return res.status(400).json({ success: false, message: "productId is required." });
 
     let query = supabase
@@ -80,6 +99,7 @@ export async function searchSellersForProduct(req, res) {
       unit,
       moq,
       delivery_days,
+      brand_id,
       seller:seller_profiles!inner (
         id, shop_slug, display_name, logo_url, city, state, business_type
       )
@@ -89,6 +109,7 @@ export async function searchSellersForProduct(req, res) {
         .order("price", { ascending: true })
         .limit(clampLimit(limit));
 
+    if (brandId) query = query.eq("brand_id", brandId);
     if (q.trim()) query = query.ilike("seller.display_name", `%${q.trim()}%`);
 
     const { data, error } = await query;
@@ -125,7 +146,7 @@ export async function smartSearch(req, res) {
     }
     const cap = clampLimit(limit) > 10 ? 5 : clampLimit(limit);
 
-    const [catRes, subRes, prodRes] = await Promise.all([
+    const [catRes, subRes, prodRes, brandRes] = await Promise.all([
         supabase.from("hs_categories").select("id, name, slug, image").ilike("name", `%${term}%`).limit(cap),
         supabase
             .from("hs_subcategories")
@@ -137,26 +158,52 @@ export async function smartSearch(req, res) {
             .select("id, name, slug, image, subcategory_id, subcategory:hs_subcategories(id, name, slug, category_id, category:hs_categories(id, name, slug))")
             .ilike("name", `%${term}%`)
             .limit(cap),
+        supabase
+            .from("hs_product_brands")
+            .select(`
+                id, name, brand_name, slug, image, product_id,
+                product:hs_products(id, name, slug, subcategory_id,
+                    subcategory:hs_subcategories(id, name, slug, category_id,
+                        category:hs_categories(id, name, slug)))
+            `)
+            .or(`name.ilike.%${term}%,brand_name.ilike.%${term}%`)
+            .limit(cap),
     ]);
 
     if (catRes.error) return res.status(500).json({ success: false, message: catRes.error.message });
     if (subRes.error) return res.status(500).json({ success: false, message: subRes.error.message });
     if (prodRes.error) return res.status(500).json({ success: false, message: prodRes.error.message });
+    if (brandRes.error) return res.status(500).json({ success: false, message: brandRes.error.message });
 
     const categories = catRes.data || [];
     const subcategories = subRes.data || [];
     const products = prodRes.data || [];
+    const brands = brandRes.data || [];
 
     const isExact = (name) => name.toLowerCase() === term.toLowerCase();
 
     // Deepest exact match wins (product > subcategory > category) since it's
     // the most specific thing the user could have typed.
+    const exactBrand = brands.find((b) => isExact(b.name));
     const exactProduct = products.find((p) => isExact(p.name));
     const exactSubcategory = subcategories.find((s) => isExact(s.name));
     const exactCategory = categories.find((c) => isExact(c.name));
 
     let exact = null;
-    if (exactProduct) {
+    if (exactBrand) {
+        const p = exactBrand.product;
+        const sc = p?.subcategory;
+        const c = sc?.category;
+        exact = {
+            type: "brand",
+            stack: [
+                c && { level: "category", id: c.id, name: c.name },
+                sc && { level: "subcategory", id: sc.id, name: sc.name },
+                p && { level: "product", id: p.id, name: p.name },
+                { level: "brand", id: exactBrand.id, name: exactBrand.name },
+            ].filter(Boolean),
+        };
+    } else if (exactProduct) {
         const sc = exactProduct.subcategory;
         const c = sc?.category;
         exact = {
@@ -206,6 +253,24 @@ export async function smartSearch(req, res) {
                         ? `in ${p.subcategory.category.name} > ${p.subcategory.name}`
                         : null,
             })),
+            brands: brands.map((b) => {
+                const p = b.product;
+                const sc = p?.subcategory;
+                const c = sc?.category;
+                return {
+                    id: b.id,
+                    name: b.name,
+                    brandName: b.brand_name,
+                    image: b.image,
+                    productId: p?.id,
+                    productName: p?.name,
+                    subcategoryId: sc?.id,
+                    subcategoryName: sc?.name,
+                    categoryId: c?.id,
+                    categoryName: c?.name,
+                    subtitle: c && sc && p ? `in ${c.name} > ${sc.name} > ${p.name}` : null,
+                };
+            }),
         },
     });
 }
@@ -222,9 +287,11 @@ export async function searchHierarchy(req, res) {
             return searchSubcategories(req, res);
         case "product":
             return searchProducts(req, res);
+        case "brand":
+            return searchBrands(req, res);
         case "seller":
             return searchSellersForProduct(req, res);
         default:
-            return res.status(400).json({ success: false, message: "level must be one of category|subcategory|product|seller" });
+            return res.status(400).json({ success: false, message: "level must be one of category|subcategory|product|brand|seller" });
     }
 }

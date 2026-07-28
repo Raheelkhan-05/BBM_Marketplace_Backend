@@ -37,10 +37,27 @@ If valid, map it onto the existing hierarchy wherever a good fit exists:
 - Same rule for match_subcategory_id / new_subcategory_name, but only reuse
   a candidate subcategory if it belongs to the category you mapped to.
 - Keep any new category/subcategory name short and buyer-recognizable.
-- generic_name is the specific product name — leave it null if the search
-  term itself names a category or subcategory rather than a product.
+- generic_name is the GENERIC product line name, with NO brand words in it
+  (e.g. "Engine Oil", "Deep Groove Ball Bearing") — this is what the
+  category/subcategory mapping above is based on. Leave it null only if the
+  search term itself names a category or subcategory rather than a product.
 - variants: realistic buyer-facing options (size/color/material/grade),
-  at most 4. attributes: at most 4 short spec highlights as name/value pairs.
+  at most 4. attributes: at most 4 short spec highlights as name/value pairs,
+  for the GENERIC product line (not brand-specific).
+
+BRAND DETECTION — if the search term names a specific commercial brand or
+product line (a brand name, model number, or product line — e.g. "Castrol
+MAGNATEC 15W-40", "SKF 6205 bearing"), also set:
+- is_branded: true
+- brand_name: the manufacturer/brand only (e.g. "Castrol", "SKF")
+- brand_item_name: the full specific buyer-facing name, brand included,
+  cleaned up to a proper product title (e.g. "Castrol MAGNATEC 15W-40")
+- brand_attributes: up to 6 precise technical spec name/value pairs specific
+  to this exact branded item (viscosity grade, API/ACEA rating, bearing
+  bore/OD, pack size, etc.) — buyers filter on these, so be exact.
+If the term is generic with no identifiable brand, set is_branded: false and
+leave brand_name / brand_item_name / brand_attributes null.
+
 - ALL output text — every name, description, variant value, and attribute
   name/value — MUST be in English, regardless of the language of the input
   search term.
@@ -59,6 +76,22 @@ const CATALOG_SCHEMA = {
             new_subcategory_name: { type: ["string", "null"] },
             generic_name: { type: ["string", "null"] },
             description: { type: ["string", "null"] },
+            is_branded: { type: "boolean" },
+            brand_name: { type: ["string", "null"] },
+            brand_item_name: { type: ["string", "null"] },
+            brand_attributes: {
+                type: "array",
+                maxItems: 6,
+                items: {
+                    type: "object",
+                    properties: {
+                        name: { type: "string" },
+                        value: { type: "string" },
+                    },
+                    required: ["name", "value"],
+                    additionalProperties: false,
+                },
+            },
             variants: {
                 type: "array",
                 maxItems: 4,
@@ -95,6 +128,10 @@ const CATALOG_SCHEMA = {
             "new_subcategory_name",
             "generic_name",
             "description",
+            "is_branded",
+            "brand_name",
+            "brand_item_name",
+            "brand_attributes",
             "variants",
             "attributes",
         ],

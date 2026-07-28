@@ -23,7 +23,7 @@
 import { supabase } from "../config/supabase.js";
 import { classifyQuery } from "./openaiCatalog.service.js";
 import { getShortlists } from "./catalogShortlist.service.js";
-import { embedText } from "./embeddings.service.js";
+import { embedText, embedTexts } from "./embeddings.service.js";
 import { generateCatalogImage } from "./catalogImageGen.service.js";
 import { convertPngToAvif } from "./cloudinaryConvert.service.js";
 import { uploadCatalogImage } from "./catalogImageStorage.service.js";
@@ -38,8 +38,10 @@ const CATEGORY_MATCH_THRESHOLD = 0.8;
 
 const CATEGORY_DEDUPE_FLOOR = 0.72;
 const SUBCATEGORY_DEDUPE_FLOOR = 0.72;
+const BRAND_MATCH_THRESHOLD = 0.80;
 
-const PHOTO_STYLE = "plain neutral studio background, no text, no watermark, no logos, no brand names, professional catalog photography.";
+
+const PHOTO_STYLE = "plain neutral studio background, no text, no watermark, no logos, no brand names, professional catalog photography, product centered horizontally with generous negative space on both sides, composed for a wide letterbox crop so nothing important sits near the top or bottom edge.";
 
 function categoryImagePrompt(name) {
     return `Flat-lay of assorted everyday items representing the "${name}" product category for a B2B industrial marketplace, ${PHOTO_STYLE}`;
@@ -81,9 +83,8 @@ async function insertOrFetchOnConflict(table, insertPayload, conflictFilter, sel
 
 // ---- find-or-create ----
 
-async function createCategory(name) {
+async function createCategory(name, embedding) {
     const slug = slugify(name);
-    const embedding = await embedText(name);
     return insertOrFetchOnConflict(
         "hs_categories",
         { name, slug, is_ai_generated: true, embedding },
@@ -92,9 +93,8 @@ async function createCategory(name) {
     );
 }
 
-async function createSubcategory(categoryId, name) {
+async function createSubcategory(categoryId, name, embedding) {
     const slug = slugify(name);
-    const embedding = await embedText(name);
     return insertOrFetchOnConflict(
         "hs_subcategories",
         { category_id: categoryId, name, slug, is_ai_generated: true, embedding },
@@ -103,7 +103,7 @@ async function createSubcategory(categoryId, name) {
     );
 }
 
-async function resolveCategory(classification, shortlists, log) {
+async function resolveCategory(classification, shortlists, embeddingByKey, log) {
     if (classification.match_category_id) {
         const { data } = await supabase
             .from("hs_categories")
@@ -140,10 +140,10 @@ async function resolveCategory(classification, shortlists, log) {
     }
 
     log.info("category: creating new ->", classification.new_category_name);
-    return createCategory(classification.new_category_name);
+    return createCategory(classification.new_category_name, embeddingByKey.category);
 }
 
-async function resolveSubcategory(classification, categoryId, shortlists, log) {
+async function resolveSubcategory(classification, categoryId, shortlists, embeddingByKey, log) {
     if (classification.match_subcategory_id) {
         const { data } = await supabase
             .from("hs_subcategories")
@@ -179,10 +179,10 @@ async function resolveSubcategory(classification, categoryId, shortlists, log) {
     }
 
     log.info("subcategory: creating new ->", classification.new_subcategory_name);
-    return createSubcategory(categoryId, classification.new_subcategory_name);
+    return createSubcategory(categoryId, classification.new_subcategory_name, embeddingByKey.subcategory);
 }
 
-async function resolveProduct(classification, subcategoryId, log) {
+async function resolveProduct(classification, subcategoryId, embeddingByKey, log) {
     const name = classification.generic_name;
     if (!name || !subcategoryId) return null;
 
@@ -198,7 +198,7 @@ async function resolveProduct(classification, subcategoryId, log) {
     }
 
     const slug = slugify(name);
-    const embedding = await embedText(name);
+    const embedding = embeddingByKey.product;
     log.info("product: creating new ->", name);
     return insertOrFetchOnConflict(
         "hs_products",
@@ -221,6 +221,18 @@ async function resolveProduct(classification, subcategoryId, log) {
 // ---- step 1: direct embedding-cascade match against what already exists ----
 
 function findDirectMatch(shortlists) {
+    const topBrand = shortlists.brands?.[0];
+    if (topBrand && topBrand.similarity >= BRAND_MATCH_THRESHOLD) {
+        return {
+            stack: [
+                { level: "category", id: topBrand.category_id, name: topBrand.category_name },
+                { level: "subcategory", id: topBrand.subcategory_id, name: topBrand.subcategory_name },
+                { level: "product", id: topBrand.product_id, name: topBrand.product_name },
+                { level: "brand", id: topBrand.id, name: topBrand.name },
+            ],
+        };
+    }
+
     const topProduct = shortlists.products[0];
     if (topProduct && topProduct.similarity >= PRODUCT_MATCH_THRESHOLD) {
         return {
@@ -248,6 +260,50 @@ function findDirectMatch(shortlists) {
     }
 
     return null;
+}
+
+function brandImagePrompt(brandItemName, brandName, attributes) {
+    const specs = (attributes || []).map((a) => `${a.name}: ${a.value}`).join(", ");
+    const brandLine = brandName
+        ? ` Show it as an authentic ${brandName} retail product — accurate real-world packaging shape, proportions, and typical color scheme for this brand and product line, as closely as possible to how it actually looks on shelf.`
+        : "";
+    return `Product photo of ${brandItemName}${specs ? ` — ${specs}` : ""}, centered.${brandLine} ${PHOTO_STYLE}`;
+}
+
+async function resolveBrandItem(classification, productId, shortlists, embeddingByKey, log) {
+    if (!classification.is_branded || !classification.brand_item_name || !productId) return null;
+
+    const { data: existing } = await supabase
+        .from("hs_product_brands")
+        .select("id, name, image")
+        .eq("product_id", productId)
+        .ilike("name", classification.brand_item_name)
+        .maybeSingle();
+    if (existing) return { ...existing, isNew: false };
+
+    // reuse the global brand shortlist already fetched, scoped to this product
+    const top = shortlists.brands.find((b) => b.product_id === productId);
+    if (top && top.similarity >= 0.72) {
+        log.warn(`brand: reusing shortlisted "${top.name}" instead of creating duplicate`);
+        return { id: top.id, name: top.name, image: top.image, isNew: false };
+    }
+
+    const slug = slugify(classification.brand_item_name);
+    return insertOrFetchOnConflict(
+        "hs_product_brands",
+        {
+            product_id: productId,
+            brand_name: classification.brand_name,
+            name: classification.brand_item_name,
+            slug,
+            description: classification.description || null,
+            attributes: Object.fromEntries((classification.brand_attributes || []).map((a) => [a.name, a.value])),
+            is_ai_generated: true,
+            embedding: embeddingByKey.brand,
+        },
+        { product_id: productId, slug },
+        "id, name, image"
+    );
 }
 
 // ---- entrypoint ----
@@ -282,44 +338,60 @@ export async function resolveOrCreateCatalogEntry({ term, level, parentId }) {
         return { success: true, resolved: false, reason: classification.rejection_reason || "This item can't be listed on BBM Marketplace. Please try a different search." };
     }
 
-    const categoryRow = await resolveCategory(classification, shortlists, log);
+    const namesToEmbed = [];
+    if (classification.new_category_name) namesToEmbed.push({ key: "category", text: classification.new_category_name });
+    if (classification.new_subcategory_name) namesToEmbed.push({ key: "subcategory", text: classification.new_subcategory_name });
+    if (classification.generic_name) namesToEmbed.push({ key: "product", text: classification.generic_name });
+    if (classification.is_branded && classification.brand_item_name) {
+        namesToEmbed.push({ key: "brand", text: classification.brand_item_name });
+    }
+
+    const embeddedValues = namesToEmbed.length ? await embedTexts(namesToEmbed.map((n) => n.text)) : [];
+    const embeddingByKey = Object.fromEntries(namesToEmbed.map((n, i) => [n.key, embeddedValues[i]]));
+
+    const categoryRow = await resolveCategory(classification, shortlists, embeddingByKey, log);
+    // const categoryRow = await resolveCategory(classification, shortlists, log);
     if (!categoryRow) {
         log.warn("could not resolve a category at all");
         return { success: true, resolved: false, reason: "We couldn't confidently categorize this item. Please try a more specific search term." };
     }
 
-    if (categoryRow.isNew) {
-        const url = await generateAndAttachImage("hs_categories", categoryRow.id, categoryImagePrompt(categoryRow.name));
-        if (url) categoryRow.image = url;
-    }
+    // if (categoryRow.isNew) {
+    //     const url = await generateAndAttachImage("hs_categories", categoryRow.id, categoryImagePrompt(categoryRow.name));
+    //     if (url) categoryRow.image = url;
+    // }
 
-    const subcategoryRow = await resolveSubcategory(classification, categoryRow.id, shortlists, log);
-    if (subcategoryRow?.isNew) {
-        const url = await generateAndAttachImage(
-            "hs_subcategories",
-            subcategoryRow.id,
-            subcategoryImagePrompt(subcategoryRow.name, categoryRow.name)
-        );
-        if (url) subcategoryRow.image = url;
-    }
+    const subcategoryRow = await resolveSubcategory(classification, categoryRow.id, shortlists, embeddingByKey, log);
+    // if (subcategoryRow?.isNew) {
+    //     const url = await generateAndAttachImage(
+    //         "hs_subcategories",
+    //         subcategoryRow.id,
+    //         subcategoryImagePrompt(subcategoryRow.name, categoryRow.name)
+    //     );
+    //     if (url) subcategoryRow.image = url;
+    // }
 
-    const productRow = subcategoryRow ? await resolveProduct(classification, subcategoryRow.id, log) : null;
-    if (productRow?.isNew) {
-        const url = await generateAndAttachImage(
-            "hs_products",
-            productRow.id,
-            productImagePrompt(productRow.name, classification.description)
-        );
-        if (url) productRow.image = url;
-    }
+    const productRow = subcategoryRow ? await resolveProduct(classification, subcategoryRow.id, embeddingByKey, log) : null;
+
+    const brandRow = productRow ? await resolveBrandItem(classification, productRow.id, shortlists, embeddingByKey, log) : null;
+    // if (productRow?.isNew) {
+    //     const url = await generateAndAttachImage(
+    //         "hs_products",
+    //         productRow.id,
+    //         productImagePrompt(productRow.name, classification.description)
+    //     );
+    //     if (url) productRow.image = url;
+    // }
 
     const stack = [
         { level: "category", id: categoryRow.id, name: categoryRow.name },
         subcategoryRow && { level: "subcategory", id: subcategoryRow.id, name: subcategoryRow.name },
         productRow && { level: "product", id: productRow.id, name: productRow.name },
+        brandRow && { level: "brand", id: brandRow.id, name: brandRow.name },
     ].filter(Boolean);
 
     const pendingImages = [];
+    if (brandRow?.isNew) pendingImages.push({ level: "brand", id: brandRow.id, table: "hs_product_brands" });
     if (productRow?.isNew) pendingImages.push({ level: "product", id: productRow.id, table: "hs_products" });
     if (subcategoryRow?.isNew) pendingImages.push({ level: "subcategory", id: subcategoryRow.id, table: "hs_subcategories" });
     if (categoryRow.isNew) pendingImages.push({ level: "category", id: categoryRow.id, table: "hs_categories" });
@@ -327,9 +399,10 @@ export async function resolveOrCreateCatalogEntry({ term, level, parentId }) {
     (async () => {
         for (const p of pendingImages) {
             const prompt =
-                p.level === "product" ? productImagePrompt(productRow.name, classification.description) :
-                    p.level === "subcategory" ? subcategoryImagePrompt(subcategoryRow.name, categoryRow.name) :
-                        categoryImagePrompt(categoryRow.name);
+                p.level === "brand" ? brandImagePrompt(brandRow.name, classification.brand_name, classification.brand_attributes) :
+                    p.level === "product" ? productImagePrompt(productRow.name, classification.description) :
+                        p.level === "subcategory" ? subcategoryImagePrompt(subcategoryRow.name, categoryRow.name) :
+                            categoryImagePrompt(categoryRow.name);
             log.info(`background image gen starting for ${p.level} ${p.id}`);
             const url = await generateAndAttachImage(p.table, p.id, prompt);
             log.info(`background image gen ${url ? "done" : "failed"} for ${p.level} ${p.id}`);
@@ -341,7 +414,7 @@ export async function resolveOrCreateCatalogEntry({ term, level, parentId }) {
         resolved: true,
         aiGenerated: true,
         stack, // image fields simply null on new rows for now
-        noSellersYet: !!productRow,
+        noSellersYet: !!(brandRow || productRow),
         pendingImages: pendingImages.map(({ level, id }) => ({ level, id })),
     };
 
