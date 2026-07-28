@@ -303,7 +303,7 @@ export async function resolveOrCreateCatalogEntry({ term, level, parentId }) {
         if (url) subcategoryRow.image = url;
     }
 
-    const productRow = subcategoryRow ? await resolveProduct(classification, subcategoryRow.id) : null;
+    const productRow = subcategoryRow ? await resolveProduct(classification, subcategoryRow.id, log) : null;
     if (productRow?.isNew) {
         const url = await generateAndAttachImage(
             "hs_products",
