@@ -41,6 +41,15 @@ If valid, map it onto the existing hierarchy wherever a good fit exists:
   (e.g. "Engine Oil", "Deep Groove Ball Bearing") — this is what the
   category/subcategory mapping above is based on. Leave it null only if the
   search term itself names a category or subcategory rather than a product.
+- CRITICAL: generic_name must NEVER be identical (or a trivial restatement)
+  of the subcategory name — a product must always be more specific than its
+  subcategory. If the search term is itself the subcategory-level concept
+  with nothing more specific to say (e.g. searching "eyeglasses" when the
+  subcategory itself is "Eyeglasses"), set generic_name to null rather than
+  repeating the subcategory name as a fake product. Only give a non-null
+  generic_name when it genuinely narrows down further than the subcategory
+  (e.g. subcategory "Eyeglasses" -> product "Photochromic Reading Glasses",
+  or subcategory "Engine Oil" -> product "Diesel Engine Oil").
 - variants: realistic buyer-facing options (size/color/material/grade),
   at most 4. attributes: at most 4 short spec highlights as name/value pairs,
   for the GENERIC product line (not brand-specific).

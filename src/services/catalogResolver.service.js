@@ -372,7 +372,15 @@ export async function resolveOrCreateCatalogEntry({ term, level, parentId }) {
     //     if (url) subcategoryRow.image = url;
     // }
 
-    const productRow = subcategoryRow ? await resolveProduct(classification, subcategoryRow.id, embeddingByKey, log) : null;
+    const genericNameDuplicatesSubcategory =
+        subcategoryRow && classification.generic_name &&
+        classification.generic_name.trim().toLowerCase() === subcategoryRow.name.trim().toLowerCase();
+    if (genericNameDuplicatesSubcategory) {
+        log.warn(`product: skipping — generic_name "${classification.generic_name}" duplicates subcategory name, would create redundant level`);
+    }
+    const productRow = subcategoryRow && !genericNameDuplicatesSubcategory
+        ? await resolveProduct(classification, subcategoryRow.id, embeddingByKey, log)
+        : null;
 
     const brandRow = productRow ? await resolveBrandItem(classification, productRow.id, shortlists, embeddingByKey, log) : null;
     // if (productRow?.isNew) {
