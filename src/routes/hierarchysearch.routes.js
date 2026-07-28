@@ -7,6 +7,9 @@ import {
     searchHierarchy,
     smartSearch,
 } from "../controllers/hierarchysearch.controller.js";
+import { resolveWithAI } from "../controllers/aiCatalogResolve.controller.js";
+import { identifyProductFromImage } from "../controllers/imageSearch.controller.js";
+import { getImageStatuses } from "../controllers/catalogImageStatus.controller.js"
 
 const router = Router();
 
@@ -21,5 +24,15 @@ router.get("/hierarchy", searchHierarchy);
 
 // Cross-level search — fallback when a scoped search comes up empty
 router.get("/smart", smartSearch);
+
+// AI last-resort resolver — only called when the buyer explicitly taps
+// "Search with AI" after scoped + smart search both come up empty.
+router.post("/ai-resolve", resolveWithAI);
+
+// Image-based search — identifies the product in a buyer-uploaded photo
+// and returns a search term for the normal pipeline above.
+router.post("/image", identifyProductFromImage);
+
+router.get("/image-status", getImageStatuses);
 
 export default router;
