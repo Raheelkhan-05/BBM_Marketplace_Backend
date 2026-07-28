@@ -27,6 +27,7 @@ import { embedText, embedTexts } from "./embeddings.service.js";
 import { generateCatalogImage } from "./catalogImageGen.service.js";
 import { convertPngToAvif } from "./cloudinaryConvert.service.js";
 import { uploadCatalogImage } from "./catalogImageStorage.service.js";
+import { waitUntil } from "@vercel/functions";
 import { createResolveLogger } from "../utils/resolveLogger.js";
 import { slugify } from "./slugify.js";
 
@@ -396,18 +397,34 @@ export async function resolveOrCreateCatalogEntry({ term, level, parentId }) {
     if (subcategoryRow?.isNew) pendingImages.push({ level: "subcategory", id: subcategoryRow.id, table: "hs_subcategories" });
     if (categoryRow.isNew) pendingImages.push({ level: "category", id: categoryRow.id, table: "hs_categories" });
 
-    (async () => {
-        for (const p of pendingImages) {
-            const prompt =
-                p.level === "brand" ? brandImagePrompt(brandRow.name, classification.brand_name, classification.brand_attributes) :
-                    p.level === "product" ? productImagePrompt(productRow.name, classification.description) :
-                        p.level === "subcategory" ? subcategoryImagePrompt(subcategoryRow.name, categoryRow.name) :
-                            categoryImagePrompt(categoryRow.name);
-            log.info(`background image gen starting for ${p.level} ${p.id}`);
-            const url = await generateAndAttachImage(p.table, p.id, prompt);
-            log.info(`background image gen ${url ? "done" : "failed"} for ${p.level} ${p.id}`);
-        }
-    })();
+    // (async () => {
+    //     for (const p of pendingImages) {
+    //         const prompt =
+    //             p.level === "brand" ? brandImagePrompt(brandRow.name, classification.brand_name, classification.brand_attributes) :
+    //                 p.level === "product" ? productImagePrompt(productRow.name, classification.description) :
+    //                     p.level === "subcategory" ? subcategoryImagePrompt(subcategoryRow.name, categoryRow.name) :
+    //                         categoryImagePrompt(categoryRow.name);
+    //         log.info(`background image gen starting for ${p.level} ${p.id}`);
+    //         const url = await generateAndAttachImage(p.table, p.id, prompt);
+    //         log.info(`background image gen ${url ? "done" : "failed"} for ${p.level} ${p.id}`);
+    //     }
+    // })();
+
+    waitUntil(
+        Promise.all(
+            pendingImages.map(async (p) => {
+                const prompt =
+                    p.level === "brand" ? brandImagePrompt(brandRow.name, classification.brand_name, classification.brand_attributes) :
+                        p.level === "product" ? productImagePrompt(productRow.name, classification.description) :
+                            p.level === "subcategory" ? subcategoryImagePrompt(subcategoryRow.name, categoryRow.name) :
+                                categoryImagePrompt(categoryRow.name);
+                log.info(`background image gen starting for ${p.level} ${p.id}`);
+                const url = await generateAndAttachImage(p.table, p.id, prompt);
+                log.info(`background image gen ${url ? "done" : "failed"} for ${p.level} ${p.id}`);
+                return url;
+            })
+        )
+    );
 
     return {
         success: true,
