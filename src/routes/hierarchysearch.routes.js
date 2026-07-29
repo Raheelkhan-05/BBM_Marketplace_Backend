@@ -7,6 +7,7 @@ import {
     searchHierarchy,
     searchBrands,
     smartSearch,
+    searchAutocomplete
 } from "../controllers/hierarchysearch.controller.js";
 import { resolveWithAI } from "../controllers/aiCatalogResolve.controller.js";
 import { identifyProductFromImage } from "../controllers/imageSearch.controller.js";
@@ -36,5 +37,9 @@ router.post("/ai-resolve", resolveWithAI);
 router.post("/image", identifyProductFromImage);
 
 router.get("/image-status", getImageStatuses);
+
+// Fast, pure-DB typeahead — no AI, no image work. Called on every
+// keystroke (debounced client-side), so keep this endpoint cheap.
+router.get("/autocomplete", searchAutocomplete);
 
 export default router;

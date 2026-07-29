@@ -295,3 +295,59 @@ export async function searchHierarchy(req, res) {
             return res.status(400).json({ success: false, message: "level must be one of category|subcategory|product|brand|seller" });
     }
 }
+
+// backend/controllers/hierarchysearch.controller.js  (add this function)
+
+// GET /api/search/autocomplete?q=bea&limit=8
+// Pure DB pattern-match typeahead — NO AI involved. Optimized for speed:
+// small per-table limits, pattern match (name ILIKE 'term%') prioritized
+// over "contains" so relevant results surface first, like Google's typeahead.
+export async function searchAutocomplete(req, res) {
+    const { q = "", limit } = req.query;
+    const term = q.trim();
+
+    if (term.length < 2) {
+        return res.json({ success: true, suggestions: [] });
+    }
+
+    const cap = Math.min(Number(limit) || 6, 10);
+    const perTable = Math.min(cap, 4); // keep each query cheap
+
+    // pattern match first (fast, uses index well with ILIKE 'term%'),
+    // this is what makes it feel "real-time" vs a full contains scan.
+    const pattern = `%${term}%`;
+
+
+    const [catRes, subRes, prodRes, brandRes] = await Promise.all([
+        supabase.from("hs_categories").select("id, name, slug").ilike("name", pattern).order("name").limit(perTable),
+        supabase.from("hs_subcategories").select("id, name, slug").ilike("name", pattern).order("name").limit(perTable),
+        supabase.from("hs_products").select("id, name, slug").ilike("name", pattern).order("name").limit(perTable),
+        supabase.from("hs_product_brands").select("id, name, brand_name, slug").ilike("name", pattern).order("name").limit(perTable),
+    ]);
+
+    if (catRes.error || subRes.error || prodRes.error || brandRes.error) {
+        // Fail soft — autocomplete is non-critical, never break the search bar
+        return res.json({ success: true, suggestions: [] });
+    }
+
+    const suggestions = [
+        ...(catRes.data || []).map((c) => ({ id: c.id, name: c.name, level: "category" })),
+        ...(subRes.data || []).map((s) => ({ id: s.id, name: s.name, level: "subcategory" })),
+        ...(prodRes.data || []).map((p) => ({ id: p.id, name: p.name, level: "product" })),
+        ...(brandRes.data || []).map((b) => ({ id: b.id, name: b.name, level: "brand" })),
+    ];
+
+    // Dedupe by lowercase name (categories/products can share names sometimes)
+    // and cap to the requested total.
+    const seen = new Set();
+    const deduped = [];
+    for (const s of suggestions) {
+        const key = s.name.trim().toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        deduped.push(s);
+        if (deduped.length >= cap) break;
+    }
+
+    res.json({ success: true, suggestions: deduped });
+}
