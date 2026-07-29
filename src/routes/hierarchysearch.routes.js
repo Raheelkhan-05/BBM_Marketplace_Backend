@@ -11,7 +11,9 @@ import {
 } from "../controllers/hierarchysearch.controller.js";
 import { resolveWithAI } from "../controllers/aiCatalogResolve.controller.js";
 import { identifyProductFromImage } from "../controllers/imageSearch.controller.js";
-import { getImageStatuses } from "../controllers/catalogImageStatus.controller.js"
+import { getImageStatuses } from "../controllers/catalogImageStatus.controller.js";
+import { getProductDetail } from "../controllers/productDetail.controller.js";
+
 
 const router = Router();
 
@@ -41,5 +43,7 @@ router.get("/image-status", getImageStatuses);
 // Fast, pure-DB typeahead — no AI, no image work. Called on every
 // keystroke (debounced client-side), so keep this endpoint cheap.
 router.get("/autocomplete", searchAutocomplete);
+
+router.get("/products/:id", getProductDetail);
 
 export default router;
