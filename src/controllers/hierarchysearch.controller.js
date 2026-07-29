@@ -310,38 +310,42 @@ export async function searchAutocomplete(req, res) {
         return res.json({ success: true, suggestions: [] });
     }
 
-    const cap = Math.min(Number(limit) || 6, 10);
-    const perTable = Math.min(cap, 4); // keep each query cheap
-
-    // pattern match first (fast, uses index well with ILIKE 'term%'),
-    // this is what makes it feel "real-time" vs a full contains scan.
-    const pattern = `%${term}%`;
-
+    const cap = Math.min(Number(limit) || 8, 10);
+    const perTable = 4;
+    const pattern = `%${term}%`; // trgm-indexed on all 4 tables, fast either way
 
     const [catRes, subRes, prodRes, brandRes] = await Promise.all([
         supabase.from("hs_categories").select("id, name, slug").ilike("name", pattern).order("name").limit(perTable),
         supabase.from("hs_subcategories").select("id, name, slug").ilike("name", pattern).order("name").limit(perTable),
         supabase.from("hs_products").select("id, name, slug").ilike("name", pattern).order("name").limit(perTable),
-        supabase.from("hs_product_brands").select("id, name, brand_name, slug").ilike("name", pattern).order("name").limit(perTable),
+        supabase.from("hs_product_brands").select("id, name, brand_name, slug").or(`name.ilike.${pattern},brand_name.ilike.${pattern}`).order("name").limit(perTable),
     ]);
 
     if (catRes.error || subRes.error || prodRes.error || brandRes.error) {
-        // Fail soft — autocomplete is non-critical, never break the search bar
         return res.json({ success: true, suggestions: [] });
     }
 
-    const suggestions = [
+    const raw = [
         ...(catRes.data || []).map((c) => ({ id: c.id, name: c.name, level: "category" })),
         ...(subRes.data || []).map((s) => ({ id: s.id, name: s.name, level: "subcategory" })),
         ...(prodRes.data || []).map((p) => ({ id: p.id, name: p.name, level: "product" })),
-        ...(brandRes.data || []).map((b) => ({ id: b.id, name: b.name, level: "brand" })),
+        ...(brandRes.data || []).map((b) => ({ id: b.id, name: b.name, brandName: b.brand_name, level: "brand" })),
     ];
 
-    // Dedupe by lowercase name (categories/products can share names sometimes)
-    // and cap to the requested total.
+    // Rank: exact prefix match first, then "starts with a word", then rest —
+    // makes typing "bear" surface "Bearing" above "Ball Bearing".
+    const lowerTerm = term.toLowerCase();
+    const rank = (s) => {
+        const n = s.name.toLowerCase();
+        if (n.startsWith(lowerTerm)) return 0;
+        if (n.includes(` ${lowerTerm}`)) return 1;
+        return 2;
+    };
+    raw.sort((a, b) => rank(a) - rank(b));
+
     const seen = new Set();
     const deduped = [];
-    for (const s of suggestions) {
+    for (const s of raw) {
         const key = s.name.trim().toLowerCase();
         if (seen.has(key)) continue;
         seen.add(key);
