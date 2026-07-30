@@ -10,23 +10,23 @@
 //   3. Enrichment — generic name, short description, variants, attributes.
 //
 // CANDIDATE PRODUCTS note: as of catalogShortlist.service.js's completeness
-// supplement, this list is no longer just a global embedding top-10 — it's
-// guaranteed to include every existing product already filed under the
-// most likely subcategory match. That was the actual root cause of the
-// "Engine Oil" / "10W-40 Engine Oil" / "Passenger Car Engine Oil" split:
-// the true sibling often wasn't even in the candidate list the model saw.
-// The mapping rules below are unchanged, but the model now has a real shot
-// at following them.
+// supplement, this list is guaranteed to include every existing product
+// already filed under the most likely subcategory match, not just a global
+// embedding top-10.
+//
+// GENERIC ATTRIBUTES note: this call only ever produces the *initial*,
+// AI-guessed spec sheet for a brand-new product line. Once real brand
+// listings exist under it, the product detail page aggregates their real
+// attributes into ranges/option-sets server-side (see
+// productDetail.controller.js) and prefers that over these seed values —
+// this call's job is just to give a reasonable, honestly-generic starting
+// point, not to invent a precise-looking spec sheet for one imaginary SKU.
 //
 // No web_search tool here on purpose: everyday product classification
 // doesn't need it, and it was the single biggest token cost in earlier
 // versions of this service. Reasoning effort is kept at "low" — enough for
 // reliable moderation + mapping on short inputs like this without paying
-// for more. (If you find match_product_id is still being missed on cases
-// where the correct sibling is clearly present in the candidate list, that
-// —not threshold-tuning— is the signal to try bumping this to "medium";
-// it does cost more in reasoning/output tokens, so worth confirming the
-// candidate-list fix alone isn't enough first.)
+// for more.
 
 import OpenAI from "openai";
 
@@ -71,13 +71,26 @@ deciding to mint a new one:
   candidate "Engine Oil" vs incoming "10W-40 Engine Oil"), reuse the
   candidate via match_product_id and let the specific grade be described in
   attributes on that existing product's edits, not as a new product.
+- MARKETING ADJECTIVES ARE NOT NEW PRODUCT LINES. A feature or marketing
+  descriptor layered on an existing product/subcategory (e.g.
+  "AI-Powered", "Smart", "Pro", "Advanced", "Next-Gen", "Premium") does not
+  by itself justify a new generic_name distinct from the plain base item,
+  unless it denotes a genuinely distinct hardware/physical category that
+  buyers would search for separately. Searching "AI-Powered Laptop" when no
+  "Laptop" product exists yet should create generic_name "Laptop" — the
+  plainest, most natural buyer search term for the base item — not
+  "AI-Powered Laptop". Reserve more specific generic names (e.g. "Gaming
+  Laptop", "2-in-1 Convertible Laptop") only for genuine, commonly-searched
+  sub-lines, not for every marketing buzzword that appears in a query.
 - Only set generic_name (leaving match_product_id null) when this item is
   a genuinely distinct product line that no candidate covers — a different
-  physical object, not just a different spec of the same object.
+  physical object, not just a different spec of the same object, and not
+  just a different marketing name for the same object.
 - generic_name is the GENERIC product line name, with NO brand words in it
-  (e.g. "Engine Oil", "Deep Groove Ball Bearing") — this is what the
-  category/subcategory mapping above is based on. Leave it null only if the
-  search term itself names a category or subcategory rather than a product.
+  (e.g. "Engine Oil", "Deep Groove Ball Bearing", "Laptop") — this is what
+  the category/subcategory mapping above is based on. Leave it null only if
+  the search term itself names a category or subcategory rather than a
+  product.
 - CRITICAL: generic_name must NEVER be identical to, or a trivial
   restatement of, the subcategory name — including simple singular/plural
   differences. If the subcategory is "Passenger Car Engine Oils", do NOT
@@ -89,6 +102,18 @@ deciding to mint a new one:
   narrows down further than the subcategory (e.g. subcategory "Eyeglasses"
   -> product "Photochromic Reading Glasses", or subcategory "Engine Oil"
   -> product "Diesel Engine Oil").
+- GENERIC ATTRIBUTES MUST STAY GENERIC. attributes describe the WHOLE
+  product line as buyers browsing it would expect to see it, not one
+  specific real-world configuration. NEVER write an exact model number,
+  one specific chip/part number, or one specific measurement that only
+  applies to a single real SKU (e.g. do not write "Processor: Intel Core
+  Ultra 5 125H" or "Weight: 1.65kg" for a generic "Laptop" product — real
+  laptops in that line span many processors and weights). Where a spec
+  genuinely varies across real items in the line, either phrase it
+  qualitatively/broadly (e.g. "Processor Options: Intel Core / AMD Ryzen,
+  various generations") or leave it out of attributes entirely — exact
+  per-model numbers belong in brand_attributes on a specific branded item,
+  never here.
 - variants: realistic buyer-facing options (size/color/material/grade),
   at most 4. attributes: at most 4 short spec highlights as name/value pairs,
   for the GENERIC product line (not brand-specific).
@@ -102,7 +127,8 @@ MAGNATEC 15W-40", "SKF 6205 bearing"), also set:
   cleaned up to a proper product title (e.g. "Castrol MAGNATEC 15W-40")
 - brand_attributes: up to 6 precise technical spec name/value pairs specific
   to this exact branded item (viscosity grade, API/ACEA rating, bearing
-  bore/OD, pack size, etc.) — buyers filter on these, so be exact.
+  bore/OD, pack size, etc.) — buyers filter on these, so be exact. This is
+  the ONLY place exact per-model numbers belong.
 If the term is generic with no identifiable brand, set is_branded: false and
 leave brand_name / brand_item_name / brand_attributes null.
 
