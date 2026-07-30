@@ -11,8 +11,8 @@
 //      any level returns immediately with NO OpenAI classification call
 //      and nothing written to the DB.
 //   2. Only if nothing matches confidently: one GPT-5.6-Luna call to
-//      moderate + map the term (reusing the same category/subcategory
-//      shortlists), then find-or-create down to whatever level it
+//      moderate + map the term (reusing the same category/subcategory/
+//      product shortlists), then find-or-create down to whatever level it
 //      resolves to, generating an image for each newly-created row.
 //
 // All inserts are conflict-safe: if a concurrent request already created
@@ -33,25 +33,190 @@ import { slugify } from "./slugify.js";
 
 // Cosine similarity thresholds for the direct-match cascade. Tune these if
 // you find it matching too loosely/strictly in practice.
-const PRODUCT_MATCH_THRESHOLD = 0.82;
+const PRODUCT_MATCH_THRESHOLD = 0.80;
 const SUBCATEGORY_MATCH_THRESHOLD = 0.8;
 const CATEGORY_MATCH_THRESHOLD = 0.8;
 
 const CATEGORY_DEDUPE_FLOOR = 0.72;
 const SUBCATEGORY_DEDUPE_FLOOR = 0.72;
+// Products' last line of defense even if the LLM misses a dedup — see
+// openaiCatalog.service.js and catalogShortlist.service.js for the
+// upstream fix that makes the LLM far less likely to miss it in the first
+// place (the candidate list it sees is now guaranteed-complete for the
+// top subcategory match, not just a global embedding top-10).
+const PRODUCT_DEDUPE_FLOOR = 0.78;
 const BRAND_MATCH_THRESHOLD = 0.80;
 
+// ---- name-comparison helpers ----
+//
+// FIX: the old check for "generic_name is just a restatement of the
+// subcategory name" was a strict, case-folded string equality. That let
+// "Passenger Car Engine Oil" through as a product under subcategory
+// "Passenger Car Engine Oils" — the only difference is the trailing "s",
+// which strict equality doesn't catch. Normalize away punctuation and
+// simple singular/plural before comparing.
+function normalizeCatalogName(str) {
+    return (str || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^\w\s]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+function isTrivialRestatement(a, b) {
+    const na = normalizeCatalogName(a);
+    const nb = normalizeCatalogName(b);
+    if (!na || !nb) return false;
+    if (na === nb) return true;
+    // singular/plural only difference, e.g. "engine oil" vs "engine oils"
+    return na.replace(/s$/, "") === nb.replace(/s$/, "");
+}
 
-const PHOTO_STYLE = "plain neutral studio background, no text, no watermark, no logos, no brand names, professional catalog photography, product centered horizontally with generous negative space on both sides, composed for a wide letterbox crop so nothing important sits near the top or bottom edge.";
+// ---- image prompt variety ----
+//
+// Previously every category/subcategory/product/brand image used the same
+// fixed PHOTO_STYLE string plus a single backdrop pick, and the
+// container/setting hint for an entire regex bucket (e.g. everything
+// matching /oil|lubricant|grease/) was one static sentence. That's why
+// "Engine Oil", "10W-40 Engine Oil", and "Passenger Car Engine Oil" all
+// rendered as the same can on the same backdrop — the prompts were nearly
+// word-for-word identical, and image models anchor heavily on the literal
+// prompt text, not on the one product name that differs between them.
+//
+// This section adds independent, deterministic (same item name always
+// gets the same result — not random) variety axes that combine
+// multiplicatively: backdrop x camera angle x container shape x accent
+// color. None of this touches the text-classification call or its output
+// tokens — it only changes the prompt sent to the image model, so it costs
+// nothing extra on the side you're trying to control.
+
+function hashSeed(str) {
+    let h = 0;
+    for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
+    return Math.abs(h);
+}
+function pickFrom(list, seedKey) {
+    return list[hashSeed(seedKey) % list.length];
+}
+
+const PHOTO_QUALITY_BASE =
+    "professional catalog photography, no text, no watermark, no logos, no brand names, sharp focus, realistic materials and lighting.";
+
+const BACKDROP_VARIANTS = [
+    "shot on a cool-white studio backdrop with a soft diffused shadow beneath it",
+    "shot on a warm light-grey studio backdrop with soft top-down lighting",
+    "shot on a pale stone-toned studio backdrop with gentle side lighting and a subtle reflection",
+    "shot on a crisp white cyclorama backdrop with even, shadowless studio lighting",
+    "shot on a muted sage-toned studio backdrop with soft directional lighting",
+    "shot on a soft charcoal-grey backdrop with a gentle rim light along one edge",
+    "shot on a pale sand-toned backdrop with warm low-angle lighting",
+    "shot on a cool slate-blue backdrop with even diffused overhead lighting",
+    "shot on an off-white textured backdrop with soft window-style natural light",
+];
+
+const ANGLE_VARIANTS = [
+    "photographed straight-on at eye level",
+    "photographed from a slightly elevated three-quarter angle",
+    "photographed from a low angle looking slightly upward",
+    "photographed from directly above, top-down",
+    "photographed from a tight three-quarter angle emphasizing depth",
+];
+
+const ACCENT_COLOR_VARIANTS = [
+    "deep blue", "amber orange", "forest green", "charcoal grey",
+    "burgundy red", "steel silver", "muted teal", "warm brass",
+];
+
+function composeStyle(seedKey) {
+    return [
+        pickFrom(BACKDROP_VARIANTS, "backdrop:" + seedKey),
+        pickFrom(ANGLE_VARIANTS, "angle:" + seedKey),
+        PHOTO_QUALITY_BASE,
+    ].join(", ");
+}
+
+// Container shape now gets its own small pool per archetype instead of one
+// fixed sentence, so items sharing an archetype (e.g. every kind of oil)
+// still land on visibly different packaging.
+const CONTAINER_ARCHETYPES = [
+    {
+        test: /oil|lubricant|grease|coolant|hydraulic fluid/i,
+        shapes: [
+            "a slim rectangular plastic jerry-can with a fold-out spout and ridged grip panels",
+            "a cylindrical metal drum with a screw-cap lid and a rolled rim",
+            "a wide-based plastic pail with a snap-on lid and a side carry handle",
+            "a tall bottle-style plastic jug with an integrated pour spout and a twist cap",
+        ],
+    },
+    {
+        test: /filter/i,
+        shapes: [
+            "a standalone spin-on cartridge filter with its threaded end and housing clearly visible",
+            "a panel-style filter element shown flat with its pleated media visible",
+        ],
+    },
+    {
+        test: /earbud|headphone|speaker|charger|cable|electronics/i,
+        shapes: [
+            "a sleek modern unit with a matte plastic and brushed-metal finish",
+            "a compact unit with a glossy plastic shell and rounded edges",
+        ],
+    },
+    {
+        test: /watch/i,
+        shapes: ["shown at a three-quarter angle with its strap visible and the screen softly lit showing a simple watch face"],
+    },
+    {
+        test: /bearing|fastener|bolt|nut|screw|hardware|gear/i,
+        shapes: ["a precision-machined metal component with a true-to-life material finish and geometry"],
+    },
+    {
+        test: /apparel|garment|fabric|textile|clothing/i,
+        shapes: ["neatly flat-laid, with visible fabric texture and natural folds"],
+    },
+];
+function pickContainerShape(seedKey, name, categoryName, subcategoryName) {
+    const haystack = `${name} ${categoryName || ""} ${subcategoryName || ""}`;
+    const archetype = CONTAINER_ARCHETYPES.find((c) => c.test.test(haystack));
+    return archetype
+        ? pickFrom(archetype.shapes, "shape:" + seedKey)
+        : "packaged or presented in a form realistic and typical for this exact product type";
+}
+
+const ARRANGEMENT_VARIANTS = [
+    "arranged in a loose diagonal cluster",
+    "arranged in a clean grid with even spacing",
+    "arranged in a loose scattered layout with slight overlap",
+];
 
 function categoryImagePrompt(name) {
-    return `Flat-lay of assorted everyday items representing the "${name}" product category for a B2B industrial marketplace, ${PHOTO_STYLE}`;
+    const seedKey = "cat:" + name;
+    const arrangement = pickFrom(ARRANGEMENT_VARIANTS, "arrangement:" + seedKey);
+    return `A curated flat-lay of 4-6 distinct items representing the "${name}" product category for a B2B industrial marketplace, items varied in shape and size, ${arrangement}, product centered horizontally with generous negative space, composed for a wide letterbox crop so nothing important sits near the top or bottom edge, ${composeStyle(seedKey)}`;
 }
 function subcategoryImagePrompt(name, categoryName) {
-    return `Flat-lay of assorted items representing the "${name}" subcategory within "${categoryName}" for a B2B industrial marketplace, ${PHOTO_STYLE}`;
+    const seedKey = "sub:" + name;
+    const arrangement = pickFrom(ARRANGEMENT_VARIANTS, "arrangement:" + seedKey);
+    return `A curated flat-lay of 3-5 distinct items representing the "${name}" subcategory within "${categoryName}" for a B2B industrial marketplace, items varied in shape and size, ${arrangement}, product centered horizontally with generous negative space, composed for a wide letterbox crop so nothing important sits near the top or bottom edge, ${composeStyle(seedKey)}`;
 }
-function productImagePrompt(name, description) {
-    return `Product photo of ${name}${description ? ` — ${description}` : ""}, centered, ${PHOTO_STYLE}`;
+function productImagePrompt(name, description, categoryName, subcategoryName) {
+    const seedKey = "prod:" + name;
+    const shape = pickContainerShape(seedKey, name, categoryName, subcategoryName);
+    const accent = pickFrom(ACCENT_COLOR_VARIANTS, "accent:" + seedKey);
+    return `Product photo of "${name}"${description ? ` — ${description}` : ""}, ${shape}, with a ${accent} accent on the cap, trim, or housing for visual distinction, product centered horizontally with generous negative space, composed for a wide letterbox crop so nothing important sits near the top or bottom edge, ${composeStyle(seedKey)}`;
+}
+function brandImagePrompt(brandItemName, brandName, attributes, categoryName, subcategoryName) {
+    // No synthetic accent color here on purpose — the brandLine below
+    // already asks for the real, accurate brand color scheme, and stacking
+    // a synthetic accent-color instruction on top of that just gives the
+    // image model conflicting signals and makes real brands look wrong.
+    const seedKey = "brand:" + brandItemName;
+    const specs = (attributes || []).map((a) => `${a.name}: ${a.value}`).join(", ");
+    const shape = pickContainerShape(seedKey, brandItemName, categoryName, subcategoryName);
+    const brandLine = brandName
+        ? ` Show it as an authentic ${brandName} retail product — accurate real-world packaging shape, proportions, and typical color scheme for this brand and product line, as closely as possible to how it actually looks on shelf.`
+        : "";
+    return `Product photo of ${brandItemName}${specs ? ` — ${specs}` : ""}, ${shape}.${brandLine} Product centered horizontally with generous negative space, composed for a wide letterbox crop so nothing important sits near the top or bottom edge, ${composeStyle(seedKey)}`;
 }
 
 async function generateAndAttachImage(table, id, prompt) {
@@ -183,7 +348,22 @@ async function resolveSubcategory(classification, categoryId, shortlists, embedd
     return createSubcategory(categoryId, classification.new_subcategory_name, embeddingByKey.subcategory);
 }
 
-async function resolveProduct(classification, subcategoryId, embeddingByKey, log) {
+async function resolveProduct(classification, subcategoryId, shortlists, embeddingByKey, log) {
+    // 0. LLM explicitly said this is the same generic product line as an
+    // existing candidate — the fix for "Engine Oil" / "10W-40 Engine Oil"
+    // / "Passenger Car Engine Oil" all existing as separate products.
+    if (classification.match_product_id) {
+        const { data } = await supabase
+            .from("hs_products")
+            .select("id, name, image, subcategory_id")
+            .eq("id", classification.match_product_id)
+            .maybeSingle();
+        if (data && data.subcategory_id === subcategoryId) {
+            log.info("product: matched via LLM match_product_id", data.id, data.name);
+            return { ...data, isNew: false };
+        }
+    }
+
     const name = classification.generic_name;
     if (!name || !subcategoryId) return null;
 
@@ -196,6 +376,30 @@ async function resolveProduct(classification, subcategoryId, embeddingByKey, log
     if (existing) {
         log.info("product: exact-name match found ->", existing.name);
         return { ...existing, isNew: false };
+    }
+
+    // Embedding-based safety net, scoped to this subcategory.
+    const top = shortlists.products.find((p) => p.subcategory_id === subcategoryId && p.similarity >= PRODUCT_DEDUPE_FLOOR);
+    if (top) {
+        log.warn(
+            `product: overriding LLM's "generic_name=${name}" — ` +
+            `reusing shortlisted "${top.name}" (similarity ${top.similarity.toFixed(3)} >= ${PRODUCT_DEDUPE_FLOOR})`
+        );
+        return { id: top.id, name: top.name, image: top.image, isNew: false };
+    }
+
+    // Governance/visibility: the shortlist now guarantees every existing
+    // product in this subcategory is present (see catalogShortlist.service
+    // .js), so if we're about to mint a new one anyway while siblings
+    // exist, that's worth a loud log line for a human to spot-check —
+    // rather than silently letting a duplicate pile up unnoticed until
+    // someone stumbles onto it in the catalog months later.
+    const siblingsInSubcategory = shortlists.products.filter((p) => p.subcategory_id === subcategoryId);
+    if (siblingsInSubcategory.length) {
+        log.warn(
+            `product: creating "${name}" as NEW despite ${siblingsInSubcategory.length} existing sibling(s) in this subcategory ` +
+            `(${siblingsInSubcategory.map((s) => s.name).join(", ")}) — flag for catalog review if this looks like a duplicate`
+        );
     }
 
     const slug = slugify(name);
@@ -263,14 +467,6 @@ function findDirectMatch(shortlists) {
     return null;
 }
 
-function brandImagePrompt(brandItemName, brandName, attributes) {
-    const specs = (attributes || []).map((a) => `${a.name}: ${a.value}`).join(", ");
-    const brandLine = brandName
-        ? ` Show it as an authentic ${brandName} retail product — accurate real-world packaging shape, proportions, and typical color scheme for this brand and product line, as closely as possible to how it actually looks on shelf.`
-        : "";
-    return `Product photo of ${brandItemName}${specs ? ` — ${specs}` : ""}, centered.${brandLine} ${PHOTO_STYLE}`;
-}
-
 async function resolveBrandItem(classification, productId, shortlists, embeddingByKey, log) {
     if (!classification.is_branded || !classification.brand_item_name || !productId) return null;
 
@@ -331,6 +527,7 @@ export async function resolveOrCreateCatalogEntry({ term, level, parentId }) {
         level,
         categoryShortlist: shortlists.categories,
         subcategoryShortlist: shortlists.subcategories,
+        productShortlist: shortlists.products,
     });
     log.info("classification result", classification);
 
@@ -351,46 +548,28 @@ export async function resolveOrCreateCatalogEntry({ term, level, parentId }) {
     const embeddingByKey = Object.fromEntries(namesToEmbed.map((n, i) => [n.key, embeddedValues[i]]));
 
     const categoryRow = await resolveCategory(classification, shortlists, embeddingByKey, log);
-    // const categoryRow = await resolveCategory(classification, shortlists, log);
     if (!categoryRow) {
         log.warn("could not resolve a category at all");
         return { success: true, resolved: false, reason: "We couldn't confidently categorize this item. Please try a more specific search term." };
     }
 
-    // if (categoryRow.isNew) {
-    //     const url = await generateAndAttachImage("hs_categories", categoryRow.id, categoryImagePrompt(categoryRow.name));
-    //     if (url) categoryRow.image = url;
-    // }
-
     const subcategoryRow = await resolveSubcategory(classification, categoryRow.id, shortlists, embeddingByKey, log);
-    // if (subcategoryRow?.isNew) {
-    //     const url = await generateAndAttachImage(
-    //         "hs_subcategories",
-    //         subcategoryRow.id,
-    //         subcategoryImagePrompt(subcategoryRow.name, categoryRow.name)
-    //     );
-    //     if (url) subcategoryRow.image = url;
-    // }
 
+    // FIX: was a strict string-equality check, which let "Passenger Car
+    // Engine Oil" (product) slip through under "Passenger Car Engine Oils"
+    // (subcategory) — the only difference was the trailing "s". Normalized
+    // comparison catches simple plural/punctuation variants too.
     const genericNameDuplicatesSubcategory =
         subcategoryRow && classification.generic_name &&
-        classification.generic_name.trim().toLowerCase() === subcategoryRow.name.trim().toLowerCase();
+        isTrivialRestatement(classification.generic_name, subcategoryRow.name);
     if (genericNameDuplicatesSubcategory) {
-        log.warn(`product: skipping — generic_name "${classification.generic_name}" duplicates subcategory name, would create redundant level`);
+        log.warn(`product: skipping — generic_name "${classification.generic_name}" duplicates subcategory name "${subcategoryRow.name}", would create redundant level`);
     }
     const productRow = subcategoryRow && !genericNameDuplicatesSubcategory
-        ? await resolveProduct(classification, subcategoryRow.id, embeddingByKey, log)
+        ? await resolveProduct(classification, subcategoryRow.id, shortlists, embeddingByKey, log)
         : null;
 
     const brandRow = productRow ? await resolveBrandItem(classification, productRow.id, shortlists, embeddingByKey, log) : null;
-    // if (productRow?.isNew) {
-    //     const url = await generateAndAttachImage(
-    //         "hs_products",
-    //         productRow.id,
-    //         productImagePrompt(productRow.name, classification.description)
-    //     );
-    //     if (url) productRow.image = url;
-    // }
 
     const stack = [
         { level: "category", id: categoryRow.id, name: categoryRow.name },
@@ -405,25 +584,12 @@ export async function resolveOrCreateCatalogEntry({ term, level, parentId }) {
     if (subcategoryRow?.isNew) pendingImages.push({ level: "subcategory", id: subcategoryRow.id, table: "hs_subcategories" });
     if (categoryRow.isNew) pendingImages.push({ level: "category", id: categoryRow.id, table: "hs_categories" });
 
-    // (async () => {
-    //     for (const p of pendingImages) {
-    //         const prompt =
-    //             p.level === "brand" ? brandImagePrompt(brandRow.name, classification.brand_name, classification.brand_attributes) :
-    //                 p.level === "product" ? productImagePrompt(productRow.name, classification.description) :
-    //                     p.level === "subcategory" ? subcategoryImagePrompt(subcategoryRow.name, categoryRow.name) :
-    //                         categoryImagePrompt(categoryRow.name);
-    //         log.info(`background image gen starting for ${p.level} ${p.id}`);
-    //         const url = await generateAndAttachImage(p.table, p.id, prompt);
-    //         log.info(`background image gen ${url ? "done" : "failed"} for ${p.level} ${p.id}`);
-    //     }
-    // })();
-
     waitUntil(
         Promise.all(
             pendingImages.map(async (p) => {
                 const prompt =
-                    p.level === "brand" ? brandImagePrompt(brandRow.name, classification.brand_name, classification.brand_attributes) :
-                        p.level === "product" ? productImagePrompt(productRow.name, classification.description) :
+                    p.level === "brand" ? brandImagePrompt(brandRow.name, classification.brand_name, classification.brand_attributes, categoryRow.name, subcategoryRow?.name) :
+                        p.level === "product" ? productImagePrompt(productRow.name, classification.description, categoryRow.name, subcategoryRow?.name) :
                             p.level === "subcategory" ? subcategoryImagePrompt(subcategoryRow.name, categoryRow.name) :
                                 categoryImagePrompt(categoryRow.name);
                 log.info(`background image gen starting for ${p.level} ${p.id}`);
