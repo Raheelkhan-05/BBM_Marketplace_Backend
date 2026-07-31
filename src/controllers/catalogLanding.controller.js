@@ -34,6 +34,7 @@ export async function getCategoryLanding(req, res) {
     const { data: category, error } = await supabase
         .from("hs_categories")
         .select("id, name, slug, image, hero_image, tagline, overview")
+        .neq("review_status", "rejected")
         .eq(isUuid ? "id" : "slug", idOrSlug)
         .single();
 
@@ -44,6 +45,7 @@ export async function getCategoryLanding(req, res) {
     const { data: subcategories, error: subError } = await supabase
         .from("hs_subcategories")
         .select("id, name, slug, image")
+        .neq("review_status", "rejected")
         .eq("category_id", category.id)
         .order("name")
         .limit(CARD_LIMIT);
@@ -52,7 +54,8 @@ export async function getCategoryLanding(req, res) {
     const { count: subcategoryCount } = await supabase
         .from("hs_subcategories")
         .select("id", { count: "exact", head: true })
-        .eq("category_id", category.id);
+        .eq("category_id", category.id)
+        .neq("review_status", "rejected");
 
     // Need the FULL subcategory id list (not just the CARD_LIMIT slice) to
     // compute accurate per-card counts + pull a representative product
@@ -60,7 +63,8 @@ export async function getCategoryLanding(req, res) {
     const { data: allSubIds } = await supabase
         .from("hs_subcategories")
         .select("id")
-        .eq("category_id", category.id);
+        .eq("category_id", category.id)
+        .neq("review_status", "rejected");
     const subIdList = (allSubIds || []).map((s) => s.id);
 
     let countsBySubcategory = {};
@@ -72,7 +76,8 @@ export async function getCategoryLanding(req, res) {
         const { data: productRows } = await supabase
             .from("hs_products")
             .select("id, name, slug, image, subcategory_id")
-            .in("subcategory_id", subIdList);
+            .in("subcategory_id", subIdList)
+            .neq("review_status", "rejected");
 
         for (const row of productRows || []) {
             countsBySubcategory[row.subcategory_id] = (countsBySubcategory[row.subcategory_id] || 0) + 1;
@@ -127,6 +132,7 @@ export async function getSubcategoryLanding(req, res) {
             id, name, slug, image, hero_image, tagline, overview, category_id,
             category:hs_categories ( id, name, slug )
         `)
+        .neq("review_status", "rejected")
         .eq(isUuid ? "id" : "slug", idOrSlug)
         .single();
 
@@ -138,6 +144,7 @@ export async function getSubcategoryLanding(req, res) {
         .from("hs_products")
         .select("id, name, slug, image, description")
         .eq("subcategory_id", subcategory.id)
+        .neq("review_status", "rejected")
         .order("name")
         .limit(CARD_LIMIT);
     if (prodError) return res.status(500).json({ success: false, message: prodError.message });
@@ -145,14 +152,16 @@ export async function getSubcategoryLanding(req, res) {
     const { count: productCount } = await supabase
         .from("hs_products")
         .select("id", { count: "exact", head: true })
-        .eq("subcategory_id", subcategory.id);
+        .eq("subcategory_id", subcategory.id)
+        .neq("review_status", "rejected");
 
     // Need every product id under this subcategory (not just the CARD_LIMIT
     // slice) to get accurate seller counts + a representative brand preview.
     const { data: allProductRows } = await supabase
         .from("hs_products")
         .select("id")
-        .eq("subcategory_id", subcategory.id);
+        .eq("subcategory_id", subcategory.id)
+        .neq("review_status", "rejected");
     const allProductIds = (allProductRows || []).map((p) => p.id);
 
     let sellerCountByProduct = {};
@@ -174,6 +183,7 @@ export async function getSubcategoryLanding(req, res) {
             .from("hs_product_brands")
             .select("id, name, brand_name, image, product_id")
             .in("product_id", allProductIds)
+            .neq("review_status", "rejected")
             .limit(PREVIEW_LIMIT * 3); // over-fetch a little, dedupe by brand_name below
 
         const seenBrandNames = new Set();

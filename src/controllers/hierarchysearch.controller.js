@@ -18,6 +18,7 @@ export async function searchCategories(req, res) {
     let query = supabase
         .from("hs_categories")
         .select("id, name, slug, image")
+        .neq("review_status", "rejected")
         .order("name")
         .limit(clampLimit(limit));
 
@@ -37,6 +38,7 @@ export async function searchSubcategories(req, res) {
         .from("hs_subcategories")
         .select("id, category_id, name, slug, image")
         .eq("category_id", categoryId)
+        .neq("review_status", "rejected")
         .order("name")
         .limit(clampLimit(limit));
 
@@ -56,6 +58,7 @@ export async function searchProducts(req, res) {
         .from("hs_products")
         .select("id, subcategory_id, name, slug, image, description")
         .eq("subcategory_id", subcategoryId)
+        .neq("review_status", "rejected")
         .order("name")
         .limit(clampLimit(limit));
 
@@ -75,6 +78,7 @@ export async function searchBrands(req, res) {
         .from("hs_product_brands")
         .select("id, product_id, name, brand_name, slug, image, description, attributes")
         .eq("product_id", productId)
+        .neq("review_status", "rejected")
         .order("name")
         .limit(clampLimit(limit));
 
@@ -147,27 +151,15 @@ export async function smartSearch(req, res) {
     const cap = clampLimit(limit) > 10 ? 5 : clampLimit(limit);
 
     const [catRes, subRes, prodRes, brandRes] = await Promise.all([
-        supabase.from("hs_categories").select("id, name, slug, image").ilike("name", `%${term}%`).limit(cap),
-        supabase
-            .from("hs_subcategories")
-            .select("id, name, slug, image, category_id, category:hs_categories(id, name, slug)")
-            .ilike("name", `%${term}%`)
-            .limit(cap),
-        supabase
-            .from("hs_products")
-            .select("id, name, slug, image, subcategory_id, subcategory:hs_subcategories(id, name, slug, category_id, category:hs_categories(id, name, slug))")
-            .ilike("name", `%${term}%`)
-            .limit(cap),
-        supabase
-            .from("hs_product_brands")
-            .select(`
-                id, name, brand_name, slug, image, product_id,
-                product:hs_products(id, name, slug, subcategory_id,
-                    subcategory:hs_subcategories(id, name, slug, category_id,
-                        category:hs_categories(id, name, slug)))
-            `)
-            .or(`name.ilike.%${term}%,brand_name.ilike.%${term}%`)
-            .limit(cap),
+        supabase.from("hs_categories").select("id, name, slug, image").neq("review_status", "rejected").ilike("name", `%${term}%`).limit(cap),
+        supabase.from("hs_subcategories").select("id, name, slug, image, category_id, category:hs_categories(id, name, slug)").neq("review_status", "rejected").ilike("name", `%${term}%`).limit(cap),
+        supabase.from("hs_products").select("id, name, slug, image, subcategory_id, subcategory:hs_subcategories(id, name, slug, category_id, category:hs_categories(id, name, slug))").neq("review_status", "rejected").ilike("name", `%${term}%`).limit(cap),
+        supabase.from("hs_product_brands").select(`
+        id, name, brand_name, slug, image, product_id,
+        product:hs_products(id, name, slug, subcategory_id,
+            subcategory:hs_subcategories(id, name, slug, category_id,
+                category:hs_categories(id, name, slug)))
+    `).neq("review_status", "rejected").or(`name.ilike.%${term}%,brand_name.ilike.%${term}%`).limit(cap),
     ]);
 
     if (catRes.error) return res.status(500).json({ success: false, message: catRes.error.message });
@@ -315,10 +307,10 @@ export async function searchAutocomplete(req, res) {
     const pattern = `%${term}%`; // trgm-indexed on all 4 tables, fast either way
 
     const [catRes, subRes, prodRes, brandRes] = await Promise.all([
-        supabase.from("hs_categories").select("id, name, slug").ilike("name", pattern).order("name").limit(perTable),
-        supabase.from("hs_subcategories").select("id, name, slug").ilike("name", pattern).order("name").limit(perTable),
-        supabase.from("hs_products").select("id, name, slug").ilike("name", pattern).order("name").limit(perTable),
-        supabase.from("hs_product_brands").select("id, name, brand_name, slug").or(`name.ilike.${pattern},brand_name.ilike.${pattern}`).order("name").limit(perTable),
+        supabase.from("hs_categories").select("id, name, slug").neq("review_status", "rejected").ilike("name", pattern).order("name").limit(perTable),
+        supabase.from("hs_subcategories").select("id, name, slug").neq("review_status", "rejected").ilike("name", pattern).order("name").limit(perTable),
+        supabase.from("hs_products").select("id, name, slug").neq("review_status", "rejected").ilike("name", pattern).order("name").limit(perTable),
+        supabase.from("hs_product_brands").select("id, name, brand_name, slug").neq("review_status", "rejected").or(`name.ilike.${pattern},brand_name.ilike.${pattern}`).order("name").limit(perTable),
     ]);
 
     if (catRes.error || subRes.error || prodRes.error || brandRes.error) {

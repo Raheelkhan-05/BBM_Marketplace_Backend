@@ -261,7 +261,7 @@ async function createCategory(name, embedding) {
     const slug = slugify(name);
     return insertOrFetchOnConflict(
         "hs_categories",
-        { name, slug, is_ai_generated: true, embedding },
+        { name, slug, is_ai_generated: true, embedding, review_status: "pending_review" },
         { slug },
         "id, name, image"
     );
@@ -271,7 +271,7 @@ async function createSubcategory(categoryId, name, embedding) {
     const slug = slugify(name);
     return insertOrFetchOnConflict(
         "hs_subcategories",
-        { category_id: categoryId, name, slug, is_ai_generated: true, embedding },
+        { category_id: categoryId, name, slug, is_ai_generated: true, embedding, review_status: "pending_review" },
         { category_id: categoryId, slug },
         "id, name, image"
     );
@@ -425,6 +425,7 @@ async function resolveProduct(classification, subcategoryId, shortlists, embeddi
             attributes: Object.fromEntries((classification.attributes || []).map((a) => [a.name, a.value])),
             is_ai_generated: true,
             embedding,
+            review_status: "pending_review",
         },
         { subcategory_id: subcategoryId, slug },
         "id, name, image"
@@ -505,6 +506,7 @@ async function resolveBrandItem(classification, productId, shortlists, embedding
             attributes: Object.fromEntries((classification.brand_attributes || []).map((a) => [a.name, a.value])),
             is_ai_generated: true,
             embedding: embeddingByKey.brand,
+            review_status: "pending_review",
         },
         { product_id: productId, slug },
         "id, name, image"
