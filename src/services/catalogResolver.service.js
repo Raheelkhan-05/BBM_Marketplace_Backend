@@ -102,16 +102,24 @@ function pickFrom(list, seedKey) {
 const PHOTO_QUALITY_BASE =
     "professional catalog photography, no text, no watermark, no logos, no brand names, sharp focus, realistic materials and lighting.";
 
+// const BACKDROP_VARIANTS = [
+//     "shot on a cool-white studio backdrop with a soft diffused shadow beneath it",
+//     "shot on a warm light-grey studio backdrop with soft top-down lighting",
+//     "shot on a pale stone-toned studio backdrop with gentle side lighting and a subtle reflection",
+//     "shot on a crisp white cyclorama backdrop with even, shadowless studio lighting",
+//     "shot on a muted sage-toned studio backdrop with soft directional lighting",
+//     "shot on a soft charcoal-grey backdrop with a gentle rim light along one edge",
+//     "shot on a pale sand-toned backdrop with warm low-angle lighting",
+//     "shot on a cool slate-blue backdrop with even diffused overhead lighting",
+//     "shot on an off-white textured backdrop with soft window-style natural light",
+// ];
+
 const BACKDROP_VARIANTS = [
-    "shot on a cool-white studio backdrop with a soft diffused shadow beneath it",
-    "shot on a warm light-grey studio backdrop with soft top-down lighting",
-    "shot on a pale stone-toned studio backdrop with gentle side lighting and a subtle reflection",
-    "shot on a crisp white cyclorama backdrop with even, shadowless studio lighting",
-    "shot on a muted sage-toned studio backdrop with soft directional lighting",
-    "shot on a soft charcoal-grey backdrop with a gentle rim light along one edge",
-    "shot on a pale sand-toned backdrop with warm low-angle lighting",
-    "shot on a cool slate-blue backdrop with even diffused overhead lighting",
-    "shot on an off-white textured backdrop with soft window-style natural light",
+    "shot on a solid light-grey studio backdrop (hex #DBDBDB) with soft diffused shadow beneath it",
+    "shot on a solid light-grey studio backdrop (hex #DADADC) with even, shadowless studio lighting",
+    "shot on a solid light-grey studio backdrop (hex #DBDBDB) with soft top-down lighting and a subtle reflection",
+    "shot on a solid light-grey studio backdrop (hex #DADADC) with a gentle rim light along one edge",
+    "shot on a solid light-grey studio backdrop (hex #DBDBDB) with soft directional lighting",
 ];
 
 const ANGLE_VARIANTS = [
