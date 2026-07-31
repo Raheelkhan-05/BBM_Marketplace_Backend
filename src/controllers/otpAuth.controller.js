@@ -74,7 +74,7 @@ export async function verifyLoginOtp(req, res) {
 
     const { profile, isNewUser } = await findOrCreateProfile(channel, value);
     console.log("[verifyLoginOtp] profile.id used for token:", profile.id);
-    const token = jwt.sign({ sub: profile.id }, AUTH_JWT_SECRET, { expiresIn: "12h" });
+    const token = jwt.sign({ sub: profile.id }, AUTH_JWT_SECRET, { expiresIn: "168h" });
 
     return res.json({ success: true, token, isNewUser, onboardingStep: profile.onboarding_step, profile });
   } catch (e) {
