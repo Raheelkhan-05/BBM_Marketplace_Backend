@@ -146,20 +146,23 @@ export async function smartSearch(req, res) {
     const { q = "", limit } = req.query;
     const term = q.trim();
     if (term.length < 2) {
-        return res.json({ success: true, exact: null, suggestions: { categories: [], subcategories: [], products: [] } });
+        return res.json({ success: true, exact: null, rejectedExact: null, suggestions: { categories: [], subcategories: [], products: [] } });
     }
     const cap = clampLimit(limit) > 10 ? 5 : clampLimit(limit);
 
+    // NOTE: review_status is now selected (not filtered at the query level)
+    // so we can separate "active, show as suggestion" from "rejected,
+    // exact-match-only, tells the caller not to bother the AI" ourselves.
     const [catRes, subRes, prodRes, brandRes] = await Promise.all([
-        supabase.from("hs_categories").select("id, name, slug, image").neq("review_status", "rejected").ilike("name", `%${term}%`).limit(cap),
-        supabase.from("hs_subcategories").select("id, name, slug, image, category_id, category:hs_categories(id, name, slug)").neq("review_status", "rejected").ilike("name", `%${term}%`).limit(cap),
-        supabase.from("hs_products").select("id, name, slug, image, subcategory_id, subcategory:hs_subcategories(id, name, slug, category_id, category:hs_categories(id, name, slug))").neq("review_status", "rejected").ilike("name", `%${term}%`).limit(cap),
+        supabase.from("hs_categories").select("id, name, slug, image, review_status").ilike("name", `%${term}%`).limit(cap * 3),
+        supabase.from("hs_subcategories").select("id, name, slug, image, category_id, review_status, category:hs_categories(id, name, slug)").ilike("name", `%${term}%`).limit(cap * 3),
+        supabase.from("hs_products").select("id, name, slug, image, subcategory_id, review_status, subcategory:hs_subcategories(id, name, slug, category_id, category:hs_categories(id, name, slug))").ilike("name", `%${term}%`).limit(cap * 3),
         supabase.from("hs_product_brands").select(`
-        id, name, brand_name, slug, image, product_id,
+        id, name, brand_name, slug, image, product_id, review_status,
         product:hs_products(id, name, slug, subcategory_id,
             subcategory:hs_subcategories(id, name, slug, category_id,
                 category:hs_categories(id, name, slug)))
-    `).neq("review_status", "rejected").or(`name.ilike.%${term}%,brand_name.ilike.%${term}%`).limit(cap),
+    `).or(`name.ilike.%${term}%,brand_name.ilike.%${term}%`).limit(cap * 3),
     ]);
 
     if (catRes.error) return res.status(500).json({ success: false, message: catRes.error.message });
@@ -167,15 +170,34 @@ export async function smartSearch(req, res) {
     if (prodRes.error) return res.status(500).json({ success: false, message: prodRes.error.message });
     if (brandRes.error) return res.status(500).json({ success: false, message: brandRes.error.message });
 
-    const categories = catRes.data || [];
-    const subcategories = subRes.data || [];
-    const products = prodRes.data || [];
-    const brands = brandRes.data || [];
+    const allCategories = catRes.data || [];
+    const allSubcategories = subRes.data || [];
+    const allProducts = prodRes.data || [];
+    const allBrands = brandRes.data || [];
 
     const isExact = (name) => name.toLowerCase() === term.toLowerCase();
 
-    // Deepest exact match wins (product > subcategory > category) since it's
-    // the most specific thing the user could have typed.
+    // Only rejected rows matter for the "don't call the AI" check — an exact
+    // rejected match means this term was already reviewed and declined.
+    const rejectedExactBrand = allBrands.find((b) => b.review_status === "rejected" && isExact(b.name));
+    const rejectedExactProduct = allProducts.find((p) => p.review_status === "rejected" && isExact(p.name));
+    const rejectedExactSubcategory = allSubcategories.find((s) => s.review_status === "rejected" && isExact(s.name));
+    const rejectedExactCategory = allCategories.find((c) => c.review_status === "rejected" && isExact(c.name));
+
+    let rejectedExact = null;
+    if (rejectedExactBrand) rejectedExact = { level: "brand", name: rejectedExactBrand.name };
+    else if (rejectedExactProduct) rejectedExact = { level: "product", name: rejectedExactProduct.name };
+    else if (rejectedExactSubcategory) rejectedExact = { level: "subcategory", name: rejectedExactSubcategory.name };
+    else if (rejectedExactCategory) rejectedExact = { level: "category", name: rejectedExactCategory.name };
+
+    // Everything below this line — suggestions and the "exact" match used to
+    // jump straight to a page — only ever considers active (non-rejected) rows,
+    // same as before.
+    const categories = allCategories.filter((c) => c.review_status !== "rejected").slice(0, cap);
+    const subcategories = allSubcategories.filter((s) => s.review_status !== "rejected").slice(0, cap);
+    const products = allProducts.filter((p) => p.review_status !== "rejected").slice(0, cap);
+    const brands = allBrands.filter((b) => b.review_status !== "rejected").slice(0, cap);
+
     const exactBrand = brands.find((b) => isExact(b.name));
     const exactProduct = products.find((p) => isExact(p.name));
     const exactSubcategory = subcategories.find((s) => isExact(s.name));
@@ -222,44 +244,29 @@ export async function smartSearch(req, res) {
     res.json({
         success: true,
         exact,
+        rejectedExact, // frontend/AI-resolve should treat this as "stop, don't call the AI"
         suggestions: {
             categories: categories.map((c) => ({ id: c.id, name: c.name, image: c.image, subtitle: null })),
             subcategories: subcategories.map((s) => ({
-                id: s.id,
-                name: s.name,
-                image: s.image,
-                categoryId: s.category?.id,
-                categoryName: s.category?.name,
+                id: s.id, name: s.name, image: s.image,
+                categoryId: s.category?.id, categoryName: s.category?.name,
                 subtitle: s.category ? `in ${s.category.name}` : null,
             })),
             products: products.map((p) => ({
-                id: p.id,
-                name: p.name,
-                image: p.image,
-                subcategoryId: p.subcategory?.id,
-                subcategoryName: p.subcategory?.name,
-                categoryId: p.subcategory?.category?.id,
-                categoryName: p.subcategory?.category?.name,
-                subtitle:
-                    p.subcategory?.category && p.subcategory
-                        ? `in ${p.subcategory.category.name} > ${p.subcategory.name}`
-                        : null,
+                id: p.id, name: p.name, image: p.image,
+                subcategoryId: p.subcategory?.id, subcategoryName: p.subcategory?.name,
+                categoryId: p.subcategory?.category?.id, categoryName: p.subcategory?.category?.name,
+                subtitle: p.subcategory?.category && p.subcategory ? `in ${p.subcategory.category.name} > ${p.subcategory.name}` : null,
             })),
             brands: brands.map((b) => {
                 const p = b.product;
                 const sc = p?.subcategory;
                 const c = sc?.category;
                 return {
-                    id: b.id,
-                    name: b.name,
-                    brandName: b.brand_name,
-                    image: b.image,
-                    productId: p?.id,
-                    productName: p?.name,
-                    subcategoryId: sc?.id,
-                    subcategoryName: sc?.name,
-                    categoryId: c?.id,
-                    categoryName: c?.name,
+                    id: b.id, name: b.name, brandName: b.brand_name, image: b.image,
+                    productId: p?.id, productName: p?.name,
+                    subcategoryId: sc?.id, subcategoryName: sc?.name,
+                    categoryId: c?.id, categoryName: c?.name,
                     subtitle: c && sc && p ? `in ${c.name} > ${sc.name} > ${p.name}` : null,
                 };
             }),

@@ -5,9 +5,21 @@ import { slugify } from "../services/slugify.js";
 
 const LEVEL_CONFIG = {
     category: { table: "hs_categories", label: "Category", editableFields: ["name", "slug", "image", "tagline", "hero_image", "overview"], embed: null },
-    subcategory: { table: "hs_subcategories", label: "Subcategory", editableFields: ["name", "slug", "image", "tagline", "hero_image", "overview"], embed: "hs_categories(id, name)" },
-    product: { table: "hs_products", label: "Product", editableFields: ["name", "slug", "image", "description", "generic_name", "variants", "attributes"], embed: "hs_subcategories(id, name, hs_categories(id, name))" },
-    brand: { table: "hs_product_brands", label: "Brand Item", editableFields: ["name", "slug", "image", "brand_name", "description", "variants", "attributes"], embed: "hs_products(id, name, hs_subcategories(id, name, hs_categories(id, name)))" },
+    subcategory: {
+        table: "hs_subcategories", label: "Subcategory",
+        editableFields: ["name", "slug", "image", "tagline", "hero_image", "overview"],
+        embed: "hs_categories(id, name, review_status)",
+    },
+    product: {
+        table: "hs_products", label: "Product",
+        editableFields: ["name", "slug", "image", "description", "generic_name", "variants", "attributes"],
+        embed: "hs_subcategories(id, name, review_status, hs_categories(id, name, review_status))",
+    },
+    brand: {
+        table: "hs_product_brands", label: "Brand Item",
+        editableFields: ["name", "slug", "image", "brand_name", "description", "variants", "attributes"],
+        embed: "hs_products(id, name, review_status, hs_subcategories(id, name, review_status, hs_categories(id, name, review_status)))",
+    },
 };
 
 const CREATE_CONFIG = {
@@ -32,6 +44,26 @@ function cfgFor(level, res) {
     return cfg;
 }
 
+// True if any ancestor in this entity's chain has been rejected. Rejection
+// doesn't cascade-delete children (they're kept around so the AI resolver
+// won't recreate them), but a child with a rejected parent has nowhere
+// valid to live and shouldn't clutter the review queue.
+function hasRejectedAncestor(level, row) {
+    if (level === "subcategory") {
+        return row.hs_categories?.review_status === "rejected";
+    }
+    if (level === "product") {
+        const sc = row.hs_subcategories;
+        return sc?.review_status === "rejected" || sc?.hs_categories?.review_status === "rejected";
+    }
+    if (level === "brand") {
+        const p = row.hs_products;
+        const sc = p?.hs_subcategories;
+        return p?.review_status === "rejected" || sc?.review_status === "rejected" || sc?.hs_categories?.review_status === "rejected";
+    }
+    return false;
+}
+
 // GET /api/admin/catalog?level=all|category|subcategory|product|brand&status=pending_review|approved|rejected|all&q=
 export async function listCatalogEntries(req, res) {
     const { level = "all", status = "pending_review", q = "" } = req.query;
@@ -51,7 +83,9 @@ export async function listCatalogEntries(req, res) {
                 if (q) query = query.ilike("name", `%${q}%`);
                 const { data, error } = await query;
                 if (error) throw error;
-                return (data || []).map((row) => ({ ...row, level: lvl }));
+                return (data || [])
+                    .filter((row) => !hasRejectedAncestor(lvl, row))
+                    .map((row) => ({ ...row, level: lvl }));
             })
         );
 
@@ -77,8 +111,6 @@ export async function getCatalogEntry(req, res) {
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!data) return res.status(404).json({ success: false, message: "Not found." });
 
-    // Flatten every ancestor rung this entity has, regardless of its own level,
-    // so the frontend can prefill the whole cascading chain in one shot.
     let ancestors = {};
     if (level === "subcategory") {
         ancestors = { category: data.hs_categories ? { id: data.hs_categories.id, name: data.hs_categories.name } : null };
@@ -98,7 +130,14 @@ export async function getCatalogEntry(req, res) {
         };
     }
 
-    res.json({ success: true, level, editableFields: cfg.editableFields, entry: data, ancestors });
+    res.json({
+        success: true,
+        level,
+        editableFields: cfg.editableFields,
+        entry: data,
+        ancestors,
+        parentRejected: hasRejectedAncestor(level, data),
+    });
 }
 
 // PATCH /api/admin/catalog/:level/:id  — save edits without changing review_status

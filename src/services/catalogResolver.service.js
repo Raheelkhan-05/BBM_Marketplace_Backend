@@ -72,6 +72,28 @@ function isTrivialRestatement(a, b) {
     return na.replace(/s$/, "") === nb.replace(/s$/, "");
 }
 
+// Checks if `term` exactly matches a previously-rejected row at any level.
+// Rejected rows are kept in the DB specifically so terms don't get
+// reclassified and recreated — but that only saves cost if we actually
+// check for them BEFORE spending on embeddings or an LLM call, not after.
+async function findRejectedExactMatch(term) {
+    const trimmed = term.trim();
+    if (!trimmed) return null;
+
+    const [cat, sub, prod, brand] = await Promise.all([
+        supabase.from("hs_categories").select("id, name").eq("review_status", "rejected").ilike("name", trimmed).maybeSingle(),
+        supabase.from("hs_subcategories").select("id, name").eq("review_status", "rejected").ilike("name", trimmed).maybeSingle(),
+        supabase.from("hs_products").select("id, name").eq("review_status", "rejected").ilike("name", trimmed).maybeSingle(),
+        supabase.from("hs_product_brands").select("id, name, brand_name").eq("review_status", "rejected").or(`name.ilike.${trimmed},brand_name.ilike.${trimmed}`).maybeSingle(),
+    ]);
+
+    if (brand.data) return { level: "brand", name: brand.data.name };
+    if (prod.data) return { level: "product", name: prod.data.name };
+    if (sub.data) return { level: "subcategory", name: sub.data.name };
+    if (cat.data) return { level: "category", name: cat.data.name };
+    return null;
+}
+
 // ---- image prompt variety ----
 //
 // Previously every category/subcategory/product/brand image used the same
@@ -520,7 +542,23 @@ export async function resolveOrCreateCatalogEntry({ term, level, parentId }) {
     const log = createResolveLogger(term);
     log.info("start", { level, parentId });
 
+    // Check for a previously-rejected exact match FIRST, before spending
+    // anything on embeddings or the LLM — this is the entire point of
+    // keeping rejected rows around instead of deleting them.
+    const rejectedMatch = await findRejectedExactMatch(term);
+    if (rejectedMatch) {
+        log.warn("term was already reviewed and rejected, skipping AI entirely ->", rejectedMatch);
+        return {
+            success: true,
+            resolved: false,
+            aiGenerated: false,
+            rejected: true,
+            reason: "This item was already reviewed and isn't available for listing on BBM Marketplace.",
+        };
+    }
+
     const shortlists = await getShortlists(term);
+
     log.info("shortlists", {
         categories: shortlists.categories.map((c) => `${c.name}(${c.similarity.toFixed(3)})`),
         subcategories: shortlists.subcategories.map((s) => `${s.name}(${s.similarity.toFixed(3)})`),
