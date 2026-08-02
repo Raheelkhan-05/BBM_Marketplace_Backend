@@ -36,6 +36,27 @@ Do not split one product's name/description/specs across multiple
 entries just because they appear on separate lines — combine them into
 one entry. Do not merge two visually distinct products into one entry
 even if their text blocks are close together.
+
+BRAND vs. SELLING COMPANY — a critical distinction this document type
+often blurs. Two DIFFERENT things can appear on a catalog page:
+1. The actual PRODUCT BRAND — the name the parts themselves are sold
+   under. Look for: a small logo/watermark mark, a URL/domain fragment
+   (e.g. "www.zxlbearing.com" implies the brand is "ZXL Bearing" or
+   "ZXL"), or a brand name printed directly on the product photos.
+2. The SELLING / MANUFACTURING COMPANY — usually printed prominently in
+   a footer, header, or letterhead (e.g. "YOGI HI-TECH PVT. LTD.").
+   This is the business that MAKES or DISTRIBUTES the parts — it is
+   NOT automatically the brand_name, even though it's often the most
+   visually prominent text on the page.
+
+Rule: if a URL, logo mark, or small brand watermark suggests a DIFFERENT
+name than the footer/letterhead company name, use that smaller/quieter
+signal as brand_name — it is more likely the actual product brand. Only
+fall back to the letterhead company name as brand_name if there is truly
+no other brand indicator anywhere on the page. When in doubt because a
+distinct company name AND a distinct brand-like mark both appear, prefer
+the brand-like mark (logo, watermark, product-line name near a URL) over
+the large letterhead text.
 `.trim();
 
 const VISION_SCHEMA = {

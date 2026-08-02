@@ -28,13 +28,17 @@ function getNewTargetsForRow(row) {
 }
 
 async function attachImageForTarget(row, target, fileBuffer, jobId) {
-    // Only the brand level (most specific) is worth trying the PDF's own
-    // extracted photo for — a category/subcategory/product image should
-    // represent the whole line, not one specific SKU's crop.
-    if (target.level === "brand" && row.hasImage && row.imageBbox && row.sourcePage) {
-        const cropped = await tryBboxCrop(row, target, fileBuffer, jobId);
-        if (cropped) return;
-    }
+    // Cropping straight from the PDF was giving noticeably lower quality
+    // than the AI-generated catalog images used for every other level —
+    // skip the crop attempt entirely and always generate for brand items
+    // too, so all four levels get the same polished, consistent look.
+    // (Previous crop-first behavior is commented below in case you want
+    // to A/B it again later.)
+    //
+    // if (target.level === "brand" && row.hasImage && row.imageBbox && row.sourcePage) {
+    //     const cropped = await tryBboxCrop(row, target, fileBuffer, jobId);
+    //     if (cropped) return;
+    // }
 
     const prompt =
         target.level === "brand" ? brandImagePrompt(target.data.name, row.classification?.brand_name, row.classification?.brand_attributes, row.categoryRow?.name, row.subcategoryRow?.name)

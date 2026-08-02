@@ -311,28 +311,36 @@ export async function searchAutocomplete(req, res) {
 
     const cap = Math.min(Number(limit) || 8, 10);
     const perTable = 4;
-    const pattern = `%${term}%`; // trgm-indexed on all 4 tables, fast either way
+    const pattern = `%${term}%`;
 
-    const [catRes, subRes, prodRes, brandRes] = await Promise.all([
+    const [catRes, subRes, prodRes, brandRes, brandFamilyRes] = await Promise.all([
         supabase.from("hs_categories").select("id, name, slug").neq("review_status", "rejected").ilike("name", pattern).order("name").limit(perTable),
         supabase.from("hs_subcategories").select("id, name, slug").neq("review_status", "rejected").ilike("name", pattern).order("name").limit(perTable),
         supabase.from("hs_products").select("id, name, slug").neq("review_status", "rejected").ilike("name", pattern).order("name").limit(perTable),
         supabase.from("hs_product_brands").select("id, name, brand_name, slug").neq("review_status", "rejected").or(`name.ilike.${pattern},brand_name.ilike.${pattern}`).order("name").limit(perTable),
+        // NEW: dedicated lookup so a brand FAMILY (e.g. "Yogi Hi-Tech") gets its
+        // own suggestion row, separate from any individual SKU it makes.
+        // Only need brand_name here — dedup happens in JS below.
+        supabase.from("hs_product_brands").select("brand_name").neq("review_status", "rejected").not("brand_name", "is", null).ilike("brand_name", pattern).limit(30),
     ]);
 
-    if (catRes.error || subRes.error || prodRes.error || brandRes.error) {
+    if (catRes.error || subRes.error || prodRes.error || brandRes.error || brandFamilyRes.error) {
         return res.json({ success: true, suggestions: [] });
     }
+
+    // Collapse to unique brand_name values, then keep just a couple —
+    // this is a suggestion category, not a results list.
+    const uniqueBrandFamilies = [...new Set((brandFamilyRes.data || []).map((r) => r.brand_name).filter(Boolean))].slice(0, 3);
 
     const raw = [
         ...(catRes.data || []).map((c) => ({ id: c.id, name: c.name, level: "category" })),
         ...(subRes.data || []).map((s) => ({ id: s.id, name: s.name, level: "subcategory" })),
         ...(prodRes.data || []).map((p) => ({ id: p.id, name: p.name, level: "product" })),
         ...(brandRes.data || []).map((b) => ({ id: b.id, name: b.name, brandName: b.brand_name, level: "brand" })),
+        // NEW: brand-family suggestions, ranked and deduped alongside everything else
+        ...uniqueBrandFamilies.map((name) => ({ id: `brand-family:${name}`, name, level: "brandFamily" })),
     ];
 
-    // Rank: exact prefix match first, then "starts with a word", then rest —
-    // makes typing "bear" surface "Bearing" above "Ball Bearing".
     const lowerTerm = term.toLowerCase();
     const rank = (s) => {
         const n = s.name.toLowerCase();
@@ -345,7 +353,7 @@ export async function searchAutocomplete(req, res) {
     const seen = new Set();
     const deduped = [];
     for (const s of raw) {
-        const key = s.name.trim().toLowerCase();
+        const key = `${s.level}:${s.name.trim().toLowerCase()}`;
         if (seen.has(key)) continue;
         seen.add(key);
         deduped.push(s);
@@ -353,4 +361,93 @@ export async function searchAutocomplete(req, res) {
     }
 
     res.json({ success: true, suggestions: deduped });
+}
+
+// GET /api/search/brand-family?brandName=Castrol&limit=50
+// Reverse lookup: given a brand name, find every product (and its
+// subcategory/category ancestry) that carries that brand — i.e. the
+// full "family" of places this brand shows up across the catalog.
+export async function searchBrandFamily(req, res) {
+    const { brandName, limit } = req.query;
+    if (!brandName || !brandName.trim()) {
+        return res.status(400).json({ success: false, message: "brandName is required." });
+    }
+    const term = brandName.trim();
+
+    const { data, error } = await supabase
+        .from("hs_product_brands")
+        .select(`
+      id, name, brand_name, slug, image, description, attributes, product_id,
+      product:hs_products (
+        id, name, slug,
+        subcategory:hs_subcategories (
+          id, name, slug,
+          category:hs_categories ( id, name, slug )
+        )
+      )
+    `)
+        .or(`brand_name.ilike.%${term}%,name.ilike.%${term}%`)
+        .neq("review_status", "rejected")
+        .order("name")
+        .limit(clampLimit(limit));
+
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    const rows = data || [];
+
+    // Group by category -> subcategory -> product, each carrying the
+    // matching brand entries, so the frontend can render a tree instead
+    // of a flat list of brand rows.
+    const categoriesMap = new Map();
+
+    for (const row of rows) {
+        const p = row.product;
+        const sc = p?.subcategory;
+        const c = sc?.category;
+        if (!p || !sc || !c) continue; // skip orphaned brand rows
+
+        if (!categoriesMap.has(c.id)) {
+            categoriesMap.set(c.id, { id: c.id, name: c.name, slug: c.slug, subcategories: new Map() });
+        }
+        const catEntry = categoriesMap.get(c.id);
+
+        if (!catEntry.subcategories.has(sc.id)) {
+            catEntry.subcategories.set(sc.id, { id: sc.id, name: sc.name, slug: sc.slug, products: new Map() });
+        }
+        const subEntry = catEntry.subcategories.get(sc.id);
+
+        if (!subEntry.products.has(p.id)) {
+            subEntry.products.set(p.id, { id: p.id, name: p.name, slug: p.slug, brands: [] });
+        }
+        subEntry.products.get(p.id).brands.push({
+            id: row.id,
+            name: row.name,
+            brandName: row.brand_name,
+            image: row.image,
+            description: row.description,
+            attributes: row.attributes,
+        });
+    }
+
+    // Flatten the Maps into plain arrays for JSON.
+    const categories = [...categoriesMap.values()].map((c) => ({
+        ...c,
+        subcategories: [...c.subcategories.values()].map((sc) => ({
+            ...sc,
+            products: [...sc.products.values()],
+        })),
+    }));
+
+    const totalProducts = categories.reduce(
+        (sum, c) => sum + c.subcategories.reduce((s, sc) => s + sc.products.length, 0),
+        0
+    );
+
+    res.json({
+        success: true,
+        brandName: term,
+        totalMatches: rows.length,
+        totalProducts,
+        categories,
+    });
 }

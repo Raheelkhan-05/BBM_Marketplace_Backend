@@ -7,7 +7,8 @@ import {
     searchHierarchy,
     searchBrands,
     smartSearch,
-    searchAutocomplete
+    searchAutocomplete,
+    searchBrandFamily
 } from "../controllers/hierarchysearch.controller.js";
 import { resolveWithAI } from "../controllers/aiCatalogResolve.controller.js";
 import { identifyProductFromImage } from "../controllers/imageSearch.controller.js";
@@ -45,5 +46,7 @@ router.get("/image-status", getImageStatuses);
 router.get("/autocomplete", searchAutocomplete);
 
 router.get("/products/:id", getProductDetail);
+
+router.get("/brand-family", searchBrandFamily);
 
 export default router;

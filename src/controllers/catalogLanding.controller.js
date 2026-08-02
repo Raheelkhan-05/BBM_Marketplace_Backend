@@ -13,6 +13,8 @@ import { supabase } from "../config/supabase.js";
 
 const CARD_LIMIT = 8;      // subcategory / product grid cards
 const PREVIEW_LIMIT = 6;   // top-products / top-brands strip
+const FAMILY_GROUP_PRODUCT_PREVIEW = 6; // items shown per subcategory group before "view more"
+
 
 function fallbackTagline(name, kind) {
     if (kind === "category") return `Everything you need in ${name} — sourced from verified sellers.`;
@@ -295,5 +297,87 @@ export async function getBrandDetail(req, res) {
         },
         siblingBrandItems,
         sellerCount: sellerCount || 0,
+    });
+}
+
+// GET /api/catalog/brand-family/:brandName
+// Unlike getBrandDetail (one specific SKU + its immediate siblings under
+// the SAME product), this returns EVERY brand item across the WHOLE
+// catalog that shares this brand_name — regardless of category,
+// subcategory, or product line. This is what a search for the brand
+// itself (e.g. "ZXL Bearing") should land on, not any single SKU page.
+export async function getBrandFamily(req, res) {
+    const { brandName } = req.params;
+    const decoded = decodeURIComponent(brandName || "").trim();
+    if (!decoded) return res.status(400).json({ success: false, message: "Brand name required." });
+
+    const { data: items, error } = await supabase
+        .from("hs_product_brands")
+        .select(`
+            id, name, slug, image, brand_name,
+            product:hs_products (
+                id, name,
+                subcategory:hs_subcategories (
+                    id, name, slug,
+                    category:hs_categories ( id, name, slug )
+                )
+            )
+        `)
+        .neq("review_status", "rejected")
+        .ilike("brand_name", decoded);
+
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    if (!items?.length) return res.status(404).json({ success: false, message: "Brand not found." });
+
+    // Group into category -> subcategory -> [items], since a brand can
+    // span wildly different parts of the catalog (bearings, oils,
+    // fasteners, etc. all under the same manufacturer).
+    const categoryMap = new Map();
+    for (const item of items) {
+        const subcat = item.product?.subcategory;
+        const cat = subcat?.category;
+        const catKey = cat?.id || "uncategorized";
+        if (!categoryMap.has(catKey)) {
+            categoryMap.set(catKey, {
+                id: cat?.id || null, name: cat?.name || "Uncategorized", slug: cat?.slug || null,
+                subcategories: new Map(),
+            });
+        }
+        const catEntry = categoryMap.get(catKey);
+        const subKey = subcat?.id || "uncategorized";
+        if (!catEntry.subcategories.has(subKey)) {
+            catEntry.subcategories.set(subKey, {
+                id: subcat?.id || null, name: subcat?.name || "Uncategorized", slug: subcat?.slug || null,
+                items: [],
+            });
+        }
+        catEntry.subcategories.get(subKey).items.push({
+            id: item.id, name: item.name, slug: item.slug, image: item.image,
+            productName: item.product?.name || null,
+        });
+    }
+
+    const categories = [...categoryMap.values()].map((c) => ({
+        ...c,
+        subcategories: [...c.subcategories.values()],
+    }));
+
+    // Seller count across every SKU under this brand family.
+    const brandItemIds = items.map((i) => i.id);
+    const { count: sellerCount } = await supabase
+        .from("hs_product_sellers")
+        .select("id", { count: "exact", head: true })
+        .in("brand_id", brandItemIds)
+        .eq("is_active", true);
+
+    res.json({
+        success: true,
+        brandName: items[0].brand_name || decoded,
+        stats: {
+            skuCount: items.length,
+            categoryCount: categories.length,
+            sellerCount: sellerCount || 0,
+        },
+        categories,
     });
 }

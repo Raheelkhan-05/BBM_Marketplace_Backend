@@ -102,6 +102,10 @@ deciding to mint a new one:
   narrows down further than the subcategory (e.g. subcategory "Eyeglasses"
   -> product "Photochromic Reading Glasses", or subcategory "Engine Oil"
   -> product "Diesel Engine Oil").
+- seller_company_name: the manufacturing/distributing COMPANY printed on
+  the page (often in a footer/letterhead), if it's a DIFFERENT entity
+  from brand_name. Null if there's no distinct company name, or if the
+  company name and brand name are the same.
 - GENERIC ATTRIBUTES MUST STAY GENERIC. attributes describe the WHOLE
   product line as buyers browsing it would expect to see it, not one
   specific real-world configuration. NEVER write an exact model number,
@@ -153,6 +157,7 @@ export const CATALOG_SCHEMA = {
             description: { type: ["string", "null"] },
             is_branded: { type: "boolean" },
             brand_name: { type: ["string", "null"] },
+            seller_company_name: { type: ["string", "null"] }, // the printed manufacturer/distributor company (e.g. "Yogi Hi-Tech Pvt. Ltd."), if different from brand_name
             brand_item_name: { type: ["string", "null"] },
             brand_attributes: {
                 type: "array",
@@ -206,6 +211,7 @@ export const CATALOG_SCHEMA = {
             "description",
             "is_branded",
             "brand_name",
+            "seller_company_name",
             "brand_item_name",
             "brand_attributes",
             "variants",

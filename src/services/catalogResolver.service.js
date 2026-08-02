@@ -586,6 +586,7 @@ async function resolveBrandItem(classification, productId, shortlists, embedding
             name: classification.brand_item_name,
             slug,
             description: classification.description || null,
+            seller_company_name: classification.seller_company_name || null,
             attributes: Object.fromEntries((classification.brand_attributes || []).map((a) => [a.name, a.value])),
             is_ai_generated: true,
             embedding: embeddingByKey.brand,
