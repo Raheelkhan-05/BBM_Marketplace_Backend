@@ -8,6 +8,7 @@ import notificationRoutes from "./routes/notifications.routes.js";
 import shopRoutes from "./routes/shop.routes.js"
 import hierarchySearchRoutes from "./routes/hierarchysearch.routes.js";
 import catalogLandingRoutes from "./routes/catalogLanding.routes.js";
+import catalogImportRoutes from "./routes/catalogImport.routes.js";
 
 export function createApp() {
   const app = express();
@@ -50,6 +51,7 @@ export function createApp() {
   app.use("/api/shop", shopRoutes);
   app.use("/api/search", hierarchySearchRoutes);
   app.use("/api/catalog", catalogLandingRoutes);
+  app.use("/api/catalogs", catalogImportRoutes);
 
   app.use((err, req, res, next) => {
     console.error(err);

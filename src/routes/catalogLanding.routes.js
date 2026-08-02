@@ -9,11 +9,12 @@
 // (hierarchysearch.controller.js) stays exactly as-is.
 
 import { Router } from "express";
-import { getCategoryLanding, getSubcategoryLanding } from "../controllers/catalogLanding.controller.js";
+import { getCategoryLanding, getSubcategoryLanding, getBrandDetail } from "../controllers/catalogLanding.controller.js";
 
 const router = Router();
 
 router.get("/category/:idOrSlug", getCategoryLanding);
 router.get("/subcategory/:idOrSlug", getSubcategoryLanding);
+router.get("/brand/:idOrSlug", getBrandDetail);
 
 export default router;

@@ -47,6 +47,11 @@ const SUBCATEGORY_DEDUPE_FLOOR = 0.72;
 const PRODUCT_DEDUPE_FLOOR = 0.78;
 const BRAND_MATCH_THRESHOLD = 0.80;
 
+const BRAND_DEDUPE_FLOOR = 0.86; // higher than the automatic-match cascade threshold on
+// purpose — brand items are usually differentiated ONLY by part number/spec,
+// so this needs to be strict enough that "13070 FWT" and "165100 RWT" don't
+// collapse just because they share every other word in the name.
+
 // ---- name-comparison helpers ----
 //
 // FIX: the old check for "generic_name is just a restatement of the
@@ -70,6 +75,18 @@ function isTrivialRestatement(a, b) {
     if (na === nb) return true;
     // singular/plural only difference, e.g. "engine oil" vs "engine oils"
     return na.replace(/s$/, "") === nb.replace(/s$/, "");
+}
+
+function cosineSimilarity(a, b) {
+    if (!a || !b || a.length !== b.length) return -1;
+    let dot = 0, normA = 0, normB = 0;
+    for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        normA += a[i] * a[i];
+        normB += b[i] * b[i];
+    }
+    if (normA === 0 || normB === 0) return -1;
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
 // Checks if `term` exactly matches a previously-rejected row at any level.
@@ -156,6 +173,20 @@ const ACCENT_COLOR_VARIANTS = [
     "deep blue", "amber orange", "forest green", "charcoal grey",
     "burgundy red", "steel silver", "muted teal", "warm brass",
 ];
+
+function parseEmbedding(raw) {
+    if (!raw) return null;
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw === "string") {
+        try {
+            const parsed = JSON.parse(raw); // pgvector often serializes as "[0.1,0.2,...]" over REST
+            return Array.isArray(parsed) ? parsed : null;
+        } catch {
+            return null;
+        }
+    }
+    return null;
+}
 
 function composeStyle(seedKey) {
     return [
@@ -509,11 +540,41 @@ async function resolveBrandItem(classification, productId, shortlists, embedding
         .maybeSingle();
     if (existing) return { ...existing, isNew: false };
 
-    // reuse the global brand shortlist already fetched, scoped to this product
-    const top = shortlists.brands.find((b) => b.product_id === productId);
-    if (top && top.similarity >= 0.72) {
-        log.warn(`brand: reusing shortlisted "${top.name}" instead of creating duplicate`);
-        return { id: top.id, name: top.name, image: top.image, isNew: false };
+    // FIX: the old check was `shortlists.brands.find(b => b.product_id ===
+    // productId)` — the FIRST brand under this product, regardless of
+    // whether its name has anything to do with the item being resolved
+    // right now. Combined with session-tracked brands being injected with
+    // similarity: 1 (see runImportJob.service.js), this made EVERY brand
+    // under a shared product collapse onto whichever brand was created
+    // first — e.g. 7 distinct part numbers (13070 FWT, 165100 RWT, 142523
+    // DR, ...) all reusing one brand row. Fix: pull the REAL existing
+    // brand rows (with embeddings) under this product from the DB, and
+    // compute genuine cosine similarity between THIS item's own
+    // brand_item_name embedding and each sibling's — never trust a
+    // pre-fetched, possibly page-shared or session-injected score.
+    const { data: siblingBrands } = await supabase
+        .from("hs_product_brands")
+        .select("id, name, image, embedding")
+        .eq("product_id", productId);
+
+    if (siblingBrands?.length && embeddingByKey.brand) {
+        let best = null;
+        for (const sib of siblingBrands) {
+            const sibEmbedding = parseEmbedding(sib.embedding);
+            if (!sibEmbedding) continue;
+            const sim = cosineSimilarity(embeddingByKey.brand, sibEmbedding);
+            if (!best || sim > best.sim) best = { ...sib, sim };
+        }
+        if (best && best.sim >= BRAND_DEDUPE_FLOOR) {
+            log.warn(`brand: reusing "${best.name}" for incoming "${classification.brand_item_name}" (similarity ${best.sim.toFixed(3)} >= ${BRAND_DEDUPE_FLOOR})`);
+            return { id: best.id, name: best.name, image: best.image, isNew: false };
+        }
+        if (best) {
+            log.info(
+                `brand: creating new — closest sibling "${best.name}" only scored ${best.sim.toFixed(3)}, ` +
+                `below floor ${BRAND_DEDUPE_FLOOR}`
+            );
+        }
     }
 
     const slug = slugify(classification.brand_item_name);
@@ -658,3 +719,5 @@ export async function resolveOrCreateCatalogEntry({ term, level, parentId }) {
     };
 
 }
+
+export { resolveCategory, resolveSubcategory, resolveProduct, resolveBrandItem, categoryImagePrompt, subcategoryImagePrompt, productImagePrompt, brandImagePrompt, generateAndAttachImage };

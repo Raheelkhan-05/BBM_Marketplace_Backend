@@ -216,3 +216,84 @@ export async function getSubcategoryLanding(req, res) {
         topBrands,
     });
 }
+
+// GET /api/catalog/brand/:idOrSlug
+export async function getBrandDetail(req, res) {
+    const { idOrSlug } = req.params;
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(idOrSlug);
+
+    const { data: brand, error } = await supabase
+        .from("hs_product_brands")
+        .select(`
+            id, name, slug, image, brand_name, description, attributes, product_id,
+            product:hs_products (
+                id, name, slug, subcategory_id,
+                subcategory:hs_subcategories (
+                    id, name, slug, category_id,
+                    category:hs_categories ( id, name, slug )
+                )
+            )
+        `)
+        .neq("review_status", "rejected")
+        .eq(isUuid ? "id" : "slug", idOrSlug)
+        .single();
+
+    if (error || !brand) {
+        return res.status(404).json({ success: false, message: "Brand item not found." });
+    }
+
+    // Flatten the nested product/subcategory/category the same shape the
+    // frontend expects (brand.product / brand.subcategory / brand.category),
+    // instead of the raw nested Supabase join shape.
+    const product = brand.product || null;
+    const subcategory = product?.subcategory || null;
+    const category = subcategory?.category || null;
+
+    // Sibling SKUs: every OTHER hs_product_brands row sharing the same
+    // brand_name, regardless of which product they're filed under — a
+    // buyer on "Yogi Hi-Tech 13070 FWT" should see ALL Yogi Hi-Tech SKUs,
+    // not just ones under this exact product line. Falls back to
+    // comparing `name` if brand_name was never set (is_branded rows
+    // always have brand_name, but guard anyway).
+    let siblingBrandItems = [];
+    const brandNameKey = brand.brand_name || brand.name;
+    if (brandNameKey) {
+        const { data: siblingRows } = await supabase
+            .from("hs_product_brands")
+            .select("id, name, image, brand_name")
+            .neq("review_status", "rejected")
+            .neq("id", brand.id)
+            .ilike("brand_name", brandNameKey)
+            .order("name")
+            .limit(PREVIEW_LIMIT * 3); // over-fetch slightly in case of near-duplicate casing, trimmed below
+
+        siblingBrandItems = (siblingRows || []).slice(0, PREVIEW_LIMIT);
+    }
+
+    // Seller count scoped to this exact brand item (SKU-level), not the
+    // whole product line — a buyer here wants to know how many sellers
+    // stock THIS specific part number.
+    const { count: sellerCount } = await supabase
+        .from("hs_product_sellers")
+        .select("id", { count: "exact", head: true })
+        .eq("brand_id", brand.id)
+        .eq("is_active", true);
+
+    res.json({
+        success: true,
+        brand: {
+            id: brand.id,
+            name: brand.name,
+            slug: brand.slug,
+            image: brand.image,
+            brand_name: brand.brand_name,
+            description: brand.description,
+            attributes: brand.attributes || {},
+            product: product ? { id: product.id, name: product.name, slug: product.slug } : null,
+            subcategory: subcategory ? { id: subcategory.id, name: subcategory.name, slug: subcategory.slug } : null,
+            category: category ? { id: category.id, name: category.name, slug: category.slug } : null,
+        },
+        siblingBrandItems,
+        sellerCount: sellerCount || 0,
+    });
+}

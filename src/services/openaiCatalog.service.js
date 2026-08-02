@@ -32,7 +32,7 @@ import OpenAI from "openai";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const SYSTEM_PROMPT = `
+export const SYSTEM_PROMPT = `
 You are BBM Marketplace's catalog classifier (Brand Brigade Marketing Pvt
 Ltd), a B2B industrial/commercial trading platform in India.
 
@@ -137,7 +137,7 @@ leave brand_name / brand_item_name / brand_attributes null.
   search term.
 `.trim();
 
-const CATALOG_SCHEMA = {
+export const CATALOG_SCHEMA = {
     name: "catalog_classification",
     schema: {
         type: "object",
@@ -216,17 +216,17 @@ const CATALOG_SCHEMA = {
     strict: true,
 };
 
-function formatCategoryShortlist(categories) {
+export function formatCategoryShortlist(categories) {
     if (!categories.length) return "(none yet)";
     return categories.map((c) => `- ${c.id}: ${c.name}`).join("\n");
 }
 
-function formatSubcategoryShortlist(subcategories) {
+export function formatSubcategoryShortlist(subcategories) {
     if (!subcategories.length) return "(none yet)";
     return subcategories.map((s) => `- ${s.id}: ${s.name} (category: ${s.category_name})`).join("\n");
 }
 
-function formatProductShortlist(products) {
+export function formatProductShortlist(products) {
     if (!products.length) return "(none yet)";
     return products
         .map((p) => `- ${p.id}: ${p.name} (subcategory: ${p.subcategory_name}, category: ${p.category_name})`)
