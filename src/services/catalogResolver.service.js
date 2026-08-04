@@ -68,6 +68,38 @@ function normalizeCatalogName(str) {
         .replace(/\s+/g, " ")
         .trim();
 }
+
+// catalogResolver.service.js — add near isTrivialRestatement
+
+// Strips pure grade/spec tokens (viscosity grades, numeric codes) so two
+// names differing ONLY by a spec qualifier compare as the same core
+// concept — "Diesel Engine Oil" vs "15W-40 Diesel Engine Oil", or
+// "Multipurpose Grease" vs "Industrial Multipurpose Grease".
+function coreTokens(name) {
+    return new Set(
+        normalizeCatalogName(name)
+            .split(" ")
+            .filter(Boolean)
+            .filter((tok) => !/^\d+w?\d*$/i.test(tok.replace(/-/g, ""))) // drop "15w40", "90", "140", etc.
+    );
+}
+
+// True if the SMALLER name's core words are entirely a subset of the
+// LARGER name's core words — i.e. one name is just the other plus extra
+// qualifier words ("Multipurpose Grease" ⊂ "Industrial Multipurpose
+// Grease"), which means they're the same underlying product line, not
+// two distinct ones. This is a deterministic backstop — it does NOT rely
+// on the LLM's judgment, because the LLM was already told this exact rule
+// in plain English and still created the duplicate anyway.
+function isNameContainmentDuplicate(nameA, nameB) {
+    const a = coreTokens(nameA);
+    const b = coreTokens(nameB);
+    if (a.size === 0 || b.size === 0) return false;
+    const [smaller, larger] = a.size <= b.size ? [a, b] : [b, a];
+    for (const tok of smaller) if (!larger.has(tok)) return false;
+    return true;
+}
+
 function isTrivialRestatement(a, b) {
     const na = normalizeCatalogName(a);
     const nb = normalizeCatalogName(b);
@@ -280,7 +312,10 @@ function brandImagePrompt(brandItemName, brandName, attributes, categoryName, su
     return `Product photo of ${brandItemName}${specs ? ` — ${specs}` : ""}, ${shape}.${brandLine} Product centered horizontally with generous negative space, composed for a wide letterbox crop so nothing important sits near the top or bottom edge, ${composeStyle(seedKey)}`;
 }
 
-async function generateAndAttachImage(table, id, prompt) {
+// A 429 from the image model shouldn't just be logged and abandoned —
+// it tells you exactly how long to wait ("try again in 12s"), so parse
+// that and retry a couple of times before giving up for real.
+async function generateAndAttachImage(table, id, prompt, attempt = 1) {
     try {
         const pngBase64 = await generateCatalogImage(prompt);
         const avifBuffer = await convertPngToAvif(pngBase64, `${table}-${id}`);
@@ -288,6 +323,14 @@ async function generateAndAttachImage(table, id, prompt) {
         await supabase.from(table).update({ image: publicUrl }).eq("id", id);
         return publicUrl;
     } catch (err) {
+        const is429 = err.message?.includes("429") || err.status === 429;
+        if (is429 && attempt < 4) {
+            const waitMatch = err.message?.match(/try again in (\d+(?:\.\d+)?)s/i);
+            const waitMs = waitMatch ? Math.ceil(parseFloat(waitMatch[1]) * 1000) + 500 : attempt * 5000;
+            console.warn(`image gen rate-limited for ${table}/${id}, retrying in ${waitMs}ms (attempt ${attempt + 1}/4)`);
+            await new Promise((r) => setTimeout(r, waitMs));
+            return generateAndAttachImage(table, id, prompt, attempt + 1);
+        }
         console.error(`AI image pipeline failed for ${table}/${id}:`, err.message);
         return null;
     }
@@ -440,6 +483,24 @@ async function resolveProduct(classification, subcategoryId, shortlists, embeddi
     }
 
     // Embedding-based safety net, scoped to this subcategory.
+    // Hard containment check across EVERY sibling already in this
+    // subcategory (shortlists.products is guaranteed-complete for the
+    // top-matching subcategory, per catalogShortlist's completeness
+    // supplement) — not just the single top-embedding match. This catches
+    // exactly the cases the LLM was instructed to avoid but didn't:
+    // "Diesel Engine Oil" / "15W-40 Diesel Engine Oil",
+    // "Multipurpose Grease" / "Industrial Multipurpose Grease".
+    const containmentMatch = shortlists.products.find(
+        (p) => p.subcategory_id === subcategoryId && p.id !== top?.id && isNameContainmentDuplicate(name, p.name)
+    );
+    if (containmentMatch) {
+        log.warn(
+            `product: BLOCKED creating "${name}" — core name is contained in / contains existing ` +
+            `"${containmentMatch.name}", reusing that instead (this overrides the LLM's own decision)`
+        );
+        return { id: containmentMatch.id, name: containmentMatch.name, image: containmentMatch.image, isNew: false };
+    }
+
     const top = shortlists.products.find((p) => p.subcategory_id === subcategoryId && p.similarity >= PRODUCT_DEDUPE_FLOOR);
     if (top) {
         log.warn(
@@ -529,6 +590,49 @@ function findDirectMatch(shortlists) {
     return null;
 }
 
+// catalogResolver.service.js
+
+// Extracts identifying codes/part-numbers from a name — things like
+// "13070", "BTH 0065", "566425.H195", "VKBA 5423". These are the ACTUAL
+// disambiguating tokens in auto-parts catalogs; two SKUs can share every
+// other word ("Unitized", "Wheel Bearing", "Front/Rear Axle") and still
+// be completely different parts, which is exactly why embedding
+// similarity alone can score 0.90+ on two distinct SKUs (see: "13070 FWT"
+// vs "165100 RWT" scored 0.904; "VKBA 5423" vs "VKBA 5425" scored 0.985).
+// Matches: alphanumeric codes with at least one digit, optionally
+// prefixed with letters, allowing internal . - / (e.g. "566425.H195").
+// Pulls every numeric token out of a name — grades ("90", "140"), part
+// numbers ("13070"), spec codes ("VKBA5423"), whatever. No minimum digit
+// count: a 2-digit viscosity grade ("90" vs "140") is just as much a real
+// distinguishing feature as a 6-digit part number, and the earlier 3+
+// digit threshold is exactly why "Spirax S2 G 90" wrongly merged with
+// "Spirax S2 G 140" — "90" never qualified as a code, so the conflict
+// check saw nothing to compare and fell through to raw text similarity,
+// which is fooled by the two names sharing every other word.
+function extractCodes(name) {
+    if (!name) return new Set();
+    const matches = name.match(/\d[\dA-Za-z.\-/]*\d|\d+/g) || [];
+    return new Set(matches.map((c) => c.toUpperCase().replace(/[.\-/\s]/g, "")));
+}
+
+
+// Compares the PRIMARY (longest) code on each side rather than any-overlap
+// — this is what correctly separates "VKBA5423" from "VKBA5425" and
+// "566425H195" from "566426H195" despite their shared prefixes/suffixes.
+// Conservative by design: require the full set of numeric tokens to
+// match EXACTLY before allowing embedding similarity to decide anything.
+// Any difference in the numbers present — a different grade, a different
+// part number, an extra/missing spec — is treated as a real SKU
+// difference, not something similarity should be allowed to paper over.
+// This errs toward creating an extra row over wrongly merging two
+// distinct SKUs, which is the safer failure mode for a live catalog.
+function codesConflict(codesA, codesB) {
+    if (codesA.size === 0 || codesB.size === 0) return false; // neither side has a number to compare — let embedding decide
+    if (codesA.size !== codesB.size) return true;
+    for (const c of codesA) if (!codesB.has(c)) return true;
+    return false;
+}
+
 async function resolveBrandItem(classification, productId, shortlists, embeddingByKey, log) {
     if (!classification.is_branded || !classification.brand_item_name || !productId) return null;
 
@@ -540,18 +644,8 @@ async function resolveBrandItem(classification, productId, shortlists, embedding
         .maybeSingle();
     if (existing) return { ...existing, isNew: false };
 
-    // FIX: the old check was `shortlists.brands.find(b => b.product_id ===
-    // productId)` — the FIRST brand under this product, regardless of
-    // whether its name has anything to do with the item being resolved
-    // right now. Combined with session-tracked brands being injected with
-    // similarity: 1 (see runImportJob.service.js), this made EVERY brand
-    // under a shared product collapse onto whichever brand was created
-    // first — e.g. 7 distinct part numbers (13070 FWT, 165100 RWT, 142523
-    // DR, ...) all reusing one brand row. Fix: pull the REAL existing
-    // brand rows (with embeddings) under this product from the DB, and
-    // compute genuine cosine similarity between THIS item's own
-    // brand_item_name embedding and each sibling's — never trust a
-    // pre-fetched, possibly page-shared or session-injected score.
+    const incomingCodes = extractCodes(classification.brand_item_name);
+
     const { data: siblingBrands } = await supabase
         .from("hs_product_brands")
         .select("id, name, image, embedding")
@@ -560,20 +654,29 @@ async function resolveBrandItem(classification, productId, shortlists, embedding
     if (siblingBrands?.length && embeddingByKey.brand) {
         let best = null;
         for (const sib of siblingBrands) {
+            // Hard veto: if this sibling has a different identifying code
+            // than the incoming item, it is NOT the same SKU — full stop,
+            // regardless of how high the embedding similarity comes back.
+            // This is what actually fixes the "13070 FWT" / "165100 RWT"
+            // and "VKBA 5423" / "VKBA 5425" false merges: those pairs have
+            // conflicting codes, so they're excluded from consideration
+            // before similarity is even weighed.
+            const sibCodes = extractCodes(sib.name);
+            if (codesConflict(incomingCodes, sibCodes)) continue;
+
             const sibEmbedding = parseEmbedding(sib.embedding);
             if (!sibEmbedding) continue;
             const sim = cosineSimilarity(embeddingByKey.brand, sibEmbedding);
             if (!best || sim > best.sim) best = { ...sib, sim };
         }
         if (best && best.sim >= BRAND_DEDUPE_FLOOR) {
-            log.warn(`brand: reusing "${best.name}" for incoming "${classification.brand_item_name}" (similarity ${best.sim.toFixed(3)} >= ${BRAND_DEDUPE_FLOOR})`);
+            log.warn(`brand: reusing "${best.name}" for incoming "${classification.brand_item_name}" (similarity ${best.sim.toFixed(3)} >= ${BRAND_DEDUPE_FLOOR}, no code conflict)`);
             return { id: best.id, name: best.name, image: best.image, isNew: false };
         }
         if (best) {
-            log.info(
-                `brand: creating new — closest sibling "${best.name}" only scored ${best.sim.toFixed(3)}, ` +
-                `below floor ${BRAND_DEDUPE_FLOOR}`
-            );
+            log.info(`brand: creating new — closest non-conflicting sibling "${best.name}" only scored ${best.sim.toFixed(3)}, below floor ${BRAND_DEDUPE_FLOOR}`);
+        } else if (siblingBrands.length) {
+            log.info(`brand: creating new — all ${siblingBrands.length} sibling(s) had conflicting codes, no comparison possible`);
         }
     }
 
@@ -583,10 +686,10 @@ async function resolveBrandItem(classification, productId, shortlists, embedding
         {
             product_id: productId,
             brand_name: classification.brand_name,
+            seller_company_name: classification.seller_company_name || null,
             name: classification.brand_item_name,
             slug,
             description: classification.description || null,
-            seller_company_name: classification.seller_company_name || null,
             attributes: Object.fromEntries((classification.brand_attributes || []).map((a) => [a.name, a.value])),
             is_ai_generated: true,
             embedding: embeddingByKey.brand,

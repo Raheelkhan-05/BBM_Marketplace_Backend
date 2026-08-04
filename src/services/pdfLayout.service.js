@@ -1,13 +1,14 @@
 // backend/services/fileImport/pdfLayout.service.js
 import { getDocument, OPS } from "pdfjs-dist/legacy/build/pdf.mjs";
+import { STANDARD_FONT_DATA_URL } from "../services/pdfStandardFonts.js";
 
 const LINE_TOLERANCE = 3; // pt — merges only near-identical baselines into one physical text line
 
 export async function extractPages(fileBuffer) {
     const data = fileBuffer instanceof Uint8Array && fileBuffer.constructor === Uint8Array
         ? fileBuffer
-        : new Uint8Array(fileBuffer);   // strips the Buffer subclass wrapper pdfjs rejects
-    const doc = await getDocument({ data }).promise;
+        : new Uint8Array(fileBuffer);
+    const doc = await getDocument({ data, standardFontDataUrl: STANDARD_FONT_DATA_URL }).promise;
 
     const pages = [];
     for (let i = 1; i <= doc.numPages; i++) {

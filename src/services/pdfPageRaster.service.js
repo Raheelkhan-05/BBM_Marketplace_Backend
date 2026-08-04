@@ -3,6 +3,7 @@
 // image cropping, so a page is only rendered once per job.
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { createCanvas } from "@napi-rs/canvas";
+import { STANDARD_FONT_DATA_URL } from "./pdfStandardFonts.js";
 
 const RENDER_SCALE = 2.5;
 const rasterCache = new Map(); // `${jobId}:${pageNumber}` -> { canvas, viewport, pngBuffer }
@@ -12,7 +13,7 @@ export async function getPageRaster(fileBuffer, pageNumber, jobId) {
     if (rasterCache.has(key)) return rasterCache.get(key);
 
     const data = new Uint8Array(fileBuffer);
-    const doc = await getDocument({ data }).promise;
+    const doc = await getDocument({ data, standardFontDataUrl: STANDARD_FONT_DATA_URL }).promise;
     const page = await doc.getPage(pageNumber);
     const viewport = page.getViewport({ scale: RENDER_SCALE });
     const canvas = createCanvas(viewport.width, viewport.height);

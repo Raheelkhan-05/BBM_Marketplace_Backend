@@ -26,8 +26,19 @@ export async function resolveImportRow({ classification, shortlists, embeddingBy
             () => resolveProduct(classification, subcategoryRow.id, shortlists, embeddingByKey, log))
         : null;
 
+    // FIX: brand resolution previously bypassed resolveWithCache entirely
+    // — every occurrence of the same SKU on the same page (e.g. repeated
+    // pack-size/price rows for "Shell Spirax S1 ATF TASA") re-ran the full
+    // DB lookup independently instead of reusing the first result. Keying
+    // on productId + normalized brand name means repeat rows within one
+    // job now resolve identically and instantly, instead of each getting
+    // an independent (and potentially inconsistent) resolution.
+    const brandCacheKey = productRow && classification.is_branded && classification.brand_item_name
+        ? `${productRow.id}::${classification.brand_item_name}`
+        : null;
     const brandRow = productRow
-        ? await resolveBrandItem(classification, productRow.id, shortlists, embeddingByKey, log)
+        ? await resolveWithCache(jobCache, "brand", brandCacheKey,
+            () => resolveBrandItem(classification, productRow.id, shortlists, embeddingByKey, log))
         : null;
 
     return {

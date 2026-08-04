@@ -11,6 +11,7 @@ import { uploadCatalogImage } from "./catalogImageStorage.service.js";
 import { convertPngToAvif } from "./cloudinaryConvert.service.js";
 import { generateCatalogImage } from "./catalogImageGen.service.js";
 import { categoryImagePrompt, subcategoryImagePrompt, productImagePrompt, brandImagePrompt, generateAndAttachImage } from "./catalogResolver.service.js";
+import { STANDARD_FONT_DATA_URL } from "./pdfStandardFonts.js";
 import sharp from "sharp";
 
 
@@ -71,12 +72,27 @@ async function tryBboxCrop(row, target, fileBuffer, jobId) {
     }
 }
 
+const IMAGE_GEN_CONCURRENCY = 3; // stay comfortably under the 5/min gpt-image rate limit
+
+async function runWithConcurrencyLimit(tasks, limit, worker) {
+    const results = [];
+    let index = 0;
+    async function runNext() {
+        while (index < tasks.length) {
+            const i = index++;
+            results[i] = await worker(tasks[i]);
+        }
+    }
+    await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, runNext));
+    return results;
+}
+
 export async function runImportJob(jobId, fileBuffer) {
     try {
         await updateJob(jobId, { progress: { processed: 0, total: 0, phase: "reading_pdf" } });
 
         const data = new Uint8Array(fileBuffer);
-        const doc = await getDocument({ data }).promise;
+        const doc = await getDocument({ data, standardFontDataUrl: STANDARD_FONT_DATA_URL }).promise;
         const numPages = doc.numPages;
 
         const resolvedRows = [];
@@ -163,7 +179,9 @@ export async function runImportJob(jobId, fileBuffer) {
                 imageTasks.push({ row, target });
             }
         }
-        await Promise.all(imageTasks.map(({ row, target }) => attachImageForTarget(row, target, fileBuffer, jobId)));
+        await runWithConcurrencyLimit(imageTasks, IMAGE_GEN_CONCURRENCY, ({ row, target }) =>
+            attachImageForTarget(row, target, fileBuffer, jobId)
+        );
         clearRasterCache(jobId);
 
 

@@ -14,6 +14,8 @@
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { createCanvas } from "@napi-rs/canvas";
 import sharp from "sharp";
+import { STANDARD_FONT_DATA_URL } from "./pdfStandardFonts.js";
+
 
 const RENDER_SCALE = 2.5; // higher = crisper crops; tune against render time/memory
 
@@ -55,7 +57,7 @@ async function getOrRenderPage(fileBuffer, pageNumber, jobId) {
 
     try {
         const data = new Uint8Array(fileBuffer);
-        const doc = await getDocument({ data }).promise;
+        const doc = await getDocument({ data, standardFontDataUrl: STANDARD_FONT_DATA_URL }).promise;
         const page = await doc.getPage(pageNumber);
         const viewport = page.getViewport({ scale: RENDER_SCALE });
         const canvas = createCanvas(viewport.width, viewport.height);

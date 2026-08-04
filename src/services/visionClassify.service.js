@@ -49,6 +49,14 @@ often blurs. Two DIFFERENT things can appear on a catalog page:
    NOT automatically the brand_name, even though it's often the most
    visually prominent text on the page.
 
+PACK-SIZE / QUANTITY PRICING TABLES — this document type frequently lists
+the SAME product multiple times, once per pack size or quantity tier
+(e.g. "Spirax S2 G 90" appearing at 1.0L, 5.0L, 20.0L, each at a
+different price). These are ALL THE SAME product entry, not separate
+ones — merge them into ONE item. Only the price/pack-size varies; do not
+create a separate entry per row just because the PDF's price table
+repeats the SKU name for each quantity tier.
+
 Rule: if a URL, logo mark, or small brand watermark suggests a DIFFERENT
 name than the footer/letterhead company name, use that smaller/quieter
 signal as brand_name — it is more likely the actual product brand. Only
