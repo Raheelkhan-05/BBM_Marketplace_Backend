@@ -490,6 +490,8 @@ async function resolveProduct(classification, subcategoryId, shortlists, embeddi
     // exactly the cases the LLM was instructed to avoid but didn't:
     // "Diesel Engine Oil" / "15W-40 Diesel Engine Oil",
     // "Multipurpose Grease" / "Industrial Multipurpose Grease".
+    const top = shortlists.products.find((p) => p.subcategory_id === subcategoryId && p.similarity >= PRODUCT_DEDUPE_FLOOR);
+
     const containmentMatch = shortlists.products.find(
         (p) => p.subcategory_id === subcategoryId && p.id !== top?.id && isNameContainmentDuplicate(name, p.name)
     );
@@ -501,7 +503,7 @@ async function resolveProduct(classification, subcategoryId, shortlists, embeddi
         return { id: containmentMatch.id, name: containmentMatch.name, image: containmentMatch.image, isNew: false };
     }
 
-    const top = shortlists.products.find((p) => p.subcategory_id === subcategoryId && p.similarity >= PRODUCT_DEDUPE_FLOOR);
+
     if (top) {
         log.warn(
             `product: overriding LLM's "generic_name=${name}" — ` +
