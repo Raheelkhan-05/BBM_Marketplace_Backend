@@ -18,6 +18,8 @@ import {
   createSellerProduct,
   deleteSellerProduct,
   updateSellerProduct,
+  requestSellerWhatsappOtp,
+  verifySellerWhatsappOtp,
 } from "../controllers/seller.controller.js";
 
 const router = Router();
@@ -27,7 +29,8 @@ router.get("/onboarding", requireAuth, getSellerOnboarding);
 router.post("/onboarding/save", requireAuth, authWriteLimiter, saveSellerOnboarding);
 router.post("/onboarding/submit", requireAuth, authWriteLimiter, submitSellerOnboarding);
 router.post("/upload", requireAuth, authWriteLimiter, upload.single("file"), uploadSellerFile);
-
+router.post("/onboarding/whatsapp/request-otp", requireAuth, authWriteLimiter, requestSellerWhatsappOtp);
+router.post("/onboarding/whatsapp/verify-otp", requireAuth, authWriteLimiter, verifySellerWhatsappOtp);
 
 // seller.routes.js
 router.get("/dashboard", requireAuth, getSellerDashboard);

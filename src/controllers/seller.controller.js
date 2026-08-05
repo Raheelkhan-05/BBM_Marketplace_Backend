@@ -1,26 +1,26 @@
 import { supabase } from "../config/supabase.js";
 import { notifyAdmins, notifyUser } from "../utils/notify.js";
+import { sendOtp, verifyOtpCode } from "../utils/otp.js";
 
 const REQUIRED_FIELDS = [
-  "display_name", "business_type", "industry", "categories", "products_brands",
-  "year_established", "contact_person", "designation", "whatsapp_number",
-  "address", "pincode", "city", "state", "logo_url", "banner_url",
-  "description", "brochure_url",
+  "display_name", "business_type", "year_established",
+  "contact_person", "whatsapp_number",
+  "address", "pincode", "city", "state", "logo_url",
 ];
 
 // Fields that require re-review once a shop is already approved
 const GATED_FIELDS = [
-  "display_name", "business_type", "industry", "categories", "products_brands",
-  "year_established", "employee_range", "annual_turnover", "show_turnover_publicly",
-  "contact_person", "designation", "whatsapp_number", "website",
-  "address", "pincode", "city", "state", "country",
-  "logo_url", "banner_url", "description", "brochure_url", "video_url",
+  "display_name", "business_type", "year_established", "employee_range", "annual_turnover",
+  "contact_person", "whatsapp_number", "whatsapp_verified", "website",
+  "address", "pincode", "city", "state", "country", "dispatch_same_as_registered",
+  "logo_url", "primary_color", "secondary_color",
   "pan", "iec_code", "udyam_number", "cin",
-  "manufacturing_facility", "export_countries", "industries_served", "production_capacity",
-  "linkedin_url", "facebook_url", "instagram_url", "youtube_url",
+  "export_countries", "working_days", "order_acceptance_start", "order_acceptance_end", "holidays",
 ];
+
 const THEME_FIELDS = ["primary_color", "secondary_color"];
-const WRITABLE_FIELDS = [...GATED_FIELDS, ...THEME_FIELDS, "onboarding_step"];
+
+const WRITABLE_FIELDS = [...GATED_FIELDS, "onboarding_step"];
 
 function slugify(str) {
   return str.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
@@ -43,8 +43,38 @@ function mergeEffective(seller) {
   return { ...seller, ...seller.pending_changes, is_preview: true };
 }
 
-// ---------- Onboarding (pre-approval) ----------
+// New: WhatsApp OTP for onboarding. If the number matches the account's
+// already-verified phone, the frontend skips this entirely and just sets
+// whatsapp_verified = true directly via saveSellerProgress.
+export async function requestSellerWhatsappOtp(req, res) {
+  const { whatsapp_number } = req.body || {};
+  if (!/^\d{10}$/.test(whatsapp_number || "")) {
+    return res.status(400).json({ success: false, message: "Enter a valid 10-digit number." });
+  }
+  try {
+    await sendOtp(whatsapp_number);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message || "Couldn't send OTP." });
+  }
+}
 
+export async function verifySellerWhatsappOtp(req, res) {
+  const userId = req.user.id;
+  const { whatsapp_number, otp } = req.body || {};
+  const ok = await verifyOtpCode(whatsapp_number, otp);
+  if (!ok) return res.status(400).json({ success: false, message: "Incorrect or expired OTP." });
+
+  const { data, error } = await supabase
+    .from("seller_profiles")
+    .update({ whatsapp_number, whatsapp_verified: true })
+    .eq("user_id", userId)
+    .select().single();
+  if (error) return res.status(500).json({ success: false, message: error.message });
+  res.json({ success: true, seller: data });
+}
+
+// ---------- Onboarding (pre-approval) ----------
 // getSellerOnboarding — attach the full GST reference block (business_profiles),
 // so the frontend can render it as read-only context without a second fetch.
 export async function getSellerOnboarding(req, res) {
@@ -84,11 +114,22 @@ export async function saveSellerOnboarding(req, res) {
   res.json({ success: true, seller: data });
 }
 
+// submitSellerOnboarding — add whatsapp_verified check + auto-derive
+// manufacturing_facility from the GST nature_of_business array instead of
+// asking the seller.
 export async function submitSellerOnboarding(req, res) {
   const userId = req.user.id;
   const body = req.body || {};
   const update = {};
   for (const key of WRITABLE_FIELDS) if (body[key] !== undefined) update[key] = body[key];
+
+  if (!update.whatsapp_verified) {
+    return res.status(400).json({ success: false, message: "Please verify your WhatsApp number before submitting." });
+  }
+
+  const { data: business } = await supabase.from("business_profiles").select("id, nature_of_business").eq("user_id", userId).maybeSingle();
+  update.manufacturing_facility = Array.isArray(business?.nature_of_business)
+    && business.nature_of_business.some((n) => /factory|manufactur/i.test(n));
 
   const merged = { user_id: userId, ...update };
   const missing = REQUIRED_FIELDS.filter((f) => {
@@ -112,7 +153,7 @@ export async function submitSellerOnboarding(req, res) {
 
   const { data, error } = await supabase
     .from("seller_profiles")
-    .upsert({ user_id: userId, ...update, shop_slug: shopSlug, status: "pending_review", submitted_at: new Date().toISOString() }, { onConflict: "user_id" })
+    .upsert({ user_id: userId, business_profile_id: business?.id ?? null, ...update, shop_slug: shopSlug, status: "pending_review", submitted_at: new Date().toISOString() }, { onConflict: "user_id" })
     .select().single();
 
   if (error) return res.status(500).json({ success: false, message: error.message });
