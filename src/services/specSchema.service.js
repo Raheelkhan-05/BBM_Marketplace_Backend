@@ -42,6 +42,11 @@ Rules:
 - Tailor fields to THIS EXACT product like an expert in that specific
   industry would build a spec sheet for it. Never reuse one category's
   schema shape for a different one.
+- Reach for the SAME level of depth a real industry spec sheet would
+have — a grease listing should compare on NLGI grade, base oil type,
+thickener type, dropping point, operating temperature range, and
+application, the same way a phone listing compares on chipset/RAM/
+display. Don't undershoot just because the product seems mundane.
 `.trim();
 
 const SCHEMA = {
@@ -50,7 +55,7 @@ const SCHEMA = {
         type: "object",
         properties: {
             fields: {
-                type: "array", minItems: 3, maxItems: 24,
+                type: "array", minItems: 8, maxItems: 16,
                 items: {
                     type: "object",
                     properties: {

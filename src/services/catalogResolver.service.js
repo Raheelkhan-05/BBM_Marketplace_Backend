@@ -48,6 +48,7 @@ const SUBCATEGORY_DEDUPE_FLOOR = 0.72;
 // top subcategory match, not just a global embedding top-10).
 const PRODUCT_DEDUPE_FLOOR = 0.78;
 const BRAND_MATCH_THRESHOLD = 0.80;
+const LOW_FILL_RATE_THRESHOLD = 0.34;
 
 const BRAND_DEDUPE_FLOOR = 0.86; // higher than the automatic-match cascade threshold on
 // purpose — brand items are usually differentiated ONLY by part number/spec,
@@ -700,13 +701,12 @@ async function resolveBrandItem(classification, productId, shortlists, embedding
             name: classification.brand_item_name,
             slug,
             description: classification.description || null,
-            attributes: brandSpecFill.values.length
-                ? Object.fromEntries(brandSpecFill.values.map((a) => [a.key, a.value]))
-                : Object.fromEntries((classification.brand_attributes || []).map((a) => [a.name, a.value])),
-            spec_grounded: brandSpecFill.grounded && brandSpecFill.values.length > 0,
+            attributes: Object.fromEntries(brandSpecFill.values.map((a) => [a.key, a.value])), // ONLY schema-keyed values now
             is_ai_generated: true,
             embedding: embeddingByKey.brand,
             review_status: "pending_review",
+            spec_grounded: brandSpecFill.grounded,
+            needs_spec_backfill: brandSpecFill.fillRate < LOW_FILL_RATE_THRESHOLD,
         },
         { product_id: productId, slug },
         "id, name, image"

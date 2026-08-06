@@ -1,32 +1,55 @@
 // backend/services/brandSpecFill.service.js
+//
+// TWO calls, deliberately separated:
+//   1. gatherFindings — web_search ON, free-text output. Research is
+//      naturally citation-heavy; that's fine here, this text is never
+//      shown to a buyer.
+//   2. formatFindings — NO tools, forced strict schema, plain text only.
+//      Reformats step 1's findings into clean key/value pairs. Because
+//      this call never sees search results directly, it has nothing
+//      citation-shaped to carry into the output.
+// Sanitization (below) still runs as a hard backstop regardless.
 import OpenAI from "openai";
+import { sanitizeSpecValues } from "../utils/sanitizeSpecValue.js";
+
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const SYSTEM_PROMPT = `
-You fill REAL, VERIFIED technical specifications for one specific branded
-product, against a fixed comparison schema.
-
-Your goal is a spec sheet as complete and detailed as the manufacturer's
-own official spec page — buyers rely on this for a real purchase
-decision, so thoroughness matters as much as accuracy.
-
-For each field: if you're confident of the TRUE real spec (from knowledge
-or search results), include it. If a field is type "list", include every
-real value that applies (all storage tiers, all color options, all
-certifications) as one comma-separated string, in natural/ascending
-order — don't pick just one when several genuinely apply.
-
-Only leave a field out if you've genuinely tried to find it and are still
-not confident — not just because it wasn't in the first result you saw.
-Never guess, estimate, or infer from "typical" products in this category.
-A shorter honest response beats a complete but inaccurate one — but check
-thoroughly before calling a field unknown.
-
-Numeric fields: just the number (unit is already known from the schema).
+const FINDINGS_SYSTEM_PROMPT = `
+You are researching the REAL technical specifications of one specific
+branded/commercial product for a B2B marketplace. Search and report
+factual findings in plain prose. For each requested field, either state
+the real value plainly, or say "not found" if you can't confirm it — do
+not guess or estimate. This is a research pass only; formatting happens
+in a separate step, so write naturally, citations and all.
 `.trim();
 
-const SCHEMA = {
-    name: "brand_spec_fill",
+async function gatherFindings({ brandItemName, brandName, specSchema }) {
+    const fieldList = specSchema.map((f) => `- ${f.label}${f.unit ? ` (${f.unit})` : ""}`).join("\n");
+    const response = await openai.responses.create({
+        model: "gpt-5.6-luna",
+        reasoning: { effort: "medium" },
+        tools: [{ type: "web_search" }],
+        input: [
+            { role: "system", content: FINDINGS_SYSTEM_PROMPT },
+            { role: "user", content: `Product: "${brandItemName}" (brand: ${brandName || "unknown"})\n\nFind real values for:\n${fieldList}` },
+        ],
+    });
+    return response.output_text || "";
+}
+
+const FORMAT_SYSTEM_PROMPT = `
+Format research findings into structured spec values.
+- Include a field ONLY if the findings state it with confidence. If
+  findings say "not found", are vague, or don't mention it — OMIT it.
+  Never fill with a guess or a typical/generic value.
+- value must be PLAIN DATA ONLY: no URLs, no markdown links, no
+  "(source: ...)", no citations, no brackets. Just the fact
+  (e.g. "15W-40", never "15W-40 (source: xyz.com)").
+- Numeric fields: number only, don't repeat a unit already in the schema.
+`.trim();
+
+const FORMAT_SCHEMA = {
+    name: "brand_spec_values",
     schema: {
         type: "object",
         properties: {
@@ -44,32 +67,40 @@ const SCHEMA = {
     strict: true,
 };
 
-export async function fillBrandSpecValues({ brandItemName, brandName, specSchema, useWebSearch }) {
-    if (!specSchema?.length) return { values: [], grounded: false };
-
+async function formatFindings({ findings, specSchema }) {
     const fieldsBlock = specSchema
-        .map((f) => `- ${f.key} ("${f.label}", group: ${f.group}, type: ${f.type}${f.unit ? `, unit: ${f.unit}` : ""})`)
+        .map((f) => `- key: "${f.key}" | label: "${f.label}"${f.unit ? ` | unit: ${f.unit}` : ""}`)
         .join("\n");
-
-    const userContent = `Branded product: "${brandItemName}"
-Brand: ${brandName || "(unknown)"}
-
-SCHEMA FIELDS — aim to fill as many as you can genuinely verify:
-${fieldsBlock}`;
-
     const response = await openai.responses.create({
         model: "gpt-5.6-luna",
-        reasoning: { effort: useWebSearch ? "medium" : "low" }, // bumped from "medium"
-        tools: useWebSearch ? [{ type: "web_search" }] : undefined,
-        input: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: userContent }],
-        text: { format: { type: "json_schema", name: SCHEMA.name, schema: SCHEMA.schema, strict: true } },
+        reasoning: { effort: "low" },
+        input: [
+            { role: "system", content: FORMAT_SYSTEM_PROMPT },
+            { role: "user", content: `SCHEMA FIELDS:\n${fieldsBlock}\n\nRESEARCH FINDINGS:\n${findings}` },
+        ],
+        text: { format: { type: "json_schema", name: FORMAT_SCHEMA.name, schema: FORMAT_SCHEMA.schema, strict: true } },
     });
-
     try {
-        const { values } = JSON.parse(response.output_text);
-        const validKeys = new Set(specSchema.map((f) => f.key));
-        return { values: values.filter((v) => validKeys.has(v.key) && v.value?.trim()), grounded: useWebSearch };
+        return JSON.parse(response.output_text).values;
     } catch {
-        return { values: [], grounded: false };
+        return [];
     }
+}
+
+export async function fillBrandSpecValues({ brandItemName, brandName, specSchema, useWebSearch }) {
+    if (!specSchema?.length) return { values: [], grounded: false, fillRate: 0 };
+
+    let rawValues = [];
+    let grounded = false;
+
+    if (useWebSearch) {
+        const findings = await gatherFindings({ brandItemName, brandName, specSchema });
+        rawValues = await formatFindings({ findings, specSchema });
+        grounded = rawValues.length > 0;
+    }
+
+    const validKeys = new Set(specSchema.map((f) => f.key));
+    const cleaned = sanitizeSpecValues(rawValues.filter((v) => validKeys.has(v.key) && v.value?.trim()));
+
+    return { values: cleaned, grounded, fillRate: cleaned.length / specSchema.length };
 }
