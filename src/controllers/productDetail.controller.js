@@ -49,25 +49,68 @@ function summarizeAttributeValues(name, rawValues) {
     return { name, values, rangeText: shown.join(", ") + (extra > 0 ? `, +${extra} more` : "") };
 }
 
-function buildSpecSummary(productAttributes, brandRows) {
-    const byName = new Map();
-    const addAll = (attrs) => {
-        if (!attrs || typeof attrs !== "object") return;
-        for (const [name, value] of Object.entries(attrs)) {
-            if (!byName.has(name)) byName.set(name, []);
-            byName.get(name).push(value);
+function summarizeSchemaField(field, rawValues) {
+    // "list" fields: split each raw value on commas first, so
+    // "256GB, 512GB, 1TB" becomes three real options instead of one
+    // opaque blob — this is what fixes the storage_capacity problem
+    const flatValues =
+        field.type === "list"
+            ? rawValues.filter(Boolean).flatMap((v) => String(v).split(",").map((s) => s.trim()))
+            : rawValues.filter(Boolean).map((v) => String(v).trim());
+
+    const values = [...new Set(flatValues.filter(Boolean))];
+    if (values.length === 0) return null;
+
+    if (field.type === "numeric") {
+        const nums = values.map(Number);
+        if (nums.every((n) => !Number.isNaN(n))) {
+            const min = Math.min(...nums), max = Math.max(...nums), unit = field.unit ? ` ${field.unit}` : "";
+            return {
+                key: field.key, label: field.label, group: field.group, unit: field.unit,
+                rangeText: min === max ? `${min}${unit}` : `${min}${unit} – ${max}${unit}`,
+                values,
+            };
         }
-    };
-
-    addAll(productAttributes);
-    for (const b of brandRows) addAll(b.attributes);
-
-    const summary = [];
-    for (const [name, rawValues] of byName) {
-        const entry = summarizeAttributeValues(name, rawValues);
-        if (entry) summary.push(entry);
     }
-    return summary;
+    const shown = values.slice(0, 8);
+    const extra = values.length - shown.length;
+    return {
+        key: field.key, label: field.label, group: field.group, unit: field.unit,
+        rangeText: shown.join(", ") + (extra > 0 ? `, +${extra} more` : ""),
+        values,
+    };
+}
+
+function buildSpecSummary(specSchema, productAttributes, brandRows) {
+    if (!specSchema?.length) return [];
+    return specSchema
+        .map((field) => summarizeSchemaField(field, [
+            productAttributes?.[field.key],
+            ...brandRows.map((b) => b.attributes?.[field.key]),
+        ]))
+        .filter(Boolean);
+}
+
+// NEW — every schema field THIS specific item has a value for, grouped
+// and unit-formatted like a real manufacturer spec page. Use this
+// wherever a single product or brand item is shown on its own.
+function buildFullSpecSheet(specSchema, attributes) {
+    if (!specSchema?.length || !attributes) return [];
+    const groups = [];
+    for (const field of specSchema) {
+        const raw = attributes[field.key];
+        if (!raw) continue;
+        const displayValue =
+            field.type === "numeric" && field.unit ? `${raw} ${field.unit}` :
+                field.type === "list" ? String(raw).split(",").map((s) => s.trim()).join(", ") :
+                    String(raw);
+
+        let group = groups.find((g) => g.group === field.group);
+        if (!group) { group = { group: field.group, specs: [] }; groups.push(group); }
+        group.specs.push({ key: field.key, label: field.label, value: displayValue, importance: field.importance });
+    }
+    for (const g of groups) g.specs.sort((a, b) => a.importance - b.importance);
+    return groups;
 }
 
 // GET /api/products/:id
@@ -81,7 +124,7 @@ export async function getProductDetail(req, res) {
         .select(`
             id, name, slug, image, description, generic_name,
             variants, attributes, is_ai_generated,
-            subcategory:hs_subcategories (
+            spec_schema, subcategory:hs_subcategories (
                 id, name, slug,
                 category:hs_categories ( id, name, slug )
             )
@@ -109,7 +152,9 @@ export async function getProductDetail(req, res) {
     ]);
 
     const brandRows = brandsRes.data || [];
-    const specSummary = buildSpecSummary(product.attributes, brandRows);
+    const specSummary = buildSpecSummary(product.spec_schema, product.attributes, brandRows);
+    const fullSpecSheet = buildFullSpecSheet(product.spec_schema, product.attributes);
+
 
     res.json({
         success: true,
@@ -118,6 +163,7 @@ export async function getProductDetail(req, res) {
         // them to the client per-brand
         brands: brandRows.map(({ attributes, ...rest }) => rest),
         specSummary,
+        fullSpecSheet,
         specSampleSize: brandRows.length,
         sellerCount: sellerCountRes.count || 0,
     });

@@ -28,6 +28,8 @@ import { generateCatalogImage } from "./catalogImageGen.service.js";
 import { convertPngToAvif } from "./cloudinaryConvert.service.js";
 import { uploadCatalogImage } from "./catalogImageStorage.service.js";
 import { waitUntil } from "@vercel/functions";
+import { generateSpecSchema } from "./specSchema.service.js";
+import { fillBrandSpecValues } from "./brandSpecFill.service.js";
 import { createResolveLogger } from "../utils/resolveLogger.js";
 import { slugify } from "./slugify.js";
 
@@ -451,8 +453,7 @@ async function resolveSubcategory(classification, categoryId, shortlists, embedd
     log.info("subcategory: creating new ->", classification.new_subcategory_name);
     return createSubcategory(categoryId, classification.new_subcategory_name, embeddingByKey.subcategory);
 }
-
-async function resolveProduct(classification, subcategoryId, shortlists, embeddingByKey, log) {
+async function resolveProduct(classification, subcategoryId, shortlists, embeddingByKey, log, categoryName, subcategoryName) {
     // 0. LLM explicitly said this is the same generic product line as an
     // existing candidate — the fix for "Engine Oil" / "10W-40 Engine Oil"
     // / "Passenger Car Engine Oil" all existing as separate products.
@@ -529,22 +530,29 @@ async function resolveProduct(classification, subcategoryId, shortlists, embeddi
     const slug = slugify(name);
     const embedding = embeddingByKey.product;
     log.info("product: creating new ->", name);
+
+    // only reached when actually creating a new product row
+    const specSchema = await generateSpecSchema({
+        genericName: name,
+        categoryName,
+        subcategoryName,
+        description: classification.description,
+    });
+
+
     return insertOrFetchOnConflict(
         "hs_products",
         {
-            subcategory_id: subcategoryId,
-            name,
-            slug,
+            subcategory_id: subcategoryId, name, slug,
             description: classification.description || null,
             generic_name: name,
             variants: classification.variants || [],
             attributes: Object.fromEntries((classification.attributes || []).map((a) => [a.name, a.value])),
-            is_ai_generated: true,
-            embedding,
-            review_status: "pending_review",
+            spec_schema: specSchema,
+            is_ai_generated: true, embedding, review_status: "pending_review",
         },
         { subcategory_id: subcategoryId, slug },
-        "id, name, image"
+        "id, name, image, spec_schema"
     );
 }
 
@@ -635,7 +643,7 @@ function codesConflict(codesA, codesB) {
     return false;
 }
 
-async function resolveBrandItem(classification, productId, shortlists, embeddingByKey, log) {
+async function resolveBrandItem(classification, productId, shortlists, embeddingByKey, log, brandSpecFill) {
     if (!classification.is_branded || !classification.brand_item_name || !productId) return null;
 
     const { data: existing } = await supabase
@@ -692,7 +700,10 @@ async function resolveBrandItem(classification, productId, shortlists, embedding
             name: classification.brand_item_name,
             slug,
             description: classification.description || null,
-            attributes: Object.fromEntries((classification.brand_attributes || []).map((a) => [a.name, a.value])),
+            attributes: brandSpecFill.values.length
+                ? Object.fromEntries(brandSpecFill.values.map((a) => [a.key, a.value]))
+                : Object.fromEntries((classification.brand_attributes || []).map((a) => [a.name, a.value])),
+            spec_grounded: brandSpecFill.grounded && brandSpecFill.values.length > 0,
             is_ai_generated: true,
             embedding: embeddingByKey.brand,
             review_status: "pending_review",
@@ -781,10 +792,35 @@ export async function resolveOrCreateCatalogEntry({ term, level, parentId }) {
         log.warn(`product: skipping — generic_name "${classification.generic_name}" duplicates subcategory name "${subcategoryRow.name}", would create redundant level`);
     }
     const productRow = subcategoryRow && !genericNameDuplicatesSubcategory
-        ? await resolveProduct(classification, subcategoryRow.id, shortlists, embeddingByKey, log)
+        ? await resolveProduct(classification, subcategoryRow.id, shortlists, embeddingByKey, log, categoryRow.name, subcategoryRow.name)
         : null;
 
-    const brandRow = productRow ? await resolveBrandItem(classification, productRow.id, shortlists, embeddingByKey, log) : null;
+    if (productRow && !productRow.spec_schema?.length) {
+        const schema = await generateSpecSchema({
+            genericName: productRow.name,
+            categoryName: categoryRow.name,
+            subcategoryName: subcategoryRow?.name,
+            description: classification.description,
+        });
+        if (schema.length) {
+            await supabase.from("hs_products").update({ spec_schema: schema }).eq("id", productRow.id);
+            productRow.spec_schema = schema;
+        }
+    }
+
+    let brandSpecFill = { values: [], grounded: false };
+    if (classification.is_branded && productRow?.spec_schema?.length) {
+        brandSpecFill = await fillBrandSpecValues({
+            brandItemName: classification.brand_item_name,
+            brandName: classification.brand_name,
+            specSchema: productRow.spec_schema,
+            useWebSearch: true, // named brand+model — worth grounding
+        });
+    }
+
+    const brandRow = productRow
+        ? await resolveBrandItem(classification, productRow.id, shortlists, embeddingByKey, log, brandSpecFill)
+        : null;
 
     const stack = [
         { level: "category", id: categoryRow.id, name: categoryRow.name },
