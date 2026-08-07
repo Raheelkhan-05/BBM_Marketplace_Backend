@@ -15,13 +15,13 @@ import { identifyProductFromImage } from "../controllers/imageSearch.controller.
 import { getImageStatuses } from "../controllers/catalogImageStatus.controller.js";
 import { getProductDetail } from "../controllers/productDetail.controller.js";
 
-
 const router = Router();
 
 // Level-specific endpoints (clearest for direct use / testing)
 router.get("/categories", searchCategories);
 router.get("/subcategories", searchSubcategories);
 router.get("/products", searchProducts);
+
 router.get("/brands", searchBrands);
 router.get("/sellers", searchSellersForProduct);
 

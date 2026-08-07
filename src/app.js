@@ -10,6 +10,8 @@ import hierarchySearchRoutes from "./routes/hierarchysearch.routes.js";
 import catalogLandingRoutes from "./routes/catalogLanding.routes.js";
 import catalogImportRoutes from "./routes/catalogImport.routes.js";
 import whatsappRoutes from "./routes/whatsapp.routes.js";
+import sellerCatalogListingsRouter from "./routes/sellerCatalogListings.routes.js";
+
 
 export function createApp() {
   const app = express();
@@ -54,6 +56,7 @@ export function createApp() {
   app.use("/api/catalog", catalogLandingRoutes);
   app.use("/api/catalogs", catalogImportRoutes);
   app.use("/api/whatsapp", whatsappRoutes);
+  app.use("/api/seller/catalog", sellerCatalogListingsRouter);
 
   app.use((err, req, res, next) => {
     console.error(err);
