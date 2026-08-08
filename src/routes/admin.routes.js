@@ -13,6 +13,9 @@ import {
   approveCatalogEntry, rejectCatalogEntry, getMappingOptions,
   createMappingOption, createCatalogEntry,
 } from "../controllers/adminCatalog.controller.js";
+import multer from "multer";
+import { uploadCatalogImage } from "../controllers/adminUpload.controller.js";
+const upload = multer({ storage: multer.memoryStorage() });
 
 
 const router = Router();
@@ -35,6 +38,7 @@ router.patch("/catalog/:level/:id", requireAuth, requireAdmin, authWriteLimiter,
 router.post("/catalog/:level/:id/approve", requireAuth, requireAdmin, authWriteLimiter, approveCatalogEntry);
 router.post("/catalog/:level/:id/reject", requireAuth, requireAdmin, authWriteLimiter, rejectCatalogEntry);
 router.post("/catalog/options", requireAuth, requireAdmin, authWriteLimiter, createMappingOption);
+router.post("/catalog/upload", requireAuth, requireAdmin, upload.single("file"), uploadCatalogImage);
 router.post("/catalog/:level", requireAuth, requireAdmin, authWriteLimiter, createCatalogEntry);
 
 export default router;

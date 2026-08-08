@@ -20,6 +20,11 @@ const LEVEL_CONFIG = {
         editableFields: ["name", "slug", "image", "brand_name", "description", "variants", "attributes"],
         embed: "hs_products(id, name, review_status, hs_subcategories(id, name, review_status, hs_categories(id, name, review_status)))",
     },
+    generic_product: {
+        table: "hs_generic_products", label: "Generic Product",
+        editableFields: ["name", "slug", "image"],
+        embed: "hs_subcategories(id, name, review_status, hs_categories(id, name, review_status))",
+    },
 };
 
 const CREATE_CONFIG = {
@@ -36,6 +41,8 @@ const PICKER_CONFIG = {
 
 
 function cfgFor(level, res) {
+    console.log(level);
+
     const cfg = LEVEL_CONFIG[level];
     if (!cfg) {
         res.status(400).json({ success: false, message: `Unknown level "${level}".` });
@@ -61,13 +68,20 @@ function hasRejectedAncestor(level, row) {
         const sc = p?.hs_subcategories;
         return p?.review_status === "rejected" || sc?.review_status === "rejected" || sc?.hs_categories?.review_status === "rejected";
     }
+    if (level === "generic_product") {
+        const sc = row.hs_subcategories;
+        return sc?.review_status === "rejected" || sc?.hs_categories?.review_status === "rejected";
+    }
+
     return false;
 }
 
 // GET /api/admin/catalog?level=all|category|subcategory|product|brand&status=pending_review|approved|rejected|all&q=
 export async function listCatalogEntries(req, res) {
-    const { level = "all", status = "pending_review", q = "" } = req.query;
+    const { level = "all", status = "pending_review", q = "", parentId = "" } = req.query;
     const levels = level === "all" ? Object.keys(LEVEL_CONFIG) : [level];
+    // parentId only makes sense when browsing a single level (drill-down)
+    const parentFieldForFilter = level !== "all" ? LEVEL_PARENT_FIELD[level] : null;
 
     try {
         const results = await Promise.all(
@@ -81,6 +95,7 @@ export async function listCatalogEntries(req, res) {
                     .limit(200);
                 if (status !== "all") query = query.eq("review_status", status);
                 if (q) query = query.ilike("name", `%${q}%`);
+                if (parentId && parentFieldForFilter) query = query.eq(parentFieldForFilter, parentId);
                 const { data, error } = await query;
                 if (error) throw error;
                 return (data || [])
@@ -88,7 +103,6 @@ export async function listCatalogEntries(req, res) {
                     .map((row) => ({ ...row, level: lvl }));
             })
         );
-
         const merged = results.flat().sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
         res.json({ success: true, entries: merged });
     } catch (error) {
@@ -141,7 +155,7 @@ export async function getCatalogEntry(req, res) {
 }
 
 // PATCH /api/admin/catalog/:level/:id  — save edits without changing review_status
-const LEVEL_PARENT_FIELD = { subcategory: "category_id", product: "subcategory_id", brand: "product_id" };
+const LEVEL_PARENT_FIELD = { subcategory: "category_id", product: "subcategory_id", brand: "product_id", generic_product: "subcategory_id" };
 
 export async function updateCatalogEntry(req, res) {
     const { level, id } = req.params;
