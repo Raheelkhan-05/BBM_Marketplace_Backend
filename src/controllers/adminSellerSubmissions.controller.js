@@ -1,27 +1,65 @@
 import { supabase } from "../config/supabase.js";
 import { notifyUser } from "../services/notifications.service.js";
 
+// Shared select fragment — pulls product_name/brand_name/image from the
+// brand item (hs_generic_product_brands) via generic_product_brand_id,
+// since seller_product_submissions no longer carries those directly.
+const BRAND_EMBED = `
+    id, price, moq, unit, lead_time,
+    review_status, rejection_reason, created_at,
+    seller:seller_profiles(id, display_name, user_id),
+    brand:hs_generic_product_brands(
+        id, name, brand_name, image,
+        generic_product:hs_generic_products(id, name,
+            subcategory:hs_subcategories(id, name, category:hs_categories(id, name))
+        )
+    )
+`;
+
+// Normalizes a row so the frontend (which expects product_name/brand_name/
+// image/generic_product directly on the item) keeps working unchanged,
+// regardless of whether the row uses the new brand-linked shape or an
+// older row that still has its own product_name/brand_name/image set.
+function normalizeSubmission(row) {
+    if (!row) return row;
+    const brand = row.brand || {};
+    return {
+        ...row,
+        product_name: row.product_name || brand.name || null,
+        brand_name: row.brand_name || brand.brand_name || null,
+        image: row.image || brand.image || null,
+        generic_product: row.generic_product || brand.generic_product || null,
+    };
+}
+
 // GET /api/admin/seller-submissions?status=pending_review&q=
 export async function listSellerSubmissions(req, res) {
     const { status = "pending_review", q = "" } = req.query;
     let query = supabase
         .from("seller_product_submissions")
-        .select(`
-            id, product_name, brand_name, price, moq, unit, lead_time, image,
-            review_status, rejection_reason, created_at,
-            seller:seller_profiles(id, display_name, user_id),
-            generic_product:hs_generic_products(id, name,
-                subcategory:hs_subcategories(id, name, category:hs_categories(id, name))
-            )
-        `)
+        .select(BRAND_EMBED)
         .order("created_at", { ascending: false })
         .limit(200);
     if (status !== "all") query = query.eq("review_status", status);
-    if (q.trim()) query = query.or(`product_name.ilike.%${q.trim()}%,brand_name.ilike.%${q.trim()}%`);
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
-    res.json({ success: true, items: data || [] });
+
+    let items = (data || []).map(normalizeSubmission);
+
+    // Filtering by product/brand name now has to happen after the join
+    // (can't ilike across a related table in one PostgREST query), so we
+    // filter in memory once rows are normalized.
+    if (q.trim()) {
+        const term = q.trim().toLowerCase();
+        items = items.filter(
+            (it) =>
+                it.product_name?.toLowerCase().includes(term) ||
+                it.brand_name?.toLowerCase().includes(term)
+        );
+    }
+
+    res.json({ success: true, items });
 }
 
 // GET /api/admin/seller-submissions/:id
@@ -29,12 +67,12 @@ export async function getSellerSubmission(req, res) {
     const { id } = req.params;
     const { data, error } = await supabase
         .from("seller_product_submissions")
-        .select(`*, seller:seller_profiles(id, display_name, user_id), generic_product:hs_generic_products(id, name, subcategory:hs_subcategories(id, name, category:hs_categories(id, name)))`)
+        .select(`*, ${BRAND_EMBED}`)
         .eq("id", id)
         .maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!data) return res.status(404).json({ success: false, message: "Not found." });
-    res.json({ success: true, submission: data });
+    res.json({ success: true, submission: normalizeSubmission(data) });
 }
 
 // POST /api/admin/seller-submissions/:id/approve
@@ -42,7 +80,7 @@ export async function approveSellerSubmission(req, res) {
     const { id } = req.params;
     const { data: existing, error: fetchErr } = await supabase
         .from("seller_product_submissions")
-        .select("id, product_name, seller:seller_profiles(user_id)")
+        .select("id, product_name, generic_product_brand_id, seller:seller_profiles(user_id), brand:hs_generic_product_brands(name, review_status)")
         .eq("id", id)
         .maybeSingle();
     if (fetchErr) return res.status(500).json({ success: false, message: fetchErr.message });
@@ -56,15 +94,29 @@ export async function approveSellerSubmission(req, res) {
         .single();
     if (error) return res.status(500).json({ success: false, message: error.message });
 
+    // Approving a submission is the only path that brought this brand
+    // item into existence when the seller proposed a new one, so approve
+    // the brand item alongside it if it's still sitting pending — without
+    // this, buyers never see the product on the catalog-search hierarchy
+    // (which only reads approved rows from hs_generic_product_brands).
+    if (existing.generic_product_brand_id && existing.brand?.review_status === "pending_review") {
+        const { error: brandErr } = await supabase
+            .from("hs_generic_product_brands")
+            .update({ review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: req.user.id, rejection_reason: null })
+            .eq("id", existing.generic_product_brand_id);
+        if (brandErr) return res.status(500).json({ success: false, message: brandErr.message });
+    }
+
+    const displayName = existing.product_name || existing.brand?.name || "Your product";
     if (existing.seller?.user_id) {
         await notifyUser(existing.seller.user_id, {
             type: "listing_approved",
             title: "Your product listing was approved",
-            message: `"${existing.product_name}" is now live on your shop.`,
+            message: `"${displayName}" is now live on your shop.`,
             link: "/seller/dashboard",
         });
     }
-    res.json({ success: true, submission: data });
+    res.json({ success: true, submission: normalizeSubmission(data) });
 }
 
 // POST /api/admin/seller-submissions/:id/reject   { reason }
@@ -75,7 +127,7 @@ export async function rejectSellerSubmission(req, res) {
 
     const { data: existing, error: fetchErr } = await supabase
         .from("seller_product_submissions")
-        .select("id, product_name, seller:seller_profiles(user_id)")
+        .select("id, product_name, seller:seller_profiles(user_id), brand:hs_generic_product_brands(name)")
         .eq("id", id)
         .maybeSingle();
     if (fetchErr) return res.status(500).json({ success: false, message: fetchErr.message });
@@ -89,13 +141,14 @@ export async function rejectSellerSubmission(req, res) {
         .single();
     if (error) return res.status(500).json({ success: false, message: error.message });
 
+    const displayName = existing.product_name || existing.brand?.name || "Your product";
     if (existing.seller?.user_id) {
         await notifyUser(existing.seller.user_id, {
             type: "listing_rejected",
             title: "Your product listing needs changes",
-            message: `"${existing.product_name}" wasn't approved: ${reason.trim()}`,
+            message: `"${displayName}" wasn't approved: ${reason.trim()}`,
             link: "/seller/dashboard",
         });
     }
-    res.json({ success: true, submission: data });
+    res.json({ success: true, submission: normalizeSubmission(data) });
 }

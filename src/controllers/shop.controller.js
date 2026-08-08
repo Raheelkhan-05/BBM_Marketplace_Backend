@@ -1,5 +1,36 @@
 import { supabase } from "../config/supabase.js";
 
+// See catalogHierarchySearch.controller.js for the same pattern — search
+// terms can contain characters meaningful to ILIKE (%, _) or to
+// PostgREST's .or() filter syntax (, ( ) "), e.g. a term with a comma
+// and a percent sign like "...Size, 200 g 8% off" will otherwise get
+// split mid-string by .or() and have its % read as a wildcard, so the
+// query either 500s or silently matches nothing.
+
+// Escapes ILIKE wildcard characters so they're matched literally.
+function escapeIlike(term) {
+  return term.replace(/[%_\\]/g, (m) => `\\${m}`);
+}
+
+// Wraps any raw value in PostgREST's quoted-value syntax so it can sit
+// safely inside a comma-separated .or() filter list, even if it itself
+// contains commas, parentheses, or quotes.
+function orValue(raw) {
+  return `"${raw.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function orIlikePattern(term) {
+  return orValue(`%${escapeIlike(term)}%`);
+}
+
+// .cs. (array-contains) expects a JSON array literal as its value —
+// JSON.stringify handles quoting/escaping the term correctly inside the
+// array, then orValue quotes the whole literal so its own top-level
+// commas/parens don't get mistaken for .or() separators.
+function orContainsPattern(term) {
+  return orValue(JSON.stringify([term]));
+}
+
 export async function getShopBySlug(req, res) {
   const { slug } = req.params;
 
@@ -75,12 +106,14 @@ export async function searchShops(req, res) {
   if (!q || q.trim().length < 2) return res.json({ success: true, shops: [] });
 
   const term = q.trim();
+  const namePattern = orIlikePattern(term);
+  const arrayPattern = orContainsPattern(term);
 
   const { data, error } = await supabase
     .from("seller_profiles")
     .select("id, shop_slug, display_name, logo_url, city, state, business_type, categories, products_brands")
     .eq("status", "approved") // only ever surface live, approved shops publicly
-    .or(`display_name.ilike.%${term}%,categories.cs.["${term}"],products_brands.cs.["${term}"]`)
+    .or(`display_name.ilike.${namePattern},categories.cs.${arrayPattern},products_brands.cs.${arrayPattern}`)
     .order("display_name")
     .limit(Number(limit) || 8);
 

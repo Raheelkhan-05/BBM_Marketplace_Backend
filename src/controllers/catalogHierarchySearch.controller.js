@@ -14,6 +14,34 @@ function clampLimit(limit) {
     return Math.min(n, 50);
 }
 
+// Search terms can contain characters that are meaningful to Postgres'
+// ILIKE (%, _) or to PostgREST's .or() filter syntax (,  ( ) ") — e.g.
+// "Exotes ... 200 g 8% off" has both a comma and a percent sign. Left
+// unescaped, the comma splits the .or() string into a bogus extra
+// condition and the % is read as a wildcard instead of a literal char,
+// so the search silently fails to match. These two helpers make any
+// user-supplied term safe to drop into either context.
+
+// Escapes ILIKE wildcard characters so they're matched literally.
+function escapeIlike(term) {
+    return term.replace(/[%_\\]/g, (m) => `\\${m}`);
+}
+
+// Plain %term% ILIKE pattern (safe to pass to .ilike(), which takes the
+// pattern as its own argument and never shares a string with other
+// filters — no comma-escaping needed here, just the wildcard escaping).
+function ilikePattern(term) {
+    return `%${escapeIlike(term)}%`;
+}
+
+// Builds a %term% ILIKE pattern, then quotes it per PostgREST's rules so
+// it can safely sit inside a comma-separated .or() filter list even if
+// the term itself contains commas, parentheses, or quotes.
+function orIlikePattern(term) {
+    const pattern = ilikePattern(term);
+    return `"${pattern.replace(/"/g, '\\"')}"`;
+}
+
 // GET /api/catalog-search/categories?q=&limit=
 export async function searchCategoriesV2(req, res) {
     const { q = "", limit } = req.query;
@@ -23,7 +51,7 @@ export async function searchCategoriesV2(req, res) {
         .eq("review_status", "approved")
         .order("name")
         .limit(clampLimit(limit));
-    if (q.trim()) query = query.ilike("name", `%${q.trim()}%`);
+    if (q.trim()) query = query.ilike("name", ilikePattern(q.trim()));
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
@@ -42,7 +70,7 @@ export async function searchSubcategoriesV2(req, res) {
         .eq("review_status", "approved")
         .order("name")
         .limit(clampLimit(limit));
-    if (q.trim()) query = query.ilike("name", `%${q.trim()}%`);
+    if (q.trim()) query = query.ilike("name", ilikePattern(q.trim()));
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
@@ -61,7 +89,7 @@ export async function searchGenericProductsV2(req, res) {
         .eq("review_status", "approved")
         .order("name")
         .limit(clampLimit(limit));
-    if (q.trim()) query = query.ilike("name", `%${q.trim()}%`);
+    if (q.trim()) query = query.ilike("name", ilikePattern(q.trim()));
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
@@ -84,7 +112,10 @@ export async function searchBrandItemsV2(req, res) {
         .eq("review_status", "approved")
         .order("name")
         .limit(clampLimit(limit));
-    if (q.trim()) query = query.or(`name.ilike.%${q.trim()}%,brand_name.ilike.%${q.trim()}%`);
+    if (q.trim()) {
+        const p = orIlikePattern(q.trim());
+        query = query.or(`name.ilike.${p},brand_name.ilike.${p}`);
+    }
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
@@ -133,7 +164,7 @@ export async function searchSellersForBrandItemV2(req, res) {
         .eq("review_status", "approved")
         .order("price", { ascending: true })
         .limit(clampLimit(limit));
-    if (q.trim()) query = query.ilike("seller.display_name", `%${q.trim()}%`);
+    if (q.trim()) query = query.ilike("seller.display_name", ilikePattern(q.trim()));
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
@@ -188,17 +219,19 @@ export async function smartSearchV2(req, res) {
         return res.json({ success: true, exact: null, suggestions: { categories: [], subcategories: [], genericProducts: [], brandItems: [] } });
     }
     const cap = clampLimit(limit) > 10 ? 5 : clampLimit(limit);
+    const pattern = ilikePattern(term);
+    const orPattern = orIlikePattern(term);
 
     const [catRes, subRes, gpRes, biRes] = await Promise.all([
-        supabase.from("hs_categories").select("id, name, slug, image").eq("review_status", "approved").ilike("name", `%${term}%`).limit(cap),
-        supabase.from("hs_subcategories").select("id, name, slug, image, category_id, category:hs_categories(id, name, slug)").eq("review_status", "approved").ilike("name", `%${term}%`).limit(cap),
-        supabase.from("hs_generic_products").select("id, name, slug, image, subcategory_id, subcategory:hs_subcategories(id, name, slug, category_id, category:hs_categories(id, name, slug))").eq("review_status", "approved").ilike("name", `%${term}%`).limit(cap),
+        supabase.from("hs_categories").select("id, name, slug, image").eq("review_status", "approved").ilike("name", pattern).limit(cap),
+        supabase.from("hs_subcategories").select("id, name, slug, image, category_id, category:hs_categories(id, name, slug)").eq("review_status", "approved").ilike("name", pattern).limit(cap),
+        supabase.from("hs_generic_products").select("id, name, slug, image, subcategory_id, subcategory:hs_subcategories(id, name, slug, category_id, category:hs_categories(id, name, slug))").eq("review_status", "approved").ilike("name", pattern).limit(cap),
         supabase.from("hs_generic_product_brands").select(`
             id, name, brand_name, slug, image, generic_product_id,
             generic_product:hs_generic_products(id, name, slug, subcategory_id,
                 subcategory:hs_subcategories(id, name, slug, category_id,
                     category:hs_categories(id, name, slug)))
-        `).eq("review_status", "approved").or(`name.ilike.%${term}%,brand_name.ilike.%${term}%`).limit(cap),
+        `).eq("review_status", "approved").or(`name.ilike.${orPattern},brand_name.ilike.${orPattern}`).limit(cap),
     ]);
 
     if (catRes.error) return res.status(500).json({ success: false, message: catRes.error.message });
@@ -293,13 +326,14 @@ export async function searchAutocompleteV2(req, res) {
 
     const cap = Math.min(Number(limit) || 8, 10);
     const perTable = 4;
-    const pattern = `%${term}%`;
+    const pattern = ilikePattern(term);
+    const orPattern = orIlikePattern(term);
 
     const [catRes, subRes, gpRes, biRes] = await Promise.all([
         supabase.from("hs_categories").select("id, name, slug").eq("review_status", "approved").ilike("name", pattern).order("name").limit(perTable),
         supabase.from("hs_subcategories").select("id, name, slug").eq("review_status", "approved").ilike("name", pattern).order("name").limit(perTable),
         supabase.from("hs_generic_products").select("id, name, slug").eq("review_status", "approved").ilike("name", pattern).order("name").limit(perTable),
-        supabase.from("hs_generic_product_brands").select("id, name, brand_name, slug").eq("review_status", "approved").or(`name.ilike.${pattern},brand_name.ilike.${pattern}`).order("name").limit(perTable),
+        supabase.from("hs_generic_product_brands").select("id, name, brand_name, slug").eq("review_status", "approved").or(`name.ilike.${orPattern},brand_name.ilike.${orPattern}`).order("name").limit(perTable),
     ]);
 
     if (catRes.error || subRes.error || gpRes.error || biRes.error) {
