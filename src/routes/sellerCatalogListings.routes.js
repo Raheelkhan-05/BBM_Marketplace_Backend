@@ -22,7 +22,7 @@ router.get("/generic-products", listApprovedGenericProducts);
 router.post("/submissions", requireAuth, requireApprovedSeller, createSubmission);
 router.get("/submissions", requireAuth, requireApprovedSeller, listMySubmissions);
 router.post("/listings", requireAuth, requireApprovedSeller, createListingForExistingBrand);
-router.patch("/submissions/:id", requireAuth, updateSubmission);
-router.delete("/catalog/submissions/:id", requireAuth, deleteSubmission);
+router.patch("/submissions/:id", requireAuth, requireApprovedSeller, updateSubmission);
+router.delete("/submissions/:id", requireAuth, requireApprovedSeller, deleteSubmission);
 
 export default router;

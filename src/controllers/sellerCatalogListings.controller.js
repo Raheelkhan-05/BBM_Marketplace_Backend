@@ -176,24 +176,19 @@ export async function deleteSubmission(req, res) {
 }
 
 // PATCH /api/seller/catalog/submissions/:id
-// Seller edits commercial terms (price/moq/unit/leadTime/image). Any edit
-// sends it back to pending_review — it's no longer the admin-approved
-// version until re-reviewed.
+// Seller edits commercial terms (price/moq/unit/leadTime/image/stock).
+// These are routine updates to an already-reviewed listing — the
+// identity of the item (brand item it's linked to) never changes here,
+// only the seller's own terms — so this does NOT reset review_status.
+// An approved listing stays approved and visible immediately; a
+// pending/rejected one stays whatever it already was.
 export async function updateSubmission(req, res) {
     const sellerId = req.sellerId;
     const { id } = req.params;
-    const { price, moq, unit, leadTime, image } = req.body || {};
-
-    const missing = [];
-    if (!(Number(price) > 0)) missing.push("Price");
-    if (!(Number(moq) > 0)) missing.push("MOQ");
-    if (!unit || !ALLOWED_UNITS.includes(unit)) missing.push("Unit");
-    if (!leadTime?.trim()) missing.push("Lead time");
-    if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.` });
 
     const { data: existing, error: findErr } = await supabase
         .from("seller_product_submissions")
-        .select("id, seller_id")
+        .select("id, seller_id, price, moq, unit, lead_time, image, stock_quantity")
         .eq("id", id)
         .maybeSingle();
     if (findErr) return res.status(500).json({ success: false, message: findErr.message });
@@ -201,25 +196,42 @@ export async function updateSubmission(req, res) {
         return res.status(404).json({ success: false, message: "Listing not found." });
     }
 
+    const body = req.body || {};
+    const price = body.price !== undefined ? body.price : existing.price;
+    const moq = body.moq !== undefined ? body.moq : existing.moq;
+    const unit = body.unit !== undefined ? body.unit : existing.unit;
+    const leadTime = body.leadTime !== undefined ? body.leadTime : (body.lead_time !== undefined ? body.lead_time : existing.lead_time);
+    const image = body.image !== undefined ? body.image : existing.image;
+
+    const stockProvided = Object.prototype.hasOwnProperty.call(body, "stock_quantity") || Object.prototype.hasOwnProperty.call(body, "stockQuantity");
+    const rawStock = body.stock_quantity !== undefined ? body.stock_quantity : body.stockQuantity;
+    const stockQuantity = stockProvided ? (rawStock === "" || rawStock === null ? null : Number(rawStock)) : existing.stock_quantity;
+
+    const missing = [];
+    if (!(Number(price) > 0)) missing.push("Price");
+    if (!(Number(moq) > 0)) missing.push("MOQ");
+    if (!unit || !ALLOWED_UNITS.includes(unit)) missing.push("Unit");
+    if (!leadTime?.toString().trim()) missing.push("Lead time");
+    if (stockQuantity != null && Number(stockQuantity) < 0) missing.push("Stock quantity can't be negative");
+    if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.` });
+
     const { data: updated, error } = await supabase
         .from("seller_product_submissions")
         .update({
             price: Number(price),
             moq: Number(moq),
             unit,
-            lead_time: leadTime.trim(),
+            lead_time: leadTime.toString().trim(),
             image: image || null,
-            review_status: "pending_review", // re-review after any seller edit
-            rejection_reason: null,
-            reviewed_at: null,
-            reviewed_by: null,
+            stock_quantity: stockQuantity,
+            // review_status intentionally NOT touched here — see comment above.
         })
         .eq("id", id)
-        .select("id, updated_at")
+        .select("id, price, moq, unit, lead_time, image, stock_quantity, review_status, updated_at")
         .single();
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    res.json({ success: true, submission: updated, message: "Updated — resubmitted for admin review." });
+    res.json({ success: true, submission: updated, message: "Listing updated." });
 }
 
 // POST /api/seller/catalog/listings   { genericProductBrandId, price, moq, unit, leadTime, image? }
