@@ -18,20 +18,20 @@ export async function getShopBySlug(req, res) {
     supabase
       .from("seller_product_submissions")
       .select(`
-        id, price, moq, unit, lead_time, image, review_status, created_at,
-        brand:hs_generic_product_brands (
-          id, name, brand_name, image,
-          generic_product:hs_generic_products (
+      id, price, moq, unit, lead_time, image, review_status, created_at,
+      brand:hs_generic_product_brands (
+        id, name, brand_name, image,
+        generic_product:hs_generic_products (
+          id, name,
+          subcategory:hs_subcategories (
             id, name,
-            subcategory:hs_subcategories (
-              id, name,
-              category:hs_categories ( id, name )
-            )
+            category:hs_categories ( id, name )
           )
         )
-      `)
+      )
+    `)
       .eq("seller_id", seller.id)
-      .in("review_status", ["approved", "pending_review"])
+      .eq("review_status", "approved") // public storefront: approved only, never pending or rejected
       .order("created_at", { ascending: false }),
   ]);
 
