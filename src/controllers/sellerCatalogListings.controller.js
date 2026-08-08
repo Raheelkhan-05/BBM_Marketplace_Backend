@@ -133,13 +133,93 @@ export async function listMySubmissions(req, res) {
     const { status } = req.query;
     let query = supabase
         .from("seller_product_submissions")
-        .select("id, product_name, brand_name, price, moq, unit, lead_time, image, review_status, rejection_reason, created_at, generic_product:hs_generic_products(id, name)")
+        .select(`
+      id, price, moq, unit, lead_time, image, review_status, rejection_reason, created_at, updated_at,
+      brand:hs_generic_product_brands (
+        id, name, brand_name, image,
+        generic_product:hs_generic_products (
+          id, name,
+          subcategory:hs_subcategories (
+            id, name,
+            category:hs_categories ( id, name )
+          )
+        )
+      )
+    `)
         .eq("seller_id", sellerId)
         .order("created_at", { ascending: false });
     if (status) query = query.eq("review_status", status);
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
     res.json({ success: true, items: data || [] });
+}
+
+// DELETE /api/seller/catalog/submissions/:id
+export async function deleteSubmission(req, res) {
+    const sellerId = req.sellerId;
+    const { id } = req.params;
+
+    const { data: existing, error: findErr } = await supabase
+        .from("seller_product_submissions")
+        .select("id, seller_id")
+        .eq("id", id)
+        .maybeSingle();
+    if (findErr) return res.status(500).json({ success: false, message: findErr.message });
+    if (!existing || existing.seller_id !== sellerId) {
+        return res.status(404).json({ success: false, message: "Listing not found." });
+    }
+
+    const { error } = await supabase.from("seller_product_submissions").delete().eq("id", id);
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    res.json({ success: true, message: "Listing removed." });
+}
+
+// PATCH /api/seller/catalog/submissions/:id
+// Seller edits commercial terms (price/moq/unit/leadTime/image). Any edit
+// sends it back to pending_review — it's no longer the admin-approved
+// version until re-reviewed.
+export async function updateSubmission(req, res) {
+    const sellerId = req.sellerId;
+    const { id } = req.params;
+    const { price, moq, unit, leadTime, image } = req.body || {};
+
+    const missing = [];
+    if (!(Number(price) > 0)) missing.push("Price");
+    if (!(Number(moq) > 0)) missing.push("MOQ");
+    if (!unit || !ALLOWED_UNITS.includes(unit)) missing.push("Unit");
+    if (!leadTime?.trim()) missing.push("Lead time");
+    if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.` });
+
+    const { data: existing, error: findErr } = await supabase
+        .from("seller_product_submissions")
+        .select("id, seller_id")
+        .eq("id", id)
+        .maybeSingle();
+    if (findErr) return res.status(500).json({ success: false, message: findErr.message });
+    if (!existing || existing.seller_id !== sellerId) {
+        return res.status(404).json({ success: false, message: "Listing not found." });
+    }
+
+    const { data: updated, error } = await supabase
+        .from("seller_product_submissions")
+        .update({
+            price: Number(price),
+            moq: Number(moq),
+            unit,
+            lead_time: leadTime.trim(),
+            image: image || null,
+            review_status: "pending_review", // re-review after any seller edit
+            rejection_reason: null,
+            reviewed_at: null,
+            reviewed_by: null,
+        })
+        .eq("id", id)
+        .select("id, updated_at")
+        .single();
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    res.json({ success: true, submission: updated, message: "Updated — resubmitted for admin review." });
 }
 
 // POST /api/seller/catalog/listings   { genericProductBrandId, price, moq, unit, leadTime, image? }

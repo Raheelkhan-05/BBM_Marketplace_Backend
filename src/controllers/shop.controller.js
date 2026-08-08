@@ -7,18 +7,57 @@ export async function getShopBySlug(req, res) {
     .from("seller_profiles")
     .select("*")
     .eq("shop_slug", slug)
-    .eq("status", "approved") // never expose unapproved shops publicly
+    .eq("status", "approved")
     .maybeSingle();
 
   if (error || !seller) return res.status(404).json({ success: false, message: "Shop not found." });
 
-  const [{ data: photos }, { data: certifications }, { data: products }] = await Promise.all([
+  const [{ data: photos }, { data: certifications }, { data: submissions }] = await Promise.all([
     supabase.from("seller_photos").select("category, url").eq("seller_id", seller.id).eq("pending", false).order("sort_order"),
     supabase.from("seller_certifications").select("type, name, issued_by, issued_date, file_url").eq("seller_id", seller.id).eq("pending", false),
-    supabase.from("seller_products").select("*").eq("seller_id", seller.id).eq("is_active", true).order("sort_order"),
+    supabase
+      .from("seller_product_submissions")
+      .select(`
+        id, price, moq, unit, lead_time, image, review_status, created_at,
+        brand:hs_generic_product_brands (
+          id, name, brand_name, image,
+          generic_product:hs_generic_products (
+            id, name,
+            subcategory:hs_subcategories (
+              id, name,
+              category:hs_categories ( id, name )
+            )
+          )
+        )
+      `)
+      .eq("seller_id", seller.id)
+      .in("review_status", ["approved", "pending_review"])
+      .order("created_at", { ascending: false }),
   ]);
 
-  // Strip internal-only fields before sending to the public
+  // Flatten into { id, name, brand_name, image_url, price, unit, moq,
+  // lead_time, pending_approval, category, subcategory, generic_product }
+  // so the frontend can group without knowing about the join shape.
+  const products = (submissions || []).map((s) => {
+    const gp = s.brand?.generic_product;
+    const sub = gp?.subcategory;
+    const cat = sub?.category;
+    return {
+      id: s.id,
+      name: s.brand?.name || "Product",
+      brand_name: s.brand?.brand_name || null,
+      image_url: s.image || s.brand?.image || null,
+      price: s.price,
+      unit: s.unit,
+      moq: s.moq,
+      lead_time: s.lead_time,
+      pending_approval: s.review_status === "pending_review",
+      category: cat ? { id: cat.id, name: cat.name } : null,
+      subcategory: sub ? { id: sub.id, name: sub.name } : null,
+      generic_product: gp ? { id: gp.id, name: gp.name } : null,
+    };
+  });
+
   const { user_id, business_profile_id, reviewed_by, rejection_reason, annual_turnover, show_turnover_publicly, pan, cin, ...publicSeller } = seller;
 
   res.json({
@@ -26,7 +65,7 @@ export async function getShopBySlug(req, res) {
     seller: { ...publicSeller, annual_turnover: show_turnover_publicly ? annual_turnover : null },
     photos: photos || [],
     certifications: certifications || [],
-    products: products || [],
+    products,
   });
 }
 

@@ -8,6 +8,8 @@ import {
     createSubmission,
     listMySubmissions,
     createListingForExistingBrand,
+    updateSubmission,
+    deleteSubmission,
 } from "../controllers/sellerCatalogListings.controller.js";
 
 const router = Router();
@@ -20,5 +22,7 @@ router.get("/generic-products", listApprovedGenericProducts);
 router.post("/submissions", requireAuth, requireApprovedSeller, createSubmission);
 router.get("/submissions", requireAuth, requireApprovedSeller, listMySubmissions);
 router.post("/listings", requireAuth, requireApprovedSeller, createListingForExistingBrand);
+router.patch("/submissions/:id", requireAuth, updateSubmission);
+router.delete("/catalog/submissions/:id", requireAuth, deleteSubmission);
 
 export default router;
