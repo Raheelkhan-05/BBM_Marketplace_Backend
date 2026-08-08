@@ -4,7 +4,7 @@
 // seller_product_submissions as review_status='pending_review'.
 
 import { supabase } from "../config/supabase.js";
-
+import { slugify } from "../services/slugify.js"
 const PICKER_LIMIT = 20;
 
 export const ALLOWED_UNITS = [
@@ -66,34 +66,63 @@ export async function createSubmission(req, res) {
 
     const { data: generic, error: genericErr } = await supabase
         .from("hs_generic_products")
-        .select("id, name, review_status, subcategory:hs_subcategories(id, category:hs_categories(id))")
+        .select("id, review_status")
         .eq("id", genericProductId)
         .maybeSingle();
     if (genericErr) return res.status(500).json({ success: false, message: genericErr.message });
     if (!generic) return res.status(400).json({ success: false, message: "Selected product wasn't found." });
     if (generic.review_status !== "approved") return res.status(400).json({ success: false, message: "This product isn't available to list under yet." });
-    if (!generic.subcategory?.id || !generic.subcategory?.category?.id) {
-        return res.status(400).json({ success: false, message: "This product is missing category information — please contact support." });
+
+    // Find or create the canonical brand item so future sellers can find
+    // and claim it via "I want to sell this" instead of duplicating it.
+    const trimmedName = productName.trim();
+    const trimmedBrand = brandName.trim();
+    let { data: brand } = await supabase
+        .from("hs_generic_product_brands")
+        .select("id")
+        .eq("generic_product_id", generic.id)
+        .ilike("name", trimmedName)
+        .ilike("brand_name", trimmedBrand)
+        .maybeSingle();
+
+    if (!brand) {
+        const { data: newBrand, error: createErr } = await supabase
+            .from("hs_generic_product_brands")
+            .insert({
+                generic_product_id: generic.id,
+                name: trimmedName,
+                brand_name: trimmedBrand,
+                slug: slugify(`${trimmedName}-${trimmedBrand}`),
+                image,
+                is_ai_generated: false,
+                review_status: "pending_review", // stays gated behind admin approval, same as before
+            })
+            .select("id")
+            .single();
+        if (createErr && createErr.code !== "23505") return res.status(500).json({ success: false, message: createErr.message });
+        if (createErr) {
+            // Lost a race with another seller creating it simultaneously — reselect
+            const { data: raced } = await supabase.from("hs_generic_product_brands").select("id")
+                .eq("generic_product_id", generic.id).ilike("name", trimmedName).ilike("brand_name", trimmedBrand).maybeSingle();
+            brand = raced;
+        } else {
+            brand = newBrand;
+        }
     }
 
     const { data: inserted, error } = await supabase
         .from("seller_product_submissions")
         .insert({
             seller_id: sellerId,
-            generic_product_id: generic.id,
-            subcategory_id: generic.subcategory.id,
-            category_id: generic.subcategory.category.id,
-            product_name: productName.trim(),
-            brand_name: brandName.trim(),
-            price: Number(price),
-            moq: Number(moq),
-            unit,
-            lead_time: leadTime.trim(),
-            image,
+            generic_product_brand_id: brand.id,
+            price: Number(price), moq: Number(moq), unit, lead_time: leadTime.trim(), image,
         })
         .select("id, created_at")
         .single();
-    if (error) return res.status(500).json({ success: false, message: error.message });
+    if (error) {
+        if (error.code === "23505") return res.status(409).json({ success: false, message: "You're already listing this item." });
+        return res.status(500).json({ success: false, message: error.message });
+    }
 
     res.json({ success: true, submission: inserted, message: "Submitted for review. We'll notify you once it's approved." });
 }
@@ -111,4 +140,48 @@ export async function listMySubmissions(req, res) {
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
     res.json({ success: true, items: data || [] });
+}
+
+// POST /api/seller/catalog/listings   { genericProductBrandId, price, moq, unit, leadTime, image? }
+// "I want to sell this" — seller picks an EXISTING brand item and only
+// supplies commercial terms. No product/brand name/image re-entry.
+export async function createListingForExistingBrand(req, res) {
+    const sellerId = req.sellerId;
+    const { genericProductBrandId, price, moq, unit, leadTime, image } = req.body || {};
+
+    if (!genericProductBrandId) return res.status(400).json({ success: false, message: "Missing brand item." });
+    const missing = [];
+    if (!(Number(price) > 0)) missing.push("Price");
+    if (!(Number(moq) > 0)) missing.push("MOQ");
+    if (!unit || !ALLOWED_UNITS.includes(unit)) missing.push("Unit");
+    if (!leadTime?.trim()) missing.push("Lead time");
+    if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.` });
+
+    const { data: brand, error: brandErr } = await supabase
+        .from("hs_generic_product_brands")
+        .select("id, name, review_status, generic_product_id")
+        .eq("id", genericProductBrandId)
+        .maybeSingle();
+    if (brandErr) return res.status(500).json({ success: false, message: brandErr.message });
+    if (!brand) return res.status(400).json({ success: false, message: "That item wasn't found." });
+    if (brand.review_status !== "approved") return res.status(400).json({ success: false, message: "This item isn't available to list under yet." });
+
+    const { data: inserted, error } = await supabase
+        .from("seller_product_submissions")
+        .insert({
+            seller_id: sellerId,
+            generic_product_brand_id: brand.id,
+            price: Number(price),
+            moq: Number(moq),
+            unit,
+            lead_time: leadTime.trim(),
+            image: image || null,
+        })
+        .select("id, created_at")
+        .single();
+    if (error) {
+        if (error.code === "23505") return res.status(409).json({ success: false, message: "You're already listing this item." });
+        return res.status(500).json({ success: false, message: error.message });
+    }
+    res.json({ success: true, submission: inserted, message: `You're now listing "${brand.name}". We'll notify you once it's approved.` });
 }

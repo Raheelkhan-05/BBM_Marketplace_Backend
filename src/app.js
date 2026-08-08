@@ -12,6 +12,7 @@ import catalogImportRoutes from "./routes/catalogImport.routes.js";
 import whatsappRoutes from "./routes/whatsapp.routes.js";
 import sellerCatalogListingsRouter from "./routes/sellerCatalogListings.routes.js";
 import adminSellerSubmissionsRouter from "./routes/adminSellerSubmissions.routes.js";
+import catalogSearchRoutes from "./routes/catalogSearch.routes.js";
 
 
 export function createApp() {
@@ -54,6 +55,7 @@ export function createApp() {
   app.use("/api/notifications", notificationRoutes);
   app.use("/api/shop", shopRoutes);
   app.use("/api/search", hierarchySearchRoutes);
+  app.use("/api/catalog-search", catalogSearchRoutes);
   app.use("/api/catalog", catalogLandingRoutes);
   app.use("/api/catalogs", catalogImportRoutes);
   app.use("/api/whatsapp", whatsappRoutes);

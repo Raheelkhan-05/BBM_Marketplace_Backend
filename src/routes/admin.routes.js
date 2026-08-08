@@ -11,11 +11,13 @@ import {
 import {
   listCatalogEntries, getCatalogEntry, updateCatalogEntry,
   approveCatalogEntry, rejectCatalogEntry, getMappingOptions,
-  createMappingOption, createCatalogEntry,
+  createMappingOption, createCatalogEntry, deleteCatalogEntry,
 } from "../controllers/adminCatalog.controller.js";
 import multer from "multer";
+import { downloadCatalogTemplate, bulkUploadCatalog } from "../controllers/adminCatalogBulk.controller.js";
 import { uploadCatalogImage } from "../controllers/adminUpload.controller.js";
-const upload = multer({ storage: multer.memoryStorage() });
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
 
 
 const router = Router();
@@ -33,12 +35,15 @@ router.post("/admins/demote", requireAuth, requireAdmin, authWriteLimiter, demot
 
 router.get("/catalog", requireAuth, requireAdmin, listCatalogEntries);
 router.get("/catalog/options", requireAuth, requireAdmin, getMappingOptions);
+router.get("/catalog/:level/excel-template", requireAuth, requireAdmin, downloadCatalogTemplate);
+router.post("/catalog/:level/excel-upload", requireAuth, requireAdmin, upload.single("file"), bulkUploadCatalog);
 router.get("/catalog/:level/:id", requireAuth, requireAdmin, getCatalogEntry);
 router.patch("/catalog/:level/:id", requireAuth, requireAdmin, authWriteLimiter, updateCatalogEntry);
 router.post("/catalog/:level/:id/approve", requireAuth, requireAdmin, authWriteLimiter, approveCatalogEntry);
 router.post("/catalog/:level/:id/reject", requireAuth, requireAdmin, authWriteLimiter, rejectCatalogEntry);
 router.post("/catalog/options", requireAuth, requireAdmin, authWriteLimiter, createMappingOption);
 router.post("/catalog/upload", requireAuth, requireAdmin, upload.single("file"), uploadCatalogImage);
+router.delete("/catalog/:level/:id", requireAuth, requireAdmin, deleteCatalogEntry);
 router.post("/catalog/:level", requireAuth, requireAdmin, authWriteLimiter, createCatalogEntry);
 
 export default router;
