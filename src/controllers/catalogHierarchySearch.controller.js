@@ -262,9 +262,17 @@ export async function smartSearchV2(req, res) {
                 c && { level: "category", id: c.id, name: c.name },
                 sc && { level: "subcategory", id: sc.id, name: sc.name },
                 gp && { level: "generic_product", id: gp.id, name: gp.name },
-                { level: "brand_item", id: exactBrandItem.id, name: exactBrandItem.name },
+                {
+                    level: "brand_item",
+                    id: exactBrandItem.id,
+                    name: exactBrandItem.name,
+                    image: exactBrandItem.image,
+                    brand_name: exactBrandItem.brand_name,
+                },
             ].filter(Boolean),
         };
+        // console.log(exact);
+
     } else if (exactGeneric) {
         const sc = exactGeneric.subcategory;
         const c = sc?.category;
