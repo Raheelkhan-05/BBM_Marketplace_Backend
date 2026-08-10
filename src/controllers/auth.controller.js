@@ -1,6 +1,7 @@
 // src/controllers/auth.controller.js
 import { supabaseAdmin, supabase } from "../config/supabase.js";
 import { validateGSTIN, fetchGstinDetails } from "../services/gst.service.js";
+import { channelTokenFor } from "../services/channelToken.js";
 import { sendWelcomeEmail, sendBusinessVerifiedEmail } from "../services/mail.service.js";
 
 // GET /api/auth/me
@@ -21,7 +22,7 @@ export async function getMe(req, res) {
 
   const { data: businessProfile } = await supabaseAdmin
     .from("business_profiles").select("*").eq("user_id", req.user.id).maybeSingle();
-  return res.json({ success: true, profile, businessProfile: businessProfile || null, shop_slug: seller?.shop_slug ?? null, seller_status: seller?.status ?? null });
+  return res.json({ success: true, profile, businessProfile: businessProfile || null, notificationChannel: channelTokenFor(req.user.id), shop_slug: seller?.shop_slug ?? null, seller_status: seller?.status ?? null });
 }
 
 // POST /api/auth/gst-lookup  { gstin }
@@ -51,7 +52,7 @@ export async function completeProfile(req, res) {
 
   if (!name || name.trim().length < 2) return res.status(400).json({ success: false, message: "Enter your name." });
 
-  
+
   const gstCheck = validateGSTIN(gstin);
   if (!gstCheck.valid) return res.status(400).json({ success: false, message: gstCheck.reason });
   if (!displayName || displayName.trim().length < 2) {

@@ -4,6 +4,7 @@
 // seller_product_submissions as review_status='pending_review'.
 
 import { supabase } from "../config/supabase.js";
+import { notifyAdmins } from "../services/notifications.service.js";
 import { slugify } from "../services/slugify.js"
 const PICKER_LIMIT = 20;
 
@@ -123,6 +124,14 @@ export async function createSubmission(req, res) {
         if (error.code === "23505") return res.status(409).json({ success: false, message: "You're already listing this item." });
         return res.status(500).json({ success: false, message: error.message });
     }
+
+    notifyAdmins({
+        type: "seller_submission",
+        title: "New product submission",
+        message: `${trimmedBrand} — ${trimmedName} is awaiting review.`,
+        link: `/admin/catalog/submissions/${inserted.id}`,
+    });
+
 
     res.json({ success: true, submission: inserted, message: "Submitted for review. We'll notify you once it's approved." });
 }
@@ -275,5 +284,12 @@ export async function createListingForExistingBrand(req, res) {
         if (error.code === "23505") return res.status(409).json({ success: false, message: "You're already listing this item." });
         return res.status(500).json({ success: false, message: error.message });
     }
+    notifyAdmins({
+        type: "seller_submission",
+        title: "New listing submitted",
+        message: `A seller wants to list "${brand.name}".`,
+        link: `/admin/catalog/submissions/${inserted.id}`,
+    });
+
     res.json({ success: true, submission: inserted, message: `You're now listing "${brand.name}". We'll notify you once it's approved.` });
 }

@@ -1,4 +1,5 @@
 import { supabase } from "../config/supabase.js";
+import { notifyUser } from "../services/notifications.service.js";
 import { slugify } from "../services/slugify.js";
 
 const LEVEL_CONFIG = {
@@ -218,6 +219,31 @@ export async function approveCatalogEntry(req, res) {
 
     const { data, error } = await supabase.from(cfg.table).update(update).eq("id", id).select().single();
     if (error) return res.status(500).json({ success: false, message: error.message });
+
+    // brand_item approval is the point at which seller listings linked to
+    // it actually become visible to buyers — notify every seller with a
+    // submission pointing at this brand item.
+    if (level === "brand_item") {
+        const { data: submissions, error: subErr } = await supabase
+            .from("seller_product_submissions")
+            .select("seller_id")
+            .eq("generic_product_brand_id", id);
+
+        if (subErr) {
+            console.error("Failed to fetch seller submissions for notify:", subErr.message);
+        } else if (submissions?.length) {
+            const uniqueSellerIds = [...new Set(submissions.map((s) => s.seller_id))];
+            uniqueSellerIds.forEach((sellerId) => {
+                notifyUser(sellerId, {
+                    type: "brand_item_approved",
+                    title: "Your product is live!",
+                    message: `"${data.name}" has been approved and is now visible to buyers.`,
+                    link: `/seller/listings`,
+                });
+            });
+        }
+    }
+
     res.json({ success: true, entry: data });
 }
 
