@@ -45,25 +45,31 @@ export async function listApprovedGenericProducts(req, res) {
 
 function validateSubmission(body) {
     const missing = [];
-    const { productName, brandName, price, moq, unit, leadTime, image } = body;
+    const { productName, brandName, price, moq, unit, leadTime, image, images } = body;
     if (!productName?.trim()) missing.push("Product name");
     if (!brandName?.trim()) missing.push("Brand name");
     if (!(Number(price) > 0)) missing.push("Price");
     if (!(Number(moq) > 0)) missing.push("MOQ");
     if (!unit || !ALLOWED_UNITS.includes(unit)) missing.push("Unit");
     if (!leadTime?.trim()) missing.push("Lead time");
-    if (!image) missing.push("Product image");
+    if (!image && !(Array.isArray(images) && images.length)) missing.push("Product image");
     return missing;
 }
 
 // POST /api/seller/catalog/submissions
 export async function createSubmission(req, res) {
     const sellerId = req.sellerId;
-    const { genericProductId, productName, brandName, price, moq, unit, leadTime, image } = req.body || {};
+    const { genericProductId, productName, brandName, price, moq, unit, leadTime, image, images } = req.body || {};
 
     if (!genericProductId) return res.status(400).json({ success: false, message: "Please choose a product from the catalog." });
     const missing = validateSubmission(req.body || {});
     if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.`, missing });
+
+    // Normalize: images[] is the source of truth going forward, image
+    // (cover) always derives from it so every existing reader that only
+    // knows about `image` keeps working unchanged.
+    const finalImages = Array.isArray(images) && images.length ? images : (image ? [image] : []);
+    const coverImage = finalImages[0] || null;
 
     const { data: generic, error: genericErr } = await supabase
         .from("hs_generic_products")
@@ -94,7 +100,8 @@ export async function createSubmission(req, res) {
                 name: trimmedName,
                 brand_name: trimmedBrand,
                 slug: slugify(`${trimmedName}-${trimmedBrand}`),
-                image,
+                image: coverImage,
+                images: finalImages,
                 is_ai_generated: false,
                 review_status: "pending_review", // stays gated behind admin approval, same as before
             })
@@ -116,7 +123,7 @@ export async function createSubmission(req, res) {
         .insert({
             seller_id: sellerId,
             generic_product_brand_id: brand.id,
-            price: Number(price), moq: Number(moq), unit, lead_time: leadTime.trim(), image,
+            price: Number(price), moq: Number(moq), unit, lead_time: leadTime.trim(), image: coverImage,
         })
         .select("id, created_at")
         .single();

@@ -16,11 +16,25 @@ const LEVELS = {
 };
 
 const SIMPLE_HEADERS = ["Name", "Image Link"];
-const BRAND_ITEM_HEADERS = ["Product Name", "Brand Name", "Image Link"];
+// const BRAND_ITEM_HEADERS = ["Product Name", "Brand Name", "Image Link"];
+const BRAND_ITEM_HEADERS = ["Product Name", "Brand Name", "Image Links"];
+
 
 function isUrl(v) {
     return /^https?:\/\/\S+$/i.test(v || "");
 }
+
+// Splits a single "Image Links" cell into individual URLs. Admins can
+// separate multiple photos with a comma, semicolon, or newline (Excel
+// lets a cell contain line breaks) — all three are common ways people
+// naturally paste a list of links into one cell.
+function parseImageLinks(raw) {
+    return String(raw || "")
+        .split(/[,;\n]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+}
+
 function parseWorkbook(buffer) {
     const wb = XLSX.read(buffer, { type: "buffer" });
     const sheet = wb.Sheets[wb.SheetNames[0]];
@@ -41,7 +55,7 @@ export async function downloadCatalogTemplate(req, res) {
     const isBrandItem = level === "brand_item";
     const headers = isBrandItem ? BRAND_ITEM_HEADERS : SIMPLE_HEADERS;
     const exampleRow = isBrandItem
-        ? { "Product Name": "Example Product", "Brand Name": "Example Brand", "Image Link": "https://example.com/image.jpg" }
+        ? { "Product Name": "Example Product", "Brand Name": "Example Brand", "Image Links": "https://example.com/front.jpg, https://example.com/side.jpg, https://example.com/back.jpg" }
         : { Name: "Example Item", "Image Link": "https://example.com/image.jpg" };
     const filename = `${level}-upload-template.xlsx`;
 
@@ -82,7 +96,7 @@ export async function bulkUploadCatalog(req, res) {
     if (!headersMatch(rows, expectedHeaders)) {
         return res.status(400).json({
             success: false,
-            message: `File format doesn't match. Expected columns: ${expectedHeaders.join(", ")}. Please use the downloaded template.`,
+            message: `File format doesn't match. Expected columns: ${expectedHeaders.join(", ")}. Please download a fresh template — the format for Brand Items recently changed from "Image Link" to "Image Links".`,
         });
     }
 
@@ -113,13 +127,17 @@ export async function bulkUploadCatalog(req, res) {
         if (isBrandItem) {
             const productName = String(raw["Product Name"] || "").trim();
             const brandName = String(raw["Brand Name"] || "").trim();
-            const image = String(raw["Image Link"] || "").trim();
+            const imageLinks = parseImageLinks(raw["Image Links"]);
             displayName = productName || `(row ${rowNum})`;
 
             if (!productName || productName.length < 2) errors.push("Product Name must be at least 2 characters");
             if (!brandName) errors.push("Brand Name is required");
-            if (!image) errors.push("Image Link is required");
-            else if (!isUrl(image)) errors.push("Image Link must be a valid http(s) URL");
+            if (!imageLinks.length) errors.push("At least one Image Link is required");
+            else {
+                const badUrls = imageLinks.filter((u) => !isUrl(u));
+                if (badUrls.length) errors.push(`Image Links must all be valid http(s) URLs (bad: ${badUrls.slice(0, 2).join(", ")}${badUrls.length > 2 ? "…" : ""})`);
+            }
+
 
             dedupKey = `${productName.toLowerCase()}::${brandName.toLowerCase()}`;
             if (!errors.length) {
@@ -128,7 +146,8 @@ export async function bulkUploadCatalog(req, res) {
                     name: productName,
                     brand_name: brandName,
                     slug: slugify(`${productName}-${brandName}`),
-                    image,
+                    image: imageLinks[0],
+                    images: imageLinks,
                     is_ai_generated: false,
                     review_status: "approved",
                 };

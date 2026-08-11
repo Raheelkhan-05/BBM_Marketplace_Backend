@@ -13,6 +13,11 @@ function clampLimit(limit) {
     if (!Number.isFinite(n) || n <= 0) return DEFAULT_LIMIT;
     return Math.min(n, 50);
 }
+function clampOffset(offset) {
+    const n = Number(offset);
+    if (!Number.isFinite(n) || n < 0) return 0;
+    return Math.floor(n);
+}
 
 // Search terms can contain characters that are meaningful to Postgres'
 // ILIKE (%, _) or to PostgREST's .or() filter syntax (,  ( ) ") — e.g.
@@ -42,26 +47,41 @@ function orIlikePattern(term) {
     return `"${pattern.replace(/"/g, '\\"')}"`;
 }
 
-// GET /api/catalog-search/categories?q=&limit=
+// Every paginated list endpoint follows the same shape: fetch lim+1 rows
+// via .range() so we know if there's another page without a separate
+// count query, then slice back down to lim before responding.
+function paginatedResponse(res, level, rows, lim, off) {
+    const hasMore = rows.length > lim;
+    const items = hasMore ? rows.slice(0, lim) : rows;
+    res.json({ success: true, level, items, hasMore, nextOffset: off + items.length });
+}
+
+// GET /api/catalog-search/categories?q=&limit=&offset=
 export async function searchCategoriesV2(req, res) {
-    const { q = "", limit } = req.query;
+    const { q = "", limit, offset } = req.query;
+    const lim = clampLimit(limit);
+    const off = clampOffset(offset);
+
     let query = supabase
         .from("hs_categories")
         .select("id, name, slug, image")
         .eq("review_status", "approved")
         .order("name")
-        .limit(clampLimit(limit));
+        .range(off, off + lim); // fetch lim+1 to detect hasMore
     if (q.trim()) query = query.ilike("name", ilikePattern(q.trim()));
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
-    res.json({ success: true, level: "category", items: data || [] });
+
+    paginatedResponse(res, "category", data || [], lim, off);
 }
 
-// GET /api/catalog-search/subcategories?categoryId=&q=&limit=
+// GET /api/catalog-search/subcategories?categoryId=&q=&limit=&offset=
 export async function searchSubcategoriesV2(req, res) {
-    const { categoryId, q = "", limit } = req.query;
+    const { categoryId, q = "", limit, offset } = req.query;
     if (!categoryId) return res.status(400).json({ success: false, message: "categoryId is required." });
+    const lim = clampLimit(limit);
+    const off = clampOffset(offset);
 
     let query = supabase
         .from("hs_subcategories")
@@ -69,18 +89,21 @@ export async function searchSubcategoriesV2(req, res) {
         .eq("category_id", categoryId)
         .eq("review_status", "approved")
         .order("name")
-        .limit(clampLimit(limit));
+        .range(off, off + lim);
     if (q.trim()) query = query.ilike("name", ilikePattern(q.trim()));
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
-    res.json({ success: true, level: "subcategory", items: data || [] });
+
+    paginatedResponse(res, "subcategory", data || [], lim, off);
 }
 
-// GET /api/catalog-search/generic-products?subcategoryId=&q=&limit=
+// GET /api/catalog-search/generic-products?subcategoryId=&q=&limit=&offset=
 export async function searchGenericProductsV2(req, res) {
-    const { subcategoryId, q = "", limit } = req.query;
+    const { subcategoryId, q = "", limit, offset } = req.query;
     if (!subcategoryId) return res.status(400).json({ success: false, message: "subcategoryId is required." });
+    const lim = clampLimit(limit);
+    const off = clampOffset(offset);
 
     let query = supabase
         .from("hs_generic_products")
@@ -88,30 +111,35 @@ export async function searchGenericProductsV2(req, res) {
         .eq("subcategory_id", subcategoryId)
         .eq("review_status", "approved")
         .order("name")
-        .limit(clampLimit(limit));
+        .range(off, off + lim);
     if (q.trim()) query = query.ilike("name", ilikePattern(q.trim()));
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
-    res.json({ success: true, level: "generic_product", items: data || [] });
+
+    paginatedResponse(res, "generic_product", data || [], lim, off);
 }
 
-// GET /api/catalog-search/brand-items?genericProductId=&q=&limit=
+// GET /api/catalog-search/brand-items?genericProductId=&q=&limit=&offset=
 // Each item also carries sellerCount + lowestPrice, computed only from
 // APPROVED seller listings — so pricing shown to buyers is always real
 // and reviewed, even though the brand item's own approval is separate
-// from any particular seller's listing approval.
+// from any particular seller's listing approval. Only the brand-item
+// query itself is paginated; the follow-up stats query stays scoped to
+// exactly the ids on the current page.
 export async function searchBrandItemsV2(req, res) {
-    const { genericProductId, q = "", limit } = req.query;
+    const { genericProductId, q = "", limit, offset } = req.query;
     if (!genericProductId) return res.status(400).json({ success: false, message: "genericProductId is required." });
+    const lim = clampLimit(limit);
+    const off = clampOffset(offset);
 
     let query = supabase
         .from("hs_generic_product_brands")
-        .select("id, generic_product_id, name, brand_name, slug, image")
+        .select("id, generic_product_id, name, brand_name, slug, image, images")
         .eq("generic_product_id", genericProductId)
         .eq("review_status", "approved")
         .order("name")
-        .limit(clampLimit(limit));
+        .range(off, off + lim);
     if (q.trim()) {
         const p = orIlikePattern(q.trim());
         query = query.or(`name.ilike.${p},brand_name.ilike.${p}`);
@@ -120,8 +148,13 @@ export async function searchBrandItemsV2(req, res) {
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    const brandItems = data || [];
-    if (!brandItems.length) return res.json({ success: true, level: "brand_item", items: [] });
+    const rows = data || [];
+    const hasMore = rows.length > lim;
+    const brandItems = hasMore ? rows.slice(0, lim) : rows;
+
+    if (!brandItems.length) {
+        return res.json({ success: true, level: "brand_item", items: [], hasMore, nextOffset: off + brandItems.length });
+    }
 
     const ids = brandItems.map((b) => b.id);
     const { data: listings, error: listErr } = await supabase
@@ -146,13 +179,15 @@ export async function searchBrandItemsV2(req, res) {
         lowestPrice: statsByBrand[b.id]?.lowest ?? null,
     }));
 
-    res.json({ success: true, level: "brand_item", items });
+    res.json({ success: true, level: "brand_item", items, hasMore, nextOffset: off + items.length });
 }
 
-// GET /api/catalog-search/sellers?brandItemId=&q=&limit=
+// GET /api/catalog-search/sellers?brandItemId=&q=&limit=&offset=
 export async function searchSellersForBrandItemV2(req, res) {
-    const { brandItemId, q = "", limit } = req.query;
+    const { brandItemId, q = "", limit, offset } = req.query;
     if (!brandItemId) return res.status(400).json({ success: false, message: "brandItemId is required." });
+    const lim = clampLimit(limit);
+    const off = clampOffset(offset);
 
     let query = supabase
         .from("seller_product_submissions")
@@ -163,13 +198,17 @@ export async function searchSellersForBrandItemV2(req, res) {
         .eq("generic_product_brand_id", brandItemId)
         .eq("review_status", "approved")
         .order("price", { ascending: true })
-        .limit(clampLimit(limit));
+        .range(off, off + lim);
     if (q.trim()) query = query.ilike("seller.display_name", ilikePattern(q.trim()));
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    const items = (data || []).map((row) => ({
+    const rows = data || [];
+    const hasMore = rows.length > lim;
+    const sliced = hasMore ? rows.slice(0, lim) : rows;
+
+    const items = sliced.map((row) => ({
         offerId: row.id,
         price: row.price,
         unit: row.unit,
@@ -179,11 +218,13 @@ export async function searchSellersForBrandItemV2(req, res) {
         ...row.seller,
     }));
 
-    res.json({ success: true, level: "seller", items });
+    res.json({ success: true, level: "seller", items, hasMore, nextOffset: off + items.length });
 }
 
-// GET /api/catalog-search/hierarchy?level=&parentId=&q=&limit=
+// GET /api/catalog-search/hierarchy?level=&parentId=&q=&limit=&offset=
 // Single convenience endpoint, mirrors the existing searchHierarchy dispatcher.
+// No changes needed beyond the endpoints above — it just forwards
+// req.query, so `offset` passes straight through automatically.
 export async function searchHierarchyV2(req, res) {
     const { level, parentId } = req.query;
     switch (level) {
@@ -211,7 +252,8 @@ export async function searchHierarchyV2(req, res) {
 // level comes up empty, same purpose as the existing smartSearch, but
 // scoped entirely to the new approved-only hierarchy. No AI involved,
 // no rejectedExact concept (there's no AI-resolve step downstream of this
-// page to gate).
+// page to gate). Left un-paginated on purpose — this is a small typeahead
+// fallback (cap 5-10), not a browsable list.
 export async function smartSearchV2(req, res) {
     const { q = "", limit } = req.query;
     const term = q.trim();
@@ -227,7 +269,7 @@ export async function smartSearchV2(req, res) {
         supabase.from("hs_subcategories").select("id, name, slug, image, category_id, category:hs_categories(id, name, slug)").eq("review_status", "approved").ilike("name", pattern).limit(cap),
         supabase.from("hs_generic_products").select("id, name, slug, image, subcategory_id, subcategory:hs_subcategories(id, name, slug, category_id, category:hs_categories(id, name, slug))").eq("review_status", "approved").ilike("name", pattern).limit(cap),
         supabase.from("hs_generic_product_brands").select(`
-            id, name, brand_name, slug, image, generic_product_id,
+            id, name, brand_name, slug, image, images, generic_product_id,
             generic_product:hs_generic_products(id, name, slug, subcategory_id,
                 subcategory:hs_subcategories(id, name, slug, category_id,
                     category:hs_categories(id, name, slug)))
@@ -267,12 +309,11 @@ export async function smartSearchV2(req, res) {
                     id: exactBrandItem.id,
                     name: exactBrandItem.name,
                     image: exactBrandItem.image,
+                    images: exactBrandItem.images,
                     brand_name: exactBrandItem.brand_name,
                 },
             ].filter(Boolean),
         };
-        // console.log(exact);
-
     } else if (exactGeneric) {
         const sc = exactGeneric.subcategory;
         const c = sc?.category;
@@ -327,6 +368,8 @@ export async function smartSearchV2(req, res) {
 }
 
 // GET /api/catalog-search/autocomplete?q=&limit=
+// Left un-paginated on purpose — this is a small typeahead dropdown
+// (cap 8-10 total across all levels), not a browsable list.
 export async function searchAutocompleteV2(req, res) {
     const { q = "", limit } = req.query;
     const term = q.trim();

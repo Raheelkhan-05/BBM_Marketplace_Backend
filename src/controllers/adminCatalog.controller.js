@@ -32,7 +32,7 @@ const LEVEL_CONFIG = {
     // subcategory/generic_product), just with brand_name added.
     brand_item: {
         table: "hs_generic_product_brands", label: "Brand Item",
-        editableFields: ["name", "slug", "image", "brand_name"],
+        editableFields: ["name", "slug", "image", "brand_name", "images"],
         embed: "hs_generic_products(id, name, review_status, hs_subcategories(id, name, review_status, hs_categories(id, name, review_status)))",
     },
 };
@@ -108,7 +108,7 @@ export async function listCatalogEntries(req, res) {
                 if (!cfg) return [];
                 let query = supabase
                     .from(cfg.table)
-                    .select(`id, name, image, is_ai_generated, review_status, created_at, rejection_reason${cfg.embed ? `, ${cfg.embed}` : ""}${lvl === "brand_item" ? ", brand_name" : ""}`)
+                    .select(`id, name, image, is_ai_generated, review_status, created_at, rejection_reason${cfg.embed ? `, ${cfg.embed}` : ""}${lvl === "brand_item" ? ", brand_name, images" : ""}`)
                     .order("created_at", { ascending: false })
                     .limit(200);
                 if (status !== "all") query = query.eq("review_status", status);
@@ -191,6 +191,13 @@ export async function updateCatalogEntry(req, res) {
     const body = req.body || {};
     const update = {};
     for (const key of cfg.editableFields) if (body[key] !== undefined) update[key] = body[key];
+
+    // Keep the single `image` cover column in sync whenever `images`
+    // is provided, since every existing reader (tiles, hero sections,
+    // CatalogHierarchySearchPage, etc.) still only knows about `image`.
+    if (Array.isArray(update.images)) {
+        update.image = update.images[0] || null;
+    }
 
     const parentField = LEVEL_PARENT_FIELD[level];
     if (parentField && body.parentId) update[parentField] = body.parentId;
@@ -392,6 +399,10 @@ export async function createCatalogEntry(req, res) {
         if (key === "name" || key === "slug") continue;
         if (body[key] !== undefined && body[key] !== "") insert[key] = body[key];
     }
+    if (Array.isArray(insert.images) && insert.images.length) {
+        insert.image = insert.images[0];
+    }
+
     if (level === "brand" || level === "brand_item") insert.brand_name = body.brand_name.trim();
 
     insert.slug = slugify((body.slug || "").trim() || name);
