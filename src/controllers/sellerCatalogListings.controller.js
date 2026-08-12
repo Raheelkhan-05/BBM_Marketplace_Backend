@@ -51,7 +51,7 @@ function validateSubmission(body) {
     if (!(Number(price) > 0)) missing.push("Price");
     if (!(Number(moq) > 0)) missing.push("MOQ");
     if (!unit || !ALLOWED_UNITS.includes(unit)) missing.push("Unit");
-    if (!leadTime?.trim()) missing.push("Lead time");
+    if (!(Number(leadTime) >= 0)) missing.push("Lead time");
     if (!image && !(Array.isArray(images) && images.length)) missing.push("Product image");
     return missing;
 }
@@ -123,7 +123,7 @@ export async function createSubmission(req, res) {
         .insert({
             seller_id: sellerId,
             generic_product_brand_id: brand.id,
-            price: Number(price), moq: Number(moq), unit, lead_time: leadTime.trim(), image: coverImage,
+            price: Number(price), moq: Number(moq), unit, lead_time: Number(leadTime), image: coverImage,
         })
         .select("id, created_at")
         .single();
@@ -227,7 +227,7 @@ export async function updateSubmission(req, res) {
     if (!(Number(price) > 0)) missing.push("Price");
     if (!(Number(moq) > 0)) missing.push("MOQ");
     if (!unit || !ALLOWED_UNITS.includes(unit)) missing.push("Unit");
-    if (!leadTime?.toString().trim()) missing.push("Lead time");
+    if (!(Number(leadTime) >= 0)) missing.push("Lead time");
     if (stockQuantity != null && Number(stockQuantity) < 0) missing.push("Stock quantity can't be negative");
     if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.` });
 
@@ -237,7 +237,7 @@ export async function updateSubmission(req, res) {
             price: Number(price),
             moq: Number(moq),
             unit,
-            lead_time: leadTime.toString().trim(),
+            lead_time: Number(leadTime),
             image: image || null,
             stock_quantity: stockQuantity,
             // review_status intentionally NOT touched here — see comment above.
@@ -262,7 +262,7 @@ export async function createListingForExistingBrand(req, res) {
     if (!(Number(price) > 0)) missing.push("Price");
     if (!(Number(moq) > 0)) missing.push("MOQ");
     if (!unit || !ALLOWED_UNITS.includes(unit)) missing.push("Unit");
-    if (!leadTime?.trim()) missing.push("Lead time");
+    if (!(Number(leadTime) >= 0)) missing.push("Lead time");
     if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.` });
 
     const { data: brand, error: brandErr } = await supabase
@@ -282,7 +282,7 @@ export async function createListingForExistingBrand(req, res) {
             price: Number(price),
             moq: Number(moq),
             unit,
-            lead_time: leadTime.trim(),
+            lead_time: Number(leadTime),
             image: image || null,
         })
         .select("id, created_at")
