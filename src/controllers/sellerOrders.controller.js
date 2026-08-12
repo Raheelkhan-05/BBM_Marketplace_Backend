@@ -1,0 +1,54 @@
+import { supabase } from "../config/supabase.js";
+
+// GET /api/seller/orders
+export async function listSellerOrders(req, res) {
+    const { status } = req.query;
+    let query = supabase
+        .from("orders")
+        .select(`
+      id, order_number, status, subtotal_amount, platform_fee_percent, platform_fee_amount, seller_payout_amount, total_amount,
+      payment_status, buyer_contact_name, buyer_contact_phone, buyer_contact_email,
+      buyer_gstin, buyer_business_name, buyer_gst_verified,
+      shipping_address_snapshot, buyer_notes, created_at, updated_at,
+      items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, unit, quantity, line_total )
+    `)
+        .eq("seller_id", req.sellerId).order("created_at", { ascending: false });
+    if (status) query = query.eq("status", status);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    res.json({ success: true, orders: data || [] });
+}
+
+// GET /api/seller/orders/:id
+export async function getSellerOrder(req, res) {
+    const { data: order, error } = await supabase
+        .from("orders").select("*, items:order_items ( * )")
+        .eq("id", req.params.id).eq("seller_id", req.sellerId).maybeSingle();
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    if (!order) return res.status(404).json({ success: false, message: "Order not found." });
+
+    const { data: events } = await supabase.from("order_events").select("*").eq("order_id", order.id).order("created_at");
+    res.json({ success: true, order, events: events || [] });
+}
+
+function transitionHandler(newStatus) {
+    return async function (req, res) {
+        const { reason } = req.body || {};
+        const { error } = await supabase.rpc("update_order_status", {
+            p_order_id: req.params.id, p_actor_role: "seller", p_actor_user_id: req.user.id,
+            p_new_status: newStatus, p_note: reason || null,
+        });
+        if (error) {
+            const status = { FORBIDDEN: 403, ORDER_NOT_FOUND: 404, INVALID_TRANSITION: 400 }[error.message] || 500;
+            return res.status(status).json({ success: false, code: error.message, message: status === 400 ? "That status change isn't allowed right now." : "Couldn't update the order." });
+        }
+        res.json({ success: true, message: `Order marked as ${newStatus.replace("_", " ")}.` });
+    };
+}
+
+export const confirmOrder = transitionHandler("confirmed");
+export const rejectOrder = transitionHandler("rejected");
+export const processOrder = transitionHandler("processing");
+export const shipOrder = transitionHandler("shipped");
+export const deliverOrder = transitionHandler("delivered");

@@ -13,6 +13,9 @@ import whatsappRoutes from "./routes/whatsapp.routes.js";
 import sellerCatalogListingsRouter from "./routes/sellerCatalogListings.routes.js";
 import adminSellerSubmissionsRouter from "./routes/adminSellerSubmissions.routes.js";
 import catalogSearchRoutes from "./routes/catalogSearch.routes.js";
+import ordersRoutes from "./routes/orders.routes.js";
+import sellerOrdersRoutes from "./routes/sellerOrders.routes.js";
+import buyerAddressRoutes from "./routes/buyerAddresses.routes.js";
 
 
 export function createApp() {
@@ -61,6 +64,9 @@ export function createApp() {
   app.use("/api/catalogs", catalogImportRoutes);
   app.use("/api/whatsapp", whatsappRoutes);
   app.use("/api/admin/seller-submissions", adminSellerSubmissionsRouter);
+  app.use("/api/orders", ordersRoutes);
+  app.use("/api/seller/orders", sellerOrdersRoutes);
+  app.use("/api/buyer/addresses", buyerAddressRoutes);
 
   app.use((err, req, res, next) => {
     console.error(err);
