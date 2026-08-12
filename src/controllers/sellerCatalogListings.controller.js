@@ -150,21 +150,24 @@ export async function listMySubmissions(req, res) {
     let query = supabase
         .from("seller_product_submissions")
         .select(`
-      id, price, moq, unit, lead_time, image, review_status, rejection_reason, created_at, updated_at,
-      brand:hs_generic_product_brands (
-        id, name, brand_name, image,
-        generic_product:hs_generic_products (
-          id, name,
-          subcategory:hs_subcategories (
-            id, name,
-            category:hs_categories ( id, name )
-          )
-        )
-      )
-    `)
+            id, price, moq, unit, lead_time, image, review_status, rejection_reason, created_at, updated_at,
+            brand:hs_generic_product_brands (
+                id, name, brand_name, image, images,
+                generic_product:hs_generic_products (
+                id, name,
+                subcategory:hs_subcategories (
+                    id, name,
+                    category:hs_categories ( id, name )
+                )
+                )
+            )
+            `)
         .eq("seller_id", sellerId)
         .order("created_at", { ascending: false });
     if (status) query = query.eq("review_status", status);
+
+    // console.log('listing.controller.js: listMySubmissions query:', query);
+
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
     res.json({ success: true, items: data || [] });
