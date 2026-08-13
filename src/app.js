@@ -54,6 +54,7 @@ export function createApp() {
 
   app.use("/api/auth", authRoutes);
   app.use("/api/seller/catalog", sellerCatalogListingsRouter);
+  app.use("/api/seller/orders", sellerOrdersRoutes);
   app.use("/api/seller", sellerRoutes);
   app.use("/api/admin", adminRoutes);
   app.use("/api/notifications", notificationRoutes);
@@ -65,7 +66,6 @@ export function createApp() {
   app.use("/api/whatsapp", whatsappRoutes);
   app.use("/api/admin/seller-submissions", adminSellerSubmissionsRouter);
   app.use("/api/orders", ordersRoutes);
-  app.use("/api/seller/orders", sellerOrdersRoutes);
   app.use("/api/buyer/addresses", buyerAddressRoutes);
 
   app.use((err, req, res, next) => {

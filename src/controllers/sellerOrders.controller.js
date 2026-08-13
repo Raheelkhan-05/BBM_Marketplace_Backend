@@ -1,4 +1,5 @@
 import { supabase } from "../config/supabase.js";
+import { notifyOrderChanged, notifyUser, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
 
 // GET /api/seller/orders
 export async function listSellerOrders(req, res) {
@@ -42,6 +43,16 @@ function transitionHandler(newStatus) {
         if (error) {
             const status = { FORBIDDEN: 403, ORDER_NOT_FOUND: 404, INVALID_TRANSITION: 400 }[error.message] || 500;
             return res.status(status).json({ success: false, code: error.message, message: status === 400 ? "That status change isn't allowed right now." : "Couldn't update the order." });
+        }
+
+        await notifyOrderChanged(req.params.id, { status: newStatus });
+        const { data: order } = await supabase.from("orders").select("buyer_id, order_number").eq("id", req.params.id).maybeSingle();
+        if (order) {
+            await notifyUser(order.buyer_id, {
+                type: "order_status", title: `Order ${order.order_number} ${newStatus.replace("_", " ")}`,
+                body: reason || undefined, link: `/orders/${req.params.id}`,
+            });
+            await notifyUserOrdersChanged(order.buyer_id);
         }
         res.json({ success: true, message: `Order marked as ${newStatus.replace("_", " ")}.` });
     };

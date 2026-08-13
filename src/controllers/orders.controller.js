@@ -1,4 +1,5 @@
 import { supabase } from "../config/supabase.js";
+import { notifyOrderChanged, notifyUser, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
 
 const ERROR_MAP = {
     LISTING_NOT_FOUND: { status: 404, message: "That listing is no longer available." },
@@ -94,9 +95,8 @@ export async function placeOrder(req, res) {
                 const { data: sellerProfile } = await supabase
                     .from("seller_profiles").select("user_id").eq("id", submission.seller_id).maybeSingle();
                 if (sellerProfile) {
-                    await supabase.from("notifications").insert({
-                        user_id: sellerProfile.user_id, type: "stock_demand",
-                        title: "A buyer wanted more than your available stock",
+                    await notifyUser(sellerProfile.user_id, {
+                        type: "stock_demand", title: "A buyer wanted more than your available stock",
                         body: `Requested ${qty} ${submission.unit}, but only ${submission.stock_quantity ?? 0} ${submission.unit} is listed.`,
                         link: "/seller/products",
                     });
@@ -108,6 +108,20 @@ export async function placeOrder(req, res) {
     }
 
     const row = Array.isArray(data) ? data[0] : data;
+
+    // tell the seller: this was missing entirely before — nothing notified the
+    // seller of a new order on the success path.
+    const { data: submission } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
+    if (submission) {
+        const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", submission.seller_id).maybeSingle();
+        if (sellerProfile) {
+            await notifyUser(sellerProfile.user_id, {
+                type: "new_order", title: "New order received",
+                body: `Order ${row.order_number} was just placed.`, link: `/seller/orders/${row.order_id}`,
+            });
+            await notifyUserOrdersChanged(sellerProfile.user_id);
+        }
+    }
     res.json({ success: true, orderId: row.order_id, orderNumber: row.order_number, message: "Order placed. The seller has been notified." });
 }
 
@@ -148,6 +162,15 @@ export async function cancelMyOrder(req, res) {
         p_order_id: req.params.id, p_actor_role: "buyer", p_actor_user_id: req.user.id,
         p_new_status: "cancelled", p_note: reason || "Cancelled by buyer",
     });
+    await notifyOrderChanged(req.params.id, { status: "cancelled" });
+    const { data: order } = await supabase.from("orders").select("seller_id, order_number").eq("id", req.params.id).maybeSingle();
+    if (order) {
+        const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", order.seller_id).maybeSingle();
+        if (sellerProfile) {
+            await notifyUser(sellerProfile.user_id, { type: "order_cancelled", title: `Order ${order.order_number} cancelled`, body: reason || "Cancelled by buyer", link: `/seller/orders/${req.params.id}` });
+            await notifyUserOrdersChanged(sellerProfile.user_id);
+        }
+    }
     if (error) {
         const status = { FORBIDDEN: 403, ORDER_NOT_FOUND: 404, INVALID_TRANSITION: 400 }[error.message] || 500;
         return res.status(status).json({ success: false, code: error.message, message: status === 400 ? "This order can no longer be cancelled." : "Couldn't cancel the order." });
