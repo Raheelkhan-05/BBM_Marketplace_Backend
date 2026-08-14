@@ -9,6 +9,8 @@ import {
     smartSearchV2,
     searchAutocompleteV2,
 } from "../controllers/catalogHierarchySearch.controller.js";
+import { browseCatalog } from "../controllers/catalogBrowse.controller.js";
+
 
 // New, admin-approved-only search hierarchy. Fully additive — the
 // original /api/search routes (hierarchysearch.controller.js) are
@@ -21,6 +23,7 @@ router.get("/generic-products", searchGenericProductsV2);
 router.get("/brand-items", searchBrandItemsV2);
 router.get("/sellers", searchSellersForBrandItemV2);
 router.get("/hierarchy", searchHierarchyV2);
+router.get("/browse", browseCatalog);
 router.get("/smart", smartSearchV2);
 router.get("/autocomplete", searchAutocompleteV2);
 
