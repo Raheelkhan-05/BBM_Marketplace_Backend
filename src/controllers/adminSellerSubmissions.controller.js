@@ -1,5 +1,5 @@
 import { supabase } from "../config/supabase.js";
-import { notifyUser } from "../services/notifications.service.js";
+import { notifyUser, notifySellerSubmissionsChanged, notifyAdminSubmissionsChanged } from "../services/notifications.service.js";
 
 // Shared select fragment — pulls product_name/brand_name/image from the
 // brand item (hs_generic_product_brands) via generic_product_brand_id,
@@ -90,7 +90,7 @@ export async function updateSellerSubmission(req, res) {
 
     const { data: existing, error: fetchErr } = await supabase
         .from("seller_product_submissions")
-        .select("id, generic_product_brand_id")
+        .select("id, generic_product_brand_id, seller:seller_profiles(user_id)")
         .eq("id", id)
         .maybeSingle();
     if (fetchErr) return res.status(500).json({ success: false, message: fetchErr.message });
@@ -133,6 +133,9 @@ export async function updateSellerSubmission(req, res) {
         .eq("id", id)
         .single();
     if (error) return res.status(500).json({ success: false, message: error.message });
+
+    await notifyAdminSubmissionsChanged();
+    if (existing.seller?.user_id) await notifySellerSubmissionsChanged(existing.seller.user_id);
     res.json({ success: true, submission: normalizeSubmission(data) });
 }
 
@@ -169,14 +172,17 @@ export async function approveSellerSubmission(req, res) {
     }
 
     const displayName = existing.product_name || existing.brand?.name || "Your product";
+
     if (existing.seller?.user_id) {
         await notifyUser(existing.seller.user_id, {
             type: "listing_approved",
             title: "Your product listing was approved",
             message: `"${displayName}" is now live on your shop.`,
-            link: "/seller/dashboard",
+            link: `/home?highlight=${id}`,
         });
+        await notifySellerSubmissionsChanged(existing.seller.user_id);
     }
+    await notifyAdminSubmissionsChanged(); // so other open admin tabs drop this from "Pending" live
     res.json({ success: true, submission: normalizeSubmission(data) });
 }
 
@@ -203,13 +209,16 @@ export async function rejectSellerSubmission(req, res) {
     if (error) return res.status(500).json({ success: false, message: error.message });
 
     const displayName = existing.product_name || existing.brand?.name || "Your product";
+
     if (existing.seller?.user_id) {
         await notifyUser(existing.seller.user_id, {
             type: "listing_rejected",
             title: "Your product listing needs changes",
             message: `"${displayName}" wasn't approved: ${reason.trim()}`,
-            link: "/seller/dashboard",
+            link: "/seller/status", // was "/seller/dashboard"
         });
+        await notifySellerSubmissionsChanged(existing.seller.user_id);
     }
+    await notifyAdminSubmissionsChanged();
     res.json({ success: true, submission: normalizeSubmission(data) });
 }

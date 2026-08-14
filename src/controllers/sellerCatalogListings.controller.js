@@ -4,7 +4,7 @@
 // seller_product_submissions as review_status='pending_review'.
 
 import { supabase } from "../config/supabase.js";
-import { notifyAdmins } from "../services/notifications.service.js";
+import { notifyAdmins, notifyAdminSubmissionsChanged } from "../services/notifications.service.js";
 import { slugify } from "../services/slugify.js"
 const PICKER_LIMIT = 20;
 
@@ -118,26 +118,50 @@ export async function createSubmission(req, res) {
         }
     }
 
-    const { data: inserted, error } = await supabase
+    const { data: existingRow, error: existingErr } = await supabase
         .from("seller_product_submissions")
-        .insert({
-            seller_id: sellerId,
-            generic_product_brand_id: brand.id,
-            price: Number(price), moq: Number(moq), unit, lead_time: Number(leadTime), image: coverImage,
-        })
-        .select("id, created_at")
-        .single();
+        .select("id, review_status")
+        .eq("seller_id", sellerId)
+        .eq("generic_product_brand_id", brand.id)
+        .maybeSingle();
+    if (existingErr) return res.status(500).json({ success: false, message: existingErr.message });
+    if (existingRow && existingRow.review_status !== "rejected") {
+        return res.status(409).json({ success: false, message: "You're already listing this item." });
+    }
+
+    let inserted, error;
+    if (existingRow) {
+        ({ data: inserted, error } = await supabase
+            .from("seller_product_submissions")
+            .update({
+                price: Number(price), moq: Number(moq), unit, lead_time: Number(leadTime), image: coverImage,
+                review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null,
+            })
+            .eq("id", existingRow.id)
+            .select("id, created_at")
+            .single());
+    } else {
+        ({ data: inserted, error } = await supabase
+            .from("seller_product_submissions")
+            .insert({
+                seller_id: sellerId, generic_product_brand_id: brand.id,
+                price: Number(price), moq: Number(moq), unit, lead_time: Number(leadTime), image: coverImage,
+            })
+            .select("id, created_at")
+            .single());
+    }
     if (error) {
         if (error.code === "23505") return res.status(409).json({ success: false, message: "You're already listing this item." });
         return res.status(500).json({ success: false, message: error.message });
     }
 
-    notifyAdmins({
+    await notifyAdmins({
         type: "seller_submission",
-        title: "New product submission",
-        message: `${trimmedBrand} — ${trimmedName} is awaiting review.`,
-        link: `/admin/catalog/submissions/${inserted.id}`,
+        title: existingRow ? "Listing resubmitted for review" : "New product submission",
+        message: `${trimmedBrand} — ${trimmedName} ${existingRow ? "was resubmitted after rejection" : "is awaiting review"}.`,
+        link: `/admin/listings?highlight=${inserted.id}`,
     });
+    await notifyAdminSubmissionsChanged();
 
 
     res.json({ success: true, submission: inserted, message: "Submitted for review. We'll notify you once it's approved." });
@@ -184,11 +208,19 @@ export async function deleteSubmission(req, res) {
         .eq("id", id)
         .maybeSingle();
     if (findErr) return res.status(500).json({ success: false, message: findErr.message });
+    console.log('listing.controller.js: deleteSubmission findErr:', findErr);
+    console.log('listing.controller.js: deleteSubmission existing:', existing);
+    console.log('listing.controller.js: deleteSubmission sellerId:', sellerId);
+
     if (!existing || existing.seller_id !== sellerId) {
         return res.status(404).json({ success: false, message: "Listing not found." });
     }
 
+    console.log('listing.controller.js: deleteSubmission existing:', existing);
+    console.log('listing.controller.js: deleteSubmission sellerId:', sellerId);
+
     const { error } = await supabase.from("seller_product_submissions").delete().eq("id", id);
+    console.log('listing.controller.js: deleteSubmission error:', error);
     if (error) return res.status(500).json({ success: false, message: error.message });
 
     res.json({ success: true, message: "Listing removed." });
@@ -207,7 +239,7 @@ export async function updateSubmission(req, res) {
 
     const { data: existing, error: findErr } = await supabase
         .from("seller_product_submissions")
-        .select("id, seller_id, price, moq, unit, lead_time, image, stock_quantity")
+        .select("id, seller_id, price, moq, unit, lead_time, image, stock_quantity, review_status, brand:hs_generic_product_brands(name)")
         .eq("id", id)
         .maybeSingle();
     if (findErr) return res.status(500).json({ success: false, message: findErr.message });
@@ -234,23 +266,40 @@ export async function updateSubmission(req, res) {
     if (stockQuantity != null && Number(stockQuantity) < 0) missing.push("Stock quantity can't be negative");
     if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.` });
 
+    // Editing a REJECTED listing is a resubmission — it needs to go back
+    // for review, otherwise it'd stay rejected forever with no path back.
+    // Approved/pending listings keep their status on a routine edit.
+    const wasRejected = existing.review_status === "rejected";
+    const patch = {
+        price: Number(price), moq: Number(moq), unit, lead_time: Number(leadTime),
+        image: image || null, stock_quantity: stockQuantity,
+    };
+    if (wasRejected) {
+        patch.review_status = "pending_review";
+        patch.rejection_reason = null;
+        patch.reviewed_at = null;
+        patch.reviewed_by = null;
+    }
+
     const { data: updated, error } = await supabase
         .from("seller_product_submissions")
-        .update({
-            price: Number(price),
-            moq: Number(moq),
-            unit,
-            lead_time: Number(leadTime),
-            image: image || null,
-            stock_quantity: stockQuantity,
-            // review_status intentionally NOT touched here — see comment above.
-        })
+        .update(patch)
         .eq("id", id)
-        .select("id, price, moq, unit, lead_time, image, stock_quantity, review_status, updated_at")
+        .select("id, price, moq, unit, lead_time, image, stock_quantity, review_status, rejection_reason, updated_at")
         .single();
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    res.json({ success: true, submission: updated, message: "Listing updated." });
+    if (wasRejected) {
+        await notifyAdmins({
+            type: "seller_submission",
+            title: "Listing resubmitted for review",
+            message: `"${existing.brand?.name || "A listing"}" was edited and resubmitted after rejection.`,
+            link: `/admin/listings?highlight=${id}`,
+        });
+        await notifyAdminSubmissionsChanged();
+    }
+
+    res.json({ success: true, submission: updated, message: wasRejected ? "Resubmitted for review." : "Listing updated." });
 }
 
 // POST /api/seller/catalog/listings   { genericProductBrandId, price, moq, unit, leadTime, image? }
@@ -270,36 +319,61 @@ export async function createListingForExistingBrand(req, res) {
 
     const { data: brand, error: brandErr } = await supabase
         .from("hs_generic_product_brands")
-        .select("id, name, review_status, generic_product_id")
+        .select("id, name, review_status")
         .eq("id", genericProductBrandId)
         .maybeSingle();
     if (brandErr) return res.status(500).json({ success: false, message: brandErr.message });
     if (!brand) return res.status(400).json({ success: false, message: "That item wasn't found." });
     if (brand.review_status !== "approved") return res.status(400).json({ success: false, message: "This item isn't available to list under yet." });
 
-    const { data: inserted, error } = await supabase
+    // A seller has at most one row per brand item (unique constraint) —
+    // but a REJECTED row was never live for buyers, so it shouldn't
+    // permanently block a retry. Resubmit that row instead of inserting.
+    const { data: existingRow, error: existingErr } = await supabase
         .from("seller_product_submissions")
-        .insert({
-            seller_id: sellerId,
-            generic_product_brand_id: brand.id,
-            price: Number(price),
-            moq: Number(moq),
-            unit,
-            lead_time: Number(leadTime),
-            image: image || null,
-        })
-        .select("id, created_at")
-        .single();
+        .select("id, review_status")
+        .eq("seller_id", sellerId)
+        .eq("generic_product_brand_id", brand.id)
+        .maybeSingle();
+    if (existingErr) return res.status(500).json({ success: false, message: existingErr.message });
+
+    if (existingRow && existingRow.review_status !== "rejected") {
+        return res.status(409).json({ success: false, message: "You're already listing this item." });
+    }
+
+    let result, error;
+    if (existingRow) {
+        ({ data: result, error } = await supabase
+            .from("seller_product_submissions")
+            .update({
+                price: Number(price), moq: Number(moq), unit, lead_time: Number(leadTime), image: image || null,
+                review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null,
+            })
+            .eq("id", existingRow.id)
+            .select("id, created_at")
+            .single());
+    } else {
+        ({ data: result, error } = await supabase
+            .from("seller_product_submissions")
+            .insert({
+                seller_id: sellerId, generic_product_brand_id: brand.id,
+                price: Number(price), moq: Number(moq), unit, lead_time: Number(leadTime), image: image || null,
+            })
+            .select("id, created_at")
+            .single());
+    }
     if (error) {
         if (error.code === "23505") return res.status(409).json({ success: false, message: "You're already listing this item." });
         return res.status(500).json({ success: false, message: error.message });
     }
-    notifyAdmins({
-        type: "seller_submission",
-        title: "New listing submitted",
-        message: `A seller wants to list "${brand.name}".`,
-        link: `/admin/catalog/submissions/${inserted.id}`,
-    });
 
-    res.json({ success: true, submission: inserted, message: `You're now listing "${brand.name}". We'll notify you once it's approved.` });
+    await notifyAdmins({
+        type: "seller_submission",
+        title: existingRow ? "Listing resubmitted for review" : "New listing submitted",
+        message: existingRow ? `A seller resubmitted "${brand.name}" after rejection.` : `A seller wants to list "${brand.name}".`,
+        link: `/admin/listings?highlight=${result.id}`,
+    });
+    await notifyAdminSubmissionsChanged();
+
+    res.json({ success: true, submission: result, message: `You're now listing "${brand.name}"${existingRow ? " again" : ""}. We'll notify you once it's approved.` });
 }
