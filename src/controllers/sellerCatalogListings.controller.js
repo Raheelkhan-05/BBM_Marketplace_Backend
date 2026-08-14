@@ -190,8 +190,6 @@ export async function listMySubmissions(req, res) {
         .order("created_at", { ascending: false });
     if (status) query = query.eq("review_status", status);
 
-    // console.log('listing.controller.js: listMySubmissions query:', query);
-
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
     res.json({ success: true, items: data || [] });
@@ -208,19 +206,12 @@ export async function deleteSubmission(req, res) {
         .eq("id", id)
         .maybeSingle();
     if (findErr) return res.status(500).json({ success: false, message: findErr.message });
-    console.log('listing.controller.js: deleteSubmission findErr:', findErr);
-    console.log('listing.controller.js: deleteSubmission existing:', existing);
-    console.log('listing.controller.js: deleteSubmission sellerId:', sellerId);
 
     if (!existing || existing.seller_id !== sellerId) {
         return res.status(404).json({ success: false, message: "Listing not found." });
     }
 
-    console.log('listing.controller.js: deleteSubmission existing:', existing);
-    console.log('listing.controller.js: deleteSubmission sellerId:', sellerId);
-
     const { error } = await supabase.from("seller_product_submissions").delete().eq("id", id);
-    console.log('listing.controller.js: deleteSubmission error:', error);
     if (error) return res.status(500).json({ success: false, message: error.message });
 
     res.json({ success: true, message: "Listing removed." });
