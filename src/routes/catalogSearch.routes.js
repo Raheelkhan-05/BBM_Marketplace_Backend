@@ -24,7 +24,7 @@ router.get("/generic-products", searchGenericProductsV2);
 router.get("/brand-items", searchBrandItemsV2);
 router.get("/sellers", optionalAuthListing, searchSellersForBrandItemV2);
 router.get("/hierarchy", searchHierarchyV2);
-router.get("/browse", browseCatalog);
+router.get("/browse", optionalAuthListing, browseCatalog);
 router.get("/smart", smartSearchV2);
 router.get("/autocomplete", searchAutocompleteV2);
 

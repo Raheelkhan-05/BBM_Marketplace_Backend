@@ -46,6 +46,7 @@ export async function browseCatalog(req, res) {
         p_sort: sort,
         p_limit: lim,
         p_offset: off,
+        p_seller_id: req.sellerId || null, // added
     });
 
     if (error) return res.status(500).json({ success: false, message: error.message });
