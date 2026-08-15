@@ -10,6 +10,7 @@ import {
     createListingForExistingBrand,
     updateSubmission,
     deleteSubmission,
+    setSubmissionActive,
 } from "../controllers/sellerCatalogListings.controller.js";
 
 const router = Router();
@@ -24,5 +25,6 @@ router.get("/submissions", requireAuth, requireApprovedSeller, listMySubmissions
 router.post("/listings", requireAuth, requireApprovedSeller, createListingForExistingBrand);
 router.patch("/submissions/:id", requireAuth, requireApprovedSeller, updateSubmission);
 router.delete("/submissions/:id", requireAuth, requireApprovedSeller, deleteSubmission);
+router.patch("/submissions/:id/active", requireAuth, requireApprovedSeller, setSubmissionActive);
 
 export default router;

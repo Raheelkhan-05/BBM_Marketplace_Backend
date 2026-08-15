@@ -174,7 +174,7 @@ export async function listMySubmissions(req, res) {
     let query = supabase
         .from("seller_product_submissions")
         .select(`
-            id, price, moq, unit, lead_time, image, review_status, rejection_reason, created_at, updated_at,
+            id, price, moq, unit, lead_time, image, is_active, review_status, rejection_reason, created_at, updated_at,
             brand:hs_generic_product_brands (
                 id, name, brand_name, image, images,
                 generic_product:hs_generic_products (
@@ -193,6 +193,49 @@ export async function listMySubmissions(req, res) {
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
     res.json({ success: true, items: data || [] });
+}
+
+// PATCH /api/seller/catalog/submissions/:id/active   { isActive: boolean }
+// Soft toggle instead of delete — orders already placed against this
+// listing keep their reference intact. Doesn't touch review_status,
+// price, or any other field; a deactivated-then-reactivated listing
+// comes back exactly as it was.
+export async function setSubmissionActive(req, res) {
+    const sellerId = req.sellerId;
+    const { id } = req.params;
+    const { isActive } = req.body || {};
+
+    if (typeof isActive !== "boolean") {
+        return res.status(400).json({ success: false, message: "isActive must be true or false." });
+    }
+
+    const { data: existing, error: findErr } = await supabase
+        .from("seller_product_submissions")
+        .select("id, seller_id, is_active, brand:hs_generic_product_brands(name)")
+        .eq("id", id)
+        .maybeSingle();
+    if (findErr) return res.status(500).json({ success: false, message: findErr.message });
+    if (!existing || existing.seller_id !== sellerId) {
+        return res.status(404).json({ success: false, message: "Listing not found." });
+    }
+
+    if (existing.is_active === isActive) {
+        return res.json({ success: true, submission: existing, message: isActive ? "Already active." : "Already deactivated." });
+    }
+
+    const { data: updated, error } = await supabase
+        .from("seller_product_submissions")
+        .update({ is_active: isActive })
+        .eq("id", id)
+        .select("id, price, moq, unit, lead_time, image, stock_quantity, review_status, rejection_reason, is_active, updated_at")
+        .single();
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    res.json({
+        success: true,
+        submission: updated,
+        message: isActive ? "Listing is live again." : "Listing hidden from buyers. You can reactivate it anytime.",
+    });
 }
 
 // DELETE /api/seller/catalog/submissions/:id

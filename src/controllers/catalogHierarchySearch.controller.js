@@ -161,7 +161,8 @@ export async function searchBrandItemsV2(req, res) {
         .from("seller_product_submissions")
         .select("generic_product_brand_id, price")
         .in("generic_product_brand_id", ids)
-        .eq("review_status", "approved");
+        .eq("review_status", "approved")
+        .eq("is_active", true);
     if (listErr) return res.status(500).json({ success: false, message: listErr.message });
 
     const statsByBrand = {};
@@ -197,9 +198,11 @@ export async function searchSellersForBrandItemV2(req, res) {
         `)
         .eq("generic_product_brand_id", brandItemId)
         .eq("review_status", "approved")
+        .eq("is_active", true)
         .order("price", { ascending: true })
         .range(off, off + lim);
     if (q.trim()) query = query.ilike("seller.display_name", ilikePattern(q.trim()));
+    if (req.sellerId) query = query.neq("seller_id", req.sellerId);
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });

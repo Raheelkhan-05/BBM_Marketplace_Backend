@@ -10,6 +10,7 @@ import {
     searchAutocompleteV2,
 } from "../controllers/catalogHierarchySearch.controller.js";
 import { browseCatalog } from "../controllers/catalogBrowse.controller.js";
+import { optionalAuthListing } from "../middleware/optionalAuthListing.middleware.js";
 
 
 // New, admin-approved-only search hierarchy. Fully additive — the
@@ -21,7 +22,7 @@ router.get("/categories", searchCategoriesV2);
 router.get("/subcategories", searchSubcategoriesV2);
 router.get("/generic-products", searchGenericProductsV2);
 router.get("/brand-items", searchBrandItemsV2);
-router.get("/sellers", searchSellersForBrandItemV2);
+router.get("/sellers", optionalAuthListing, searchSellersForBrandItemV2);
 router.get("/hierarchy", searchHierarchyV2);
 router.get("/browse", browseCatalog);
 router.get("/smart", smartSearchV2);
