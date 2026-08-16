@@ -12,6 +12,7 @@ import {
   listCatalogEntries, getCatalogEntry, updateCatalogEntry,
   approveCatalogEntry, rejectCatalogEntry, getMappingOptions,
   createMappingOption, createCatalogEntry, deleteCatalogEntry,
+  adminListCatalog, adminCreateCatalogEntry,
 } from "../controllers/adminCatalog.controller.js";
 import multer from "multer";
 import { downloadCatalogTemplate, bulkUploadCatalog } from "../controllers/adminCatalogBulk.controller.js";
@@ -33,7 +34,9 @@ router.get("/admins", requireAuth, requireAdmin, listAdmins);
 router.post("/admins/promote", requireAuth, requireAdmin, authWriteLimiter, promoteToAdmin);
 router.post("/admins/demote", requireAuth, requireAdmin, authWriteLimiter, demoteAdmin);
 
-router.get("/catalog", requireAuth, requireAdmin, listCatalogEntries);
+router.get("/catalog", requireAuth, requireAdmin, adminListCatalog);
+router.post("/catalog", requireAuth, requireAdmin, adminCreateCatalogEntry);
+// router.get("/catalog", requireAuth, requireAdmin, listCatalogEntries);
 router.get("/catalog/options", requireAuth, requireAdmin, getMappingOptions);
 router.get("/catalog/:level/excel-template", requireAuth, requireAdmin, downloadCatalogTemplate);
 router.post("/catalog/:level/excel-upload", requireAuth, requireAdmin, upload.single("file"), bulkUploadCatalog);

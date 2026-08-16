@@ -39,6 +39,16 @@ const LEVEL_CONFIG = {
     },
 };
 
+const LEVEL_TABLE = {
+    category: "hs_categories",
+    subcategory: "hs_subcategories",
+    generic_product: "hs_generic_products",
+};
+const PARENT_COL = {
+    subcategory: "category_id",
+    generic_product: "subcategory_id",
+};
+
 const PICKER_CONFIG = {
     category: { table: "hs_categories", parentField: null },
     subcategory: { table: "hs_subcategories", parentField: "category_id" },
@@ -453,4 +463,59 @@ export async function createCatalogEntry(req, res) {
         return res.status(500).json({ success: false, message: error.message });
     }
     res.json({ success: true, level, entry: data });
+}
+
+// GET /api/admin/catalog?level=&parentId=&q=
+export async function adminListCatalog(req, res) {
+    const { level, parentId, q = "" } = req.query;
+    const table = LEVEL_TABLE[level];
+    if (!table) return res.status(400).json({ success: false, message: "Invalid level." });
+
+    let query = supabase.from(table).select("id, name, review_status").order("name").limit(30);
+    // Show both approved AND pending here — admin should see a seller's
+    // already-proposed node so they reuse it, not just approved ones.
+    query = query.in("review_status", ["approved", "pending_review"]);
+    if (level !== "category") {
+        const col = PARENT_COL[level];
+        if (!parentId) return res.status(400).json({ success: false, message: "parentId is required." });
+        query = query.eq(col, parentId);
+    }
+    if (q.trim()) query = query.ilike("name", `%${q.trim()}%`);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    res.json({ success: true, entries: data || [] });
+}
+
+// POST /api/admin/catalog  { level, name, parentId }
+export async function adminCreateCatalogEntry(req, res) {
+    const { level, name, parentId } = req.body || {};
+    const table = LEVEL_TABLE[level];
+    if (!table) return res.status(400).json({ success: false, message: "Invalid level." });
+    if (!name?.trim()) return res.status(400).json({ success: false, message: "Name is required." });
+    if (level !== "category" && !parentId) return res.status(400).json({ success: false, message: "Parent is required." });
+    const trimmed = name.trim();
+
+    // Same dedupe pattern as the seller-side create endpoints — check
+    // for an existing match (approved or pending) under the same parent
+    // before inserting, so admin can't create a near-duplicate either.
+    let dupQuery = supabase.from(table).select("id, name, review_status").ilike("name", trimmed);
+    if (level !== "category") dupQuery = dupQuery.eq(PARENT_COL[level], parentId);
+    const { data: dup } = await dupQuery.maybeSingle();
+    if (dup) {
+        return res.json({
+            success: true, duplicate: true, entry: dup,
+            message: `"${dup.name}" already exists — selected it for you.`,
+        });
+    }
+
+    const insertRow = { name: trimmed, slug: slugify(trimmed), review_status: "approved", is_ai_generated: false, reviewed_by: req.user.id, reviewed_at: new Date().toISOString() };
+    if (level !== "category") insertRow[PARENT_COL[level]] = parentId;
+
+    const { data, error } = await supabase.from(table).insert(insertRow).select("id, name, review_status").single();
+    if (error) {
+        if (error.code === "23505") return res.status(409).json({ success: false, message: "That entry already exists." });
+        return res.status(500).json({ success: false, message: error.message });
+    }
+    res.json({ success: true, duplicate: false, entry: data, message: `"${data.name}" created and live immediately.` });
 }
