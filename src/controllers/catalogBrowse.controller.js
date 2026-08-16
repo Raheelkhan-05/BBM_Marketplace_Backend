@@ -53,3 +53,24 @@ export async function browseCatalog(req, res) {
 
     res.json({ success: true, ...data });
 }
+
+// GET /api/catalog-search/browse-products
+// Category -> Generic Product tiles (aggregated across all brands under
+// each product) — the new first drill-down level after picking a category.
+export async function browseGenericProducts(req, res) {
+    const { categoryId = null, subcategoryIds, q = "", sort = "relevance", limit = 24, offset = 0 } = req.query;
+    const lim = Math.min(Math.max(Number(limit) || 24, 1), 60);
+    const off = Math.max(Number(offset) || 0, 0);
+
+    const { data, error } = await supabase.rpc("catalog_browse_generic_products", {
+        p_category_id: categoryId || null,
+        p_subcategory_ids: splitParam(subcategoryIds),
+        p_q: q,
+        p_sort: sort,
+        p_limit: lim,
+        p_offset: off,
+        p_seller_id: req.sellerId || null,
+    });
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    res.json({ success: true, ...data });
+}
