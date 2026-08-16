@@ -2,12 +2,13 @@ import * as XLSX from "xlsx";
 import { supabase } from "../config/supabase.js";
 import { slugify } from "../services/slugify.js";
 
-// Every level here — including brand_item now — uses the exact same
-// simple template: Name(+Brand) + Image Link. Commercial terms (price/
-// moq/unit/lead time) are NOT part of the catalog identity anymore, so
-// they don't belong in this bulk-upload path at all — that data only
-// ever gets entered by a seller against an existing brand item via the
-// seller listing flow.
+// Every simple level uses the same lightweight template. brand_item's
+// template now carries the full catalog-identity shape: Name + Brand +
+// Manufacturer + Model/Part No/SKU + Grade/Variant (optional) + Image
+// Links. Commercial terms (price/moq/unit/lead time/packaging/delivery/
+// tax/etc.) are NOT part of this — they don't belong in the catalog
+// identity anymore, and only ever get entered by a seller against an
+// existing approved brand item via the seller listing flow.
 const LEVELS = {
     category: { table: "hs_categories", parentField: null, label: "Category" },
     subcategory: { table: "hs_subcategories", parentField: "category_id", label: "Subcategory" },
@@ -16,9 +17,11 @@ const LEVELS = {
 };
 
 const SIMPLE_HEADERS = ["Name", "Image Link"];
-// const BRAND_ITEM_HEADERS = ["Product Name", "Brand Name", "Image Link"];
-const BRAND_ITEM_HEADERS = ["Product Name", "Brand Name", "Image Links"];
-
+const BRAND_ITEM_HEADERS = ["Product Name", "Brand Name", "Manufacturer", "Model/Part No/SKU", "Grade/Variant", "Specifications", "Image Links"];
+// Columns that must be filled for every brand_item row. Grade/Variant and
+// Specifications are intentionally excluded — both are optional, same as
+// they are in the UI forms.
+const BRAND_ITEM_REQUIRED = ["Product Name", "Brand Name", "Manufacturer", "Model/Part No/SKU"];
 
 function isUrl(v) {
     return /^https?:\/\/\S+$/i.test(v || "");
@@ -32,6 +35,28 @@ function parseImageLinks(raw) {
     return String(raw || "")
         .split(/[,;\n]+/)
         .map((s) => s.trim())
+        .filter(Boolean);
+}
+
+// Splits a single "Specifications" cell into { key, value } rows.
+// Each spec is "Key: Value", multiple specs separated by a semicolon
+// or newline — e.g. "Material: SS304; Finish: Matte; Weight: 1.2kg".
+// A colon is required per spec; anything malformed (no colon, or an
+// empty key/value) is silently dropped rather than failing the whole
+// row, since specifications are optional.
+function parseSpecifications(raw) {
+    return String(raw || "")
+        .split(/[;\n]+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((pair) => {
+            const idx = pair.indexOf(":");
+            if (idx === -1) return null;
+            const key = pair.slice(0, idx).trim();
+            const value = pair.slice(idx + 1).trim();
+            if (!key || !value) return null;
+            return { key, value };
+        })
         .filter(Boolean);
 }
 
@@ -55,7 +80,15 @@ export async function downloadCatalogTemplate(req, res) {
     const isBrandItem = level === "brand_item";
     const headers = isBrandItem ? BRAND_ITEM_HEADERS : SIMPLE_HEADERS;
     const exampleRow = isBrandItem
-        ? { "Product Name": "Example Product", "Brand Name": "Example Brand", "Image Links": "https://example.com/front.jpg, https://example.com/side.jpg, https://example.com/back.jpg" }
+        ? {
+            "Product Name": "Example Product",
+            "Brand Name": "Example Brand",
+            "Manufacturer": "Example Manufacturer Pvt Ltd",
+            "Model/Part No/SKU": "MDL-1234",
+            "Grade/Variant": "Grade A",
+            "Specifications": "Material: Stainless Steel 304; Finish: Matte; Weight: 1.2kg",
+            "Image Links": "https://example.com/front.jpg, https://example.com/side.jpg, https://example.com/back.jpg",
+        }
         : { Name: "Example Item", "Image Link": "https://example.com/image.jpg" };
     const filename = `${level}-upload-template.xlsx`;
 
@@ -96,7 +129,7 @@ export async function bulkUploadCatalog(req, res) {
     if (!headersMatch(rows, expectedHeaders)) {
         return res.status(400).json({
             success: false,
-            message: `File format doesn't match. Expected columns: ${expectedHeaders.join(", ")}. Please download a fresh template — the format for Brand Items recently changed from "Image Link" to "Image Links".`,
+            message: `File format doesn't match. Expected columns: ${expectedHeaders.join(", ")}. Please download a fresh template — Brand Items now require Manufacturer and Model/Part No/SKU (Grade/Variant and Specifications are optional).`,
         });
     }
 
@@ -127,17 +160,28 @@ export async function bulkUploadCatalog(req, res) {
         if (isBrandItem) {
             const productName = String(raw["Product Name"] || "").trim();
             const brandName = String(raw["Brand Name"] || "").trim();
+            const manufacturer = String(raw["Manufacturer"] || "").trim();
+            const modelNo = String(raw["Model/Part No/SKU"] || "").trim();
+            const gradeVariant = String(raw["Grade/Variant"] || "").trim();
+            const specifications = parseSpecifications(raw["Specifications"]);
             const imageLinks = parseImageLinks(raw["Image Links"]);
             displayName = productName || `(row ${rowNum})`;
 
             if (!productName || productName.length < 2) errors.push("Product Name must be at least 2 characters");
             if (!brandName) errors.push("Brand Name is required");
+            if (!manufacturer) errors.push("Manufacturer is required");
+            if (!modelNo) errors.push("Model/Part No/SKU is required");
             if (!imageLinks.length) errors.push("At least one Image Link is required");
             else {
                 const badUrls = imageLinks.filter((u) => !isUrl(u));
                 if (badUrls.length) errors.push(`Image Links must all be valid http(s) URLs (bad: ${badUrls.slice(0, 2).join(", ")}${badUrls.length > 2 ? "…" : ""})`);
             }
-
+            // If the cell wasn't blank but nothing parsed out of it, the
+            // admin likely typed specs without a colon — flag it instead
+            // of silently dropping their input.
+            if (String(raw["Specifications"] || "").trim() && !specifications.length) {
+                errors.push(`Specifications must be "Key: Value" pairs separated by ; (couldn't parse any from "${String(raw["Specifications"]).slice(0, 40)}")`);
+            }
 
             dedupKey = `${productName.toLowerCase()}::${brandName.toLowerCase()}`;
             if (!errors.length) {
@@ -145,6 +189,10 @@ export async function bulkUploadCatalog(req, res) {
                     generic_product_id: parentId,
                     name: productName,
                     brand_name: brandName,
+                    manufacturer,
+                    model_no: modelNo,
+                    grade_variant: gradeVariant || null,
+                    specifications,
                     slug: slugify(`${productName}-${brandName}`),
                     image: imageLinks[0],
                     images: imageLinks,
