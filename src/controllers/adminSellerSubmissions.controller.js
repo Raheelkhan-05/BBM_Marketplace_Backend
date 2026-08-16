@@ -268,7 +268,20 @@ export async function approveSellerSubmission(req, res) {
     const { id } = req.params;
     const { data: existing, error: fetchErr } = await supabase
         .from("seller_product_submissions")
-        .select("id, product_name, generic_product_brand_id, seller:seller_profiles(user_id), brand:hs_generic_product_brands(name, review_status)")
+        .select(`
+            id, product_name, generic_product_brand_id,
+            seller:seller_profiles(user_id),
+            brand:hs_generic_product_brands(
+                name, review_status,
+                generic_product:hs_generic_products(
+                    id, review_status,
+                    subcategory:hs_subcategories(
+                        id, review_status,
+                        category:hs_categories(id, review_status)
+                    )
+                )
+            )
+        `)
         .eq("id", id)
         .maybeSingle();
     if (fetchErr) return res.status(500).json({ success: false, message: fetchErr.message });
@@ -282,15 +295,26 @@ export async function approveSellerSubmission(req, res) {
         .single();
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    // Approving a submission is the only path that brought this brand
-    // item into existence when the seller proposed a new one, so approve
-    // the brand item alongside it if it's still sitting pending — without
-    // this, buyers never see the product on the catalog-search hierarchy
-    // (which only reads approved rows from hs_generic_product_brands).
+    // Approving the listing is what makes any newly-proposed hierarchy
+    // nodes "real" — cascade top-down so buyer-facing browse (which only
+    // reads approved rows) picks the whole chain up in one shot.
+    const now = new Date().toISOString();
+    const cat = existing.brand?.generic_product?.subcategory?.category;
+    const sub = existing.brand?.generic_product?.subcategory;
+    const gp = existing.brand?.generic_product;
+    if (cat?.review_status === "pending_review") {
+        await supabase.from("hs_categories").update({ review_status: "approved", reviewed_at: now, reviewed_by: req.user.id }).eq("id", cat.id);
+    }
+    if (sub?.review_status === "pending_review") {
+        await supabase.from("hs_subcategories").update({ review_status: "approved", reviewed_at: now, reviewed_by: req.user.id }).eq("id", sub.id);
+    }
+    if (gp?.review_status === "pending_review") {
+        await supabase.from("hs_generic_products").update({ review_status: "approved", reviewed_at: now, reviewed_by: req.user.id }).eq("id", gp.id);
+    }
     if (existing.generic_product_brand_id && existing.brand?.review_status === "pending_review") {
         const { error: brandErr } = await supabase
             .from("hs_generic_product_brands")
-            .update({ review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: req.user.id, rejection_reason: null })
+            .update({ review_status: "approved", reviewed_at: now, reviewed_by: req.user.id, rejection_reason: null })
             .eq("id", existing.generic_product_brand_id);
         if (brandErr) return res.status(500).json({ success: false, message: brandErr.message });
     }

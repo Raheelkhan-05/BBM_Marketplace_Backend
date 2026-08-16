@@ -22,12 +22,47 @@ export const ALLOWED_UNITS = [
 ];
 const GST_REG_STATUSES = ["regular", "composition", "unregistered"];
 const STOCK_TYPES = ["ready_stock", "made_to_order"];
+const GROUP_FIELD_MAP = {
+    packaging: ["packSize", "unit", "unitsPerMasterPack", "masterPackSize", "packagingType"],
+    delivery: ["sellerLocation", "dispatchLocation", "deliveryTimeline", "freightTerms"],
+    tax_legal: ["hsnCode", "gstRegistrationStatus", "taxInvoiceAvailable"],
+    commercial_terms: ["paymentTerms", "returnPolicy", "warranty"],
+    quality: ["qualityCertificates", "tdsMsdsCoa", "otherCertifications"],
+};
+
+
+// Silently upserts the seller's single "default" template per groupable
+// section on every save — this is the whole auto-save mechanism, so
+// GroupTemplateBar no longer needs a manual save button, only "apply".
+async function autoSaveDefaultGroups(sellerId, body) {
+    for (const [groupType, keys] of Object.entries(GROUP_FIELD_MAP)) {
+        const data = Object.fromEntries(keys.map((k) => [k, body[k]]));
+        const hasValue = Object.values(data).some((v) => v !== "" && v != null && !(Array.isArray(v) && v.length === 0));
+        if (!hasValue) continue;
+        try {
+            const { data: existingTpl } = await supabase
+                .from("seller_listing_templates")
+                .select("id")
+                .eq("seller_id", sellerId).eq("group_type", groupType).eq("is_default", true)
+                .maybeSingle();
+            if (existingTpl) {
+                await supabase.from("seller_listing_templates").update({ data }).eq("id", existingTpl.id);
+            } else {
+                await supabase.from("seller_listing_templates").insert({ seller_id: sellerId, group_type: groupType, name: "Default", data, is_default: true });
+            }
+        } catch { /* best-effort, never blocks the actual submission */ }
+    }
+}
 
 /* ------------------------- catalog pickers (unchanged) ------------------------- */
 
 export async function listApprovedCategories(req, res) {
     const { q = "" } = req.query;
-    let query = supabase.from("hs_categories").select("id, name, slug, image").eq("review_status", "approved").order("name").limit(PICKER_LIMIT);
+    const sellerId = req.sellerId;
+    let query = supabase.from("hs_categories").select("id, name, slug, image, review_status").order("name").limit(PICKER_LIMIT);
+    query = sellerId
+        ? query.or(`review_status.eq.approved,and(review_status.eq.pending_review,created_by.eq.${sellerId})`)
+        : query.eq("review_status", "approved");
     if (q.trim()) query = query.ilike("name", `%${q.trim()}%`);
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
@@ -234,7 +269,9 @@ export async function createSubmission(req, res) {
         .maybeSingle();
     if (genericErr) return res.status(500).json({ success: false, message: genericErr.message });
     if (!generic) return res.status(400).json({ success: false, message: "Selected product wasn't found." });
-    if (generic.review_status !== "approved") return res.status(400).json({ success: false, message: "This product isn't available to list under yet." });
+    if (!["approved", "pending_review"].includes(generic.review_status)) {
+        return res.status(400).json({ success: false, message: "This product isn't available to list under yet." });
+    }
 
     let brand;
     try {
@@ -583,4 +620,117 @@ export async function updateSubmission(req, res) {
 
     const marketplace = await computeMarketplaceFigures(updated.price);
     res.json({ success: true, submission: updated, marketplace, message: wasRejected ? "Resubmitted for review." : "Listing updated." });
+}
+
+async function findDuplicate(table, filters) {
+    let query = supabase.from(table).select("id, name, review_status");
+    Object.entries(filters).forEach(([col, val]) => {
+        query = col === "name" ? query.ilike("name", val.trim()) : query.eq(col, val);
+    });
+    const { data } = await query.maybeSingle();
+    return data;
+}
+
+// POST /api/seller/catalog/categories
+export async function createSellerCategory(req, res) {
+    const { name } = req.body || {};
+    if (!name?.trim()) return res.status(400).json({ success: false, message: "Category name is required." });
+    const trimmed = name.trim();
+
+    const dup = await findDuplicate("hs_categories", { name: trimmed });
+    if (dup) {
+        return res.json({
+            success: true, duplicate: true, entry: dup,
+            message: dup.review_status === "approved"
+                ? `"${dup.name}" already exists — selected it for you.`
+                : `"${dup.name}" is already pending review — selected it for you.`,
+        });
+    }
+
+    const { data, error } = await supabase
+        .from("hs_categories")
+        .insert({ name: trimmed, slug: slugify(trimmed), review_status: "pending_review", is_ai_generated: false, created_by: req.sellerId })
+        .select("id, name, review_status")
+        .single();
+    if (error) {
+        if (error.code === "23505") return res.status(409).json({ success: false, message: "That category already exists." });
+        return res.status(500).json({ success: false, message: error.message });
+    }
+    await notifyAdmins({
+        type: "catalog_submission",
+        title: "New category submitted for review",
+        message: `A seller proposed a new category: "${trimmed}".`,
+        link: `/admin/catalog?highlight=${data.id}&level=category`,
+    });
+    res.json({ success: true, duplicate: false, entry: data, message: "Submitted for review — you can use it right away, buyers just won't see it until it's approved." });
+}
+
+// POST /api/seller/catalog/subcategories
+export async function createSellerSubcategory(req, res) {
+    const { name, categoryId } = req.body || {};
+    if (!categoryId) return res.status(400).json({ success: false, message: "Pick a category first." });
+    if (!name?.trim()) return res.status(400).json({ success: false, message: "Subcategory name is required." });
+    const trimmed = name.trim();
+
+    const dup = await findDuplicate("hs_subcategories", { name: trimmed, category_id: categoryId });
+    if (dup) {
+        return res.json({
+            success: true, duplicate: true, entry: dup,
+            message: dup.review_status === "approved"
+                ? `"${dup.name}" already exists under this category — selected it for you.`
+                : `"${dup.name}" is already pending review under this category — selected it for you.`,
+        });
+    }
+
+    const { data, error } = await supabase
+        .from("hs_subcategories")
+        .insert({ name: trimmed, category_id: categoryId, slug: slugify(trimmed), review_status: "pending_review", is_ai_generated: false, created_by: req.sellerId })
+        .select("id, name, review_status, category_id")
+        .single();
+    if (error) {
+        if (error.code === "23505") return res.status(409).json({ success: false, message: "That subcategory already exists." });
+        return res.status(500).json({ success: false, message: error.message });
+    }
+    await notifyAdmins({
+        type: "catalog_submission",
+        title: "New subcategory submitted for review",
+        message: `A seller proposed a new subcategory: "${trimmed}".`,
+        link: `/admin/catalog?highlight=${data.id}&level=subcategory`,
+    });
+    res.json({ success: true, duplicate: false, entry: data, message: "Submitted for review — you can use it right away." });
+}
+
+// POST /api/seller/catalog/generic-products
+export async function createSellerGenericProduct(req, res) {
+    const { name, subcategoryId } = req.body || {};
+    if (!subcategoryId) return res.status(400).json({ success: false, message: "Pick a subcategory first." });
+    if (!name?.trim()) return res.status(400).json({ success: false, message: "Product type name is required." });
+    const trimmed = name.trim();
+
+    const dup = await findDuplicate("hs_generic_products", { name: trimmed, subcategory_id: subcategoryId });
+    if (dup) {
+        return res.json({
+            success: true, duplicate: true, entry: dup,
+            message: dup.review_status === "approved"
+                ? `"${dup.name}" already exists under this subcategory — selected it for you.`
+                : `"${dup.name}" is already pending review under this subcategory — selected it for you.`,
+        });
+    }
+
+    const { data, error } = await supabase
+        .from("hs_generic_products")
+        .insert({ name: trimmed, subcategory_id: subcategoryId, slug: slugify(trimmed), review_status: "pending_review", is_ai_generated: false, created_by: req.sellerId })
+        .select("id, name, review_status, subcategory_id")
+        .single();
+    if (error) {
+        if (error.code === "23505") return res.status(409).json({ success: false, message: "That product type already exists." });
+        return res.status(500).json({ success: false, message: error.message });
+    }
+    await notifyAdmins({
+        type: "catalog_submission",
+        title: "New product type submitted for review",
+        message: `A seller proposed a new product type: "${trimmed}".`,
+        link: `/admin/catalog?highlight=${data.id}&level=generic_product`,
+    });
+    res.json({ success: true, duplicate: false, entry: data, message: "Submitted for review — you can use it right away." });
 }

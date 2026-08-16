@@ -21,6 +21,9 @@ import {
     updateSubmission,
     deleteSubmission,
     setSubmissionActive,
+    createSellerCategory,
+    createSellerSubcategory,
+    createSellerGenericProduct,
 } from "../controllers/sellerCatalogListings.controller.js";
 import {
     listTemplates,
@@ -37,6 +40,10 @@ router.get("/categories", listApprovedCategories);
 router.get("/subcategories", listApprovedSubcategories);
 router.get("/generic-products", listApprovedGenericProducts);
 router.get("/commission-info", getCommissionInfo);
+
+router.post("/categories", requireAuth, requireApprovedSeller, createSellerCategory);
+router.post("/subcategories", requireAuth, requireApprovedSeller, createSellerSubcategory);
+router.post("/generic-products", requireAuth, requireApprovedSeller, createSellerGenericProduct);
 
 router.post("/submissions", requireAuth, requireApprovedSeller, createSubmission);
 router.get("/submissions", requireAuth, requireApprovedSeller, listMySubmissions);
