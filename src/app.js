@@ -16,7 +16,7 @@ import catalogSearchRoutes from "./routes/catalogSearch.routes.js";
 import ordersRoutes from "./routes/orders.routes.js";
 import sellerOrdersRoutes from "./routes/sellerOrders.routes.js";
 import buyerAddressRoutes from "./routes/buyerAddresses.routes.js";
-
+import catalogRoutes from "./routes/catalog.routes.js";
 
 export function createApp() {
   const app = express();
@@ -62,11 +62,12 @@ export function createApp() {
   app.use("/api/shop", shopRoutes);
   app.use("/api/search", hierarchySearchRoutes);
   app.use("/api/catalog-search", catalogSearchRoutes);
-  app.use("/api/catalog", catalogLandingRoutes);
+  // app.use("/api/catalog", catalogLandingRoutes);
   app.use("/api/catalogs", catalogImportRoutes);
   app.use("/api/whatsapp", whatsappRoutes);
   app.use("/api/orders", ordersRoutes);
   app.use("/api/buyer/addresses", buyerAddressRoutes);
+  app.use("/api/catalog", catalogRoutes);
 
   app.use((err, req, res, next) => {
     console.error(err);
