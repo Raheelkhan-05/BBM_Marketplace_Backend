@@ -1,3 +1,4 @@
+// controllers/orders.controller.js
 import { supabase } from "../config/supabase.js";
 import { notifyOrderChanged, notifyUser, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
 
@@ -14,6 +15,27 @@ const ERROR_MAP = {
 };
 function mapRpcError(error) {
     return ERROR_MAP[(error?.message || "").trim()] || { status: 500, message: "Couldn't place the order. Please try again." };
+}
+
+// ---- Slab / quantity-discount pricing --------------------------------
+// Mirrors the exact logic in BuyNowModal.jsx's computeLocalQuote, so the
+// buyer never sees the instant estimate and the server-confirmed quote
+// disagree once background confirmation lands.
+function resolveSlabUnitPrice(priceSlabs, quantity, fallbackPrice) {
+    if (!Array.isArray(priceSlabs) || !priceSlabs.length) return { price: fallbackPrice, slab: null };
+    const applicable = priceSlabs
+        .filter((s) => Number(s.minQty) > 0 && quantity >= Number(s.minQty) && (!s.maxQty || quantity <= Number(s.maxQty)))
+        .sort((a, b) => Number(b.minQty) - Number(a.minQty));
+    if (!applicable.length) return { price: fallbackPrice, slab: null };
+    return { price: Number(applicable[0].price), slab: applicable[0] };
+}
+function resolveDiscountPercent(quantityDiscounts, quantity) {
+    if (!Array.isArray(quantityDiscounts) || !quantityDiscounts.length) return { percent: 0, tier: null };
+    const applicable = quantityDiscounts
+        .filter((d) => Number(d.minQty) > 0 && quantity >= Number(d.minQty))
+        .sort((a, b) => Number(b.minQty) - Number(a.minQty));
+    if (!applicable.length) return { percent: 0, tier: null };
+    return { percent: Number(applicable[0].discountPercent) || 0, tier: applicable[0] };
 }
 
 // GET /api/orders/checkout-status — optional-auth, mirrors fetchSellerAccessStatus's gating shape
@@ -36,7 +58,11 @@ export async function checkoutStatus(req, res) {
     res.json({ success: true, canCheckout: true, profile, business: business || null });
 }
 
-// GET /api/orders/quote — read-only, same math the RPC enforces, so the UI can show an accurate total live
+// GET /api/orders/quote — read-only, applies the same slab/discount math
+// the RPC must enforce at commit time, so the UI can show an accurate
+// live total. NOTE: placeOrder's `place_order` RPC needs to apply this
+// same resolution server-side when it commits the order — see the
+// comment on placeOrder() below.
 export async function getOrderQuote(req, res) {
     const { submissionId, quantity } = req.query;
     const qty = Number(quantity);
@@ -45,21 +71,31 @@ export async function getOrderQuote(req, res) {
 
     const { data: submission, error } = await supabase
         .from("seller_product_submissions")
-        .select("id, price, moq, unit, lead_time, stock_quantity, review_status")
+        .select("id, price, moq, unit, lead_time, stock_quantity, review_status, price_slabs, quantity_discounts, stock_type, dispatch_time_days, production_lead_time_days")
         .eq("id", submissionId).maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!submission || submission.review_status !== "approved") {
         return res.status(404).json({ success: false, message: "Listing not available." });
     }
 
+    const { price: slabPrice, slab: appliedSlab } = resolveSlabUnitPrice(submission.price_slabs, qty, Number(submission.price));
+    const { percent: discountPercent, tier: discountTier } = resolveDiscountPercent(submission.quantity_discounts, qty);
+    const unitPrice = Math.round(slabPrice * (1 - discountPercent / 100) * 100) / 100;
+
     const { data: settings } = await supabase.from("platform_settings").select("commission_percent").eq("id", true).maybeSingle();
     const commissionPercent = Number(settings?.commission_percent ?? 5);
-    const subtotal = Math.round(submission.price * qty * 100) / 100;
+    const subtotal = Math.round(unitPrice * qty * 100) / 100;
     const platformFee = Math.round((subtotal * commissionPercent / 100) * 100) / 100;
 
+    const leadTime = submission.stock_type === "made_to_order"
+        ? Number(submission.production_lead_time_days || 0)
+        : Number(submission.dispatch_time_days ?? submission.lead_time ?? 0);
+
     res.json({
-        success: true, unitPrice: submission.price, unit: submission.unit, moq: submission.moq,
-        leadTime: submission.lead_time, availableStock: submission.stock_quantity, quantity: qty, subtotal,
+        success: true,
+        unitPrice, basePriceApplied: slabPrice, appliedSlab, discountPercent, discountTier,
+        unit: submission.unit, moq: submission.moq,
+        leadTime, availableStock: submission.stock_quantity, quantity: qty, subtotal,
         platformFeePercent: commissionPercent, platformFeeAmount: platformFee, sellerPayoutAmount: subtotal - platformFee,
         meetsMoq: qty >= Number(submission.moq),
         hasEnoughStock: submission.stock_quantity == null || qty <= Number(submission.stock_quantity),
@@ -67,6 +103,16 @@ export async function getOrderQuote(req, res) {
 }
 
 // POST /api/orders
+//
+// ⚠️ PRICING GAP: this still only sends { submissionId, quantity } to
+// the `place_order` RPC, which (as far as I can see from this file)
+// presumably reads `submission.price` directly to compute order totals
+// server-side. That RPC needs to be updated to apply the SAME slab /
+// quantity-discount resolution as getOrderQuote() above, or a buyer
+// quoted a discounted tiered price here could still be charged the flat
+// base price when the order actually commits. I don't have the RPC's
+// SQL body, so I can't safely edit it — please share it (or the
+// migration that defines it) and I'll wire the matching logic in.
 export async function placeOrder(req, res) {
     const buyerId = req.user.id; // identity only ever comes from the verified token
     const { submissionId, quantity, shippingAddressId, notes } = req.body || {};
