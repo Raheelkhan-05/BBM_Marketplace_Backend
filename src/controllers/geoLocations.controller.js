@@ -107,32 +107,26 @@ export async function searchGeo(req, res) {
 }
 
 // GET /api/geo/cities?stateId=&q=
-// Cities are stored two levels under state (state -> district -> city), so
-// this resolves the district IDs under the state first, then pulls every
-// city under those districts. Returns the full list (no query) so the
-// frontend can offer a proper "select all" checkbox list, or a filtered
-// subset when the seller types to narrow it down.
+// Cities can hang directly off a state (seeded worldwide data) or one
+// level down via a district (India's pincode-lookup-built data) — this
+// checks both so nothing seeded gets missed regardless of source.
 export async function listCities(req, res) {
     const { stateId, q = "" } = req.query;
     if (!stateId) return res.status(400).json({ success: false, message: "stateId is required." });
 
     const { data: districts, error: districtErr } = await supabase
-        .from("geo_locations")
-        .select("id")
-        .eq("type", "district")
-        .eq("parent_id", stateId);
+        .from("geo_locations").select("id").eq("type", "district").eq("parent_id", stateId);
     if (districtErr) return res.status(500).json({ success: false, message: districtErr.message });
 
-    const districtIds = (districts || []).map((d) => d.id);
-    if (!districtIds.length) return res.json({ success: true, items: [] });
+    const parentIds = [stateId, ...(districts || []).map((d) => d.id)];
 
     let query = supabase
         .from("geo_locations")
         .select("id, name, parent_id")
         .eq("type", "city")
-        .in("parent_id", districtIds)
+        .in("parent_id", parentIds)
         .order("name")
-        .limit(500);
+        .limit(1000);
     if (q.trim()) query = query.ilike("name", `%${q.trim()}%`);
 
     const { data, error } = await query;
