@@ -12,11 +12,12 @@ import { requireApprovedSeller, getSellerAccessStatus } from "../middleware/requ
 import {
     getCommissionInfo,
     createSubmission,
-    // listMySubmissions,
-    // getSubmissionDetail,
+    listMySubmissions,
+    getSubmissionDetail,
     createListingForExistingBrand,
-    // updateSubmission,
-    // setSubmissionActive,
+    updateSubmission,
+    setSubmissionActive,
+    deleteSubmission,
 } from "../controllers/sellerCatalogListings.controller.js";
 import {
     listTemplates,
@@ -40,12 +41,12 @@ router.get("/commission-info", getCommissionInfo);
 // router.post("/generic-products", createSellerGenericProduct);
 
 router.post("/submissions", requireAuth, requireApprovedSeller, createSubmission);
-// router.get("/submissions", requireAuth, requireApprovedSeller, listMySubmissions);
-// router.get("/submissions/:id", requireAuth, requireApprovedSeller, getSubmissionDetail);
+router.get("/submissions", requireAuth, requireApprovedSeller, listMySubmissions);
+router.get("/submissions/:id", requireAuth, requireApprovedSeller, getSubmissionDetail);
 router.post("/listings", requireAuth, requireApprovedSeller, createListingForExistingBrand);
-// router.patch("/submissions/:id", requireAuth, requireApprovedSeller, updateSubmission);
-// router.delete("/submissions/:id", requireAuth, requireApprovedSeller, deleteSubmission);
-// router.patch("/submissions/:id/active", requireAuth, requireApprovedSeller, setSubmissionActive);
+router.patch("/submissions/:id", requireAuth, requireApprovedSeller, updateSubmission);
+router.delete("/submissions/:id", requireAuth, requireApprovedSeller, deleteSubmission);
+router.patch("/submissions/:id/active", requireAuth, requireApprovedSeller, setSubmissionActive);
 
 router.get("/templates", requireAuth, requireApprovedSeller, listTemplates);
 router.get("/templates/defaults", requireAuth, requireApprovedSeller, listDefaultTemplates);

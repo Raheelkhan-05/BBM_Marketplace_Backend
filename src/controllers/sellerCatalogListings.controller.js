@@ -19,6 +19,19 @@ const GROUP_FIELD_MAP = {
     delivery: ["dispatchPincode", "dispatchingLocations", "freightIncluded"],
 };
 
+// Columns returned for the seller's own submissions list / detail views.
+// Kept explicit (rather than "*") so we control payload size and don't leak
+// anything unexpected if columns get added later.
+const SUBMISSION_LIST_COLUMNS = `
+    id, created_at, updated_at, review_status, rejection_reason,
+    reviewed_at, is_active, generic_product_brand_id,
+    product_name, brand_name, image, price, base_price, moq, unit,
+    stock_type, stock_quantity, production_lead_time_days,
+    hs_generic_product_brands ( id, name, brand_name, image, images )
+`;
+
+const SUBMISSION_DETAIL_COLUMNS = `*, hs_generic_product_brands ( id, name, brand_name, image, images, brand_not_applicable )`;
+
 async function autoSaveDeliveryDefaults(sellerId, body) {
     const keys = GROUP_FIELD_MAP.delivery;
     const data = Object.fromEntries(keys.map((k) => [k, body[k]]));
@@ -153,6 +166,11 @@ function toListingRow(body) {
     const images = Array.isArray(body.images) ? body.images : [];
 
     return {
+        // identity — was missing before, which left these columns null on
+        // every insert/update and broke the seller's own submissions list.
+        product_name: body.productName?.trim() || null,
+        brand_name: body.brandNotApplicable ? null : (body.brandName?.trim() || null),
+
         // canonical buyer-facing (unchanged shape for every existing reader)
         price: finalPricePerUnit,
         base_price: basePricePerUnit,
@@ -355,4 +373,173 @@ export async function createListingForExistingBrand(req, res) {
 
     const marketplace = await computeMarketplaceFigures(result.price);
     res.json({ success: true, submission: result, marketplace, message: `You're now listing "${brand.name}"${existingRow ? " again" : ""}. We'll notify you once it's approved.` });
+}
+
+/* ------------------------- list / detail / update / active ------------------------- */
+
+// GET /api/seller/catalog/submissions
+// Optional query params: status=pending_review|approved|rejected, is_active=true|false,
+// page (1-based, default 1), pageSize (default 20, max 100).
+export async function listMySubmissions(req, res) {
+    const sellerId = req.sellerId;
+    const { status, is_active } = req.query;
+
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 20));
+    const from = (page - 1) * pageSize;
+    const to = from + pageSize - 1;
+
+    let query = supabase
+        .from("seller_product_submissions")
+        .select(SUBMISSION_LIST_COLUMNS, { count: "exact" })
+        .eq("seller_id", sellerId)
+        .order("created_at", { ascending: false })
+        .range(from, to);
+
+    if (status) {
+        const allowedStatuses = ["pending_review", "approved", "rejected"];
+        if (!allowedStatuses.includes(status)) {
+            return res.status(400).json({ success: false, message: "Invalid status filter." });
+        }
+        query = query.eq("review_status", status);
+    }
+    if (is_active !== undefined) {
+        query = query.eq("is_active", is_active === "true");
+    }
+
+    const { data, error, count } = await query;
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    // Frontend (SellerManageListingsPage) expects `items` and a `brand`
+    // key per row, not the raw supabase join name.
+    const items = (data || []).map(({ hs_generic_product_brands, ...rest }) => ({
+        ...rest,
+        brand: hs_generic_product_brands || null,
+    }));
+
+    res.json({
+        success: true,
+        items,
+        pagination: { page, pageSize, total: count ?? items.length, totalPages: Math.ceil((count ?? items.length) / pageSize) },
+    });
+}
+
+// GET /api/seller/catalog/submissions/:id
+export async function getSubmissionDetail(req, res) {
+    const sellerId = req.sellerId;
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+        .from("seller_product_submissions")
+        .select(SUBMISSION_DETAIL_COLUMNS)
+        .eq("id", id)
+        .eq("seller_id", sellerId)
+        .maybeSingle();
+
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    if (!data) return res.status(404).json({ success: false, message: "Submission not found." });
+
+    const { hs_generic_product_brands, ...rest } = data;
+    const submission = { ...rest, brand: hs_generic_product_brands || null };
+
+    res.json({ success: true, submission });
+}
+
+// PATCH /api/seller/catalog/submissions/:id
+// Sellers can edit their own submission. Any edit (other than toggling
+// is_active, which has its own endpoint) sends it back to pending_review,
+// mirroring the resubmission-after-rejection behaviour above.
+export async function updateSubmission(req, res) {
+    const sellerId = req.sellerId;
+    const { id } = req.params;
+    const body = req.body || {};
+
+    const { data: existing, error: fetchErr } = await supabase
+        .from("seller_product_submissions")
+        .select("id, review_status, product_name, brand_name, image")
+        .eq("id", id).eq("seller_id", sellerId).maybeSingle();
+    if (fetchErr) return res.status(500).json({ success: false, message: fetchErr.message });
+    if (!existing) return res.status(404).json({ success: false, message: "Submission not found." });
+
+    // Identity fields (product/brand/images) aren't editable here — that
+    // would mean re-resolving hs_generic_product_brands, which is out of
+    // scope for a simple listing edit. Merge in the stored identity so
+    // validation has what it needs.
+    const merged = {
+        ...body,
+        productName: existing.product_name,
+        brandName: existing.brand_name,
+        images: Array.isArray(body.images) && body.images.length ? body.images : [existing.image].filter(Boolean),
+        brandNotApplicable: !existing.brand_name,
+    };
+
+    const missing = validateListingPayload(merged).filter((m) => !["Product name", "Brand", "Product image"].includes(m));
+    if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.`, missing });
+
+    const row = toListingRow(merged);
+    const [returnText, warrantyText] = await Promise.all([
+        resolvePolicyText("return_policy", body.returnPolicyKey),
+        resolvePolicyText("warranty", body.warrantyKey),
+    ]);
+    row.return_policy = returnText;
+    row.warranty = warrantyText;
+
+    const { data: updated, error } = await supabase
+        .from("seller_product_submissions")
+        .update({ ...row, review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null })
+        .eq("id", id).eq("seller_id", sellerId)
+        .select("id, created_at, price").single();
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    await autoSaveDeliveryDefaults(sellerId, body);
+
+    await notifyAdmins({
+        type: "seller_submission",
+        title: "Listing edited and resubmitted for review",
+        message: `${existing.brand_name || "(No brand)"} — ${existing.product_name} was edited and needs review.`,
+        link: `/admin/seller-submissions?highlight=${updated.id}`,
+    });
+    await notifyAdminSubmissionsChanged();
+
+    const marketplace = await computeMarketplaceFigures(updated.price);
+    res.json({ success: true, submission: updated, marketplace, message: "Changes submitted for review." });
+}
+
+// PATCH /api/seller/catalog/submissions/:id/active
+// Toggle visibility of an already-approved listing without touching review status.
+export async function setSubmissionActive(req, res) {
+    const sellerId = req.sellerId;
+    const { id } = req.params;
+    const { isActive } = req.body || {};
+
+    if (typeof isActive !== "boolean") {
+        return res.status(400).json({ success: false, message: "isActive must be true or false." });
+    }
+
+    const { data: updated, error } = await supabase
+        .from("seller_product_submissions")
+        .update({ is_active: isActive })
+        .eq("id", id).eq("seller_id", sellerId)
+        .select("id, is_active").maybeSingle();
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    if (!updated) return res.status(404).json({ success: false, message: "Submission not found." });
+
+    res.json({ success: true, submission: updated, message: isActive ? "Listing is now active." : "Listing is now inactive." });
+}
+
+// DELETE /api/seller/catalog/submissions/:id
+export async function deleteSubmission(req, res) {
+    const sellerId = req.sellerId;
+    const { id } = req.params;
+
+    const { data: deleted, error } = await supabase
+        .from("seller_product_submissions")
+        .delete()
+        .eq("id", id).eq("seller_id", sellerId)
+        .select("id").maybeSingle();
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    if (!deleted) return res.status(404).json({ success: false, message: "Submission not found." });
+
+    await notifyAdminSubmissionsChanged();
+    res.json({ success: true, message: "Listing deleted." });
 }
