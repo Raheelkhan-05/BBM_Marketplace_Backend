@@ -30,6 +30,7 @@ const BRAND_EMBED = `
     seller:seller_profiles(id, display_name, user_id),
     brand:hs_generic_product_brands(
         id, name, brand_name, image, images,
+        
         generic_product:hs_generic_products(id, name,
             subcategory:hs_subcategories(id, name, category:hs_categories(id, name))
         )
@@ -287,6 +288,12 @@ export async function approveSellerSubmission(req, res) {
     if (fetchErr) return res.status(500).json({ success: false, message: fetchErr.message });
     if (!existing) return res.status(404).json({ success: false, message: "Not found." });
 
+    if (!existing.brand?.generic_product?.id) {
+        return res.status(400).json({
+            success: false,
+            message: "This item's category hasn't been mapped yet. Map it from Admin → Catalog → this brand item first.",
+        });
+    }
     const { data, error } = await supabase
         .from("seller_product_submissions")
         .update({ review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: req.user.id, rejection_reason: null })

@@ -17,6 +17,8 @@ import ordersRoutes from "./routes/orders.routes.js";
 import sellerOrdersRoutes from "./routes/sellerOrders.routes.js";
 import buyerAddressRoutes from "./routes/buyerAddresses.routes.js";
 import catalogRoutes from "./routes/catalog.routes.js";
+import geoRoutes from "./routes/geo.routes.js";
+import listingPolicyOptionsRoutes from "./routes/listingPolicyOptions.routes.js";
 
 export function createApp() {
   const app = express();
@@ -68,6 +70,8 @@ export function createApp() {
   app.use("/api/orders", ordersRoutes);
   app.use("/api/buyer/addresses", buyerAddressRoutes);
   app.use("/api/catalog", catalogRoutes);
+  app.use("/api/geo", geoRoutes);
+  app.use("/api/listing-policy-options", listingPolicyOptionsRoutes);
 
   app.use((err, req, res, next) => {
     console.error(err);

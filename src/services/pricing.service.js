@@ -46,3 +46,58 @@ export async function computeMarketplaceFigures(finalPrice) {
         bbmSellingPrice: Number(finalPrice), // marketplace doesn't mark up over the seller's listed price
     };
 }
+
+/**
+ * The seller now enters ONE base price against ONE basis (per unit /
+ * per pack / per master pack), and a toggle for whether that price
+ * already includes GST. Everything buyer-facing (price/unit, the
+ * comparison badges, order math) is normalized to "excl. GST, per
+ * single unit" so every existing reader of `base_price` / `price`
+ * keeps working unchanged.
+ *
+ * @param {number} enteredPrice - raw number the seller typed
+ * @param {number} gstPercent
+ * @param {boolean} gstInclusive - true if enteredPrice already includes GST
+ * @param {'per_unit'|'per_pack'|'per_master_pack'} basis
+ * @param {number} packSize - units per pack (>=1)
+ * @param {number} unitsPerMasterPack - packs per master pack (>=1), optional
+ * @returns {{ basePricePerUnit: number, finalPricePerUnit: number }}
+ */
+export function normalizeEnteredPrice(enteredPrice, gstPercent, gstInclusive, basis, packSize, unitsPerMasterPack) {
+    const price = Number(enteredPrice) || 0;
+    const gst = Number(gstPercent) || 0;
+    const pack = Number(packSize) > 0 ? Number(packSize) : 1;
+    const master = Number(unitsPerMasterPack) > 0 ? Number(unitsPerMasterPack) : 1;
+
+    // 1. strip GST if the seller entered a GST-inclusive number
+    const exGst = gstInclusive ? price / (1 + gst / 100) : price;
+
+    // 2. bring it down to a single-unit basis
+    let perUnitExGst = exGst;
+    if (basis === "per_pack") perUnitExGst = exGst / pack;
+    if (basis === "per_master_pack") perUnitExGst = exGst / (pack * master);
+
+    const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+    return {
+        basePricePerUnit: round2(perUnitExGst),
+        finalPricePerUnit: round2(perUnitExGst * (1 + gst / 100)),
+    };
+}
+
+/**
+ * Inverse of the above — given a stored per-unit base price, express it
+ * back in whatever basis/inclusivity the seller last used, for
+ * re-populating the edit form.
+ */
+export function denormalizePriceForEdit(basePricePerUnit, gstPercent, gstInclusive, basis, packSize, unitsPerMasterPack) {
+    const gst = Number(gstPercent) || 0;
+    const pack = Number(packSize) > 0 ? Number(packSize) : 1;
+    const master = Number(unitsPerMasterPack) > 0 ? Number(unitsPerMasterPack) : 1;
+
+    let scaled = Number(basePricePerUnit) || 0;
+    if (basis === "per_pack") scaled *= pack;
+    if (basis === "per_master_pack") scaled *= pack * master;
+
+    const displayPrice = gstInclusive ? scaled * (1 + gst / 100) : scaled;
+    return Math.round((displayPrice + Number.EPSILON) * 100) / 100;
+}

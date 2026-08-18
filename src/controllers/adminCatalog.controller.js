@@ -34,7 +34,11 @@ const LEVEL_CONFIG = {
     // it), so they belong here, same as name/brand_name/images already do.
     brand_item: {
         table: "hs_generic_product_brands", label: "Brand Item",
-        editableFields: ["name", "slug", "image", "brand_name", "images", "manufacturer", "model_no", "grade_variant", "specifications"],
+        editableFields: [
+            "name", "slug", "image", "images", "brand_name", "brand_image", "brand_not_applicable",
+            "manufacturer", "model_no", "grade_variant", "specifications",
+            "description", "manufacturing_details",   // ← NEW: admin-only fields
+        ],
         embed: "hs_generic_products(id, name, review_status, hs_subcategories(id, name, review_status, hs_categories(id, name, review_status)))",
     },
 };
@@ -49,10 +53,19 @@ const PARENT_COL = {
     generic_product: "subcategory_id",
 };
 
+// FIX: added a "generic_product" entry so the third rung of
+// CascadingHierarchyPicker, when mapping a brand_item, searches/creates
+// against hs_generic_products instead of falling back to (or being
+// hardcoded onto) "product" -> hs_products. Without this, "product" was
+// the only picker level available for that rung's underlying table, so
+// creating a new item there silently inserted into hs_products, producing
+// a valid-looking id that later failed the hs_generic_products lookup in
+// approveCatalogEntry with "Selected generic product wasn't found."
 const PICKER_CONFIG = {
     category: { table: "hs_categories", parentField: null },
     subcategory: { table: "hs_subcategories", parentField: "category_id" },
     product: { table: "hs_products", parentField: "subcategory_id" },
+    generic_product: { table: "hs_generic_products", parentField: "subcategory_id" },
 };
 
 const LEVEL_PARENT_FIELD = {
@@ -216,16 +229,6 @@ export async function updateCatalogEntry(req, res) {
         update.specifications = update.specifications.filter((s) => s?.key?.trim());
     }
 
-    if (level === "brand_item" && update.brand_name !== undefined && !update.brand_name.trim()) {
-        return res.status(400).json({ success: false, message: "Brand name can't be empty." });
-    }
-    if (level === "brand_item" && update.manufacturer !== undefined && !String(update.manufacturer).trim()) {
-        return res.status(400).json({ success: false, message: "Manufacturer can't be empty." });
-    }
-    if (level === "brand_item" && update.model_no !== undefined && !String(update.model_no).trim()) {
-        return res.status(400).json({ success: false, message: "Model / Part No. / SKU can't be empty." });
-    }
-
     const parentField = LEVEL_PARENT_FIELD[level];
     if (parentField && body.parentId) update[parentField] = body.parentId;
 
@@ -239,17 +242,30 @@ export async function updateCatalogEntry(req, res) {
     res.json({ success: true, entry: data });
 }
 
+
 export async function approveCatalogEntry(req, res) {
     const { level, id } = req.params;
     const cfg = cfgFor(level, res);
     if (!cfg) return;
 
     const body = req.body || {};
+
+    // NEW: brand_item can no longer be approved without a category chain —
+    // sellers no longer supply one, so this is the one place it gets set.
+    if (level === "brand_item") {
+        const genericProductId = body.parentId || null;
+        if (!genericProductId) {
+            return res.status(400).json({ success: false, message: "Map this item to a Category / Subcategory / Generic Product before approving." });
+        }
+        const { data: gp, error: gpErr } = await supabase
+            .from("hs_generic_products").select("id, review_status").eq("id", genericProductId).maybeSingle();
+        if (gpErr) return res.status(500).json({ success: false, message: gpErr.message });
+        if (!gp) return res.status(400).json({ success: false, message: "Selected generic product wasn't found." });
+    }
+
     const update = { review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: req.user.id, rejection_reason: null };
     for (const key of cfg.editableFields) if (body[key] !== undefined) update[key] = body[key];
-    if (Array.isArray(update.specifications)) {
-        update.specifications = update.specifications.filter((s) => s?.key?.trim());
-    }
+    if (Array.isArray(update.specifications)) update.specifications = update.specifications.filter((s) => s?.key?.trim());
 
     const parentField = LEVEL_PARENT_FIELD[level];
     if (parentField && body.parentId) update[parentField] = body.parentId;
@@ -349,7 +365,7 @@ export async function deleteCatalogEntry(req, res) {
     res.json({ success: true });
 }
 
-// GET /api/admin/catalog/options?pickerLevel=category|subcategory|product&parentId=&q=
+// GET /api/admin/catalog/options?pickerLevel=category|subcategory|product|generic_product&parentId=&q=
 export async function getMappingOptions(req, res) {
     const { pickerLevel, parentId, q = "" } = req.query;
     const picker = PICKER_CONFIG[pickerLevel];
