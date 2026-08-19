@@ -1,7 +1,7 @@
 // routes/sellerOrders.routes.js
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.middleware.js";
-import { requireApprovedSeller } from "../middleware/requireApprovedSeller.js"; // ← adjust to wherever this actually lives
+import { requireApprovedSeller } from "../middleware/requireApprovedSeller.js";
 import { listSellerOrders, getSellerOrder, confirmOrder, rejectOrder, processOrder, shipOrder, deliverOrder } from "../controllers/sellerOrders.controller.js";
 
 const router = Router();
