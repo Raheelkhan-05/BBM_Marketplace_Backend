@@ -1,20 +1,28 @@
+// controllers/sellerOrders.controller.js — UPDATED
+//
+// Only change: SELECT columns now include order_type, sample_order_id,
+// stock_shortfall (orders) and purchase_basis, pack_quantity_snapshot
+// (order_items), so SalesOrdersPage can render pack quantities and sample
+// badges. Transition handlers are unchanged.
 import { supabase } from "../config/supabase.js";
 import { notifyOrderChanged, notifyUser, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
 
 // GET /api/seller/orders
 export async function listSellerOrders(req, res) {
-    const { status } = req.query;
+    const { status, orderType } = req.query;
     let query = supabase
         .from("orders")
         .select(`
-      id, order_number, status, subtotal_amount, platform_fee_percent, platform_fee_amount, seller_payout_amount, total_amount,
+      id, order_number, status, order_type, sample_order_id, stock_shortfall,
+      subtotal_amount, platform_fee_percent, platform_fee_amount, seller_payout_amount, total_amount,
       payment_status, buyer_contact_name, buyer_contact_phone, buyer_contact_email,
       buyer_gstin, buyer_business_name, buyer_gst_verified,
       shipping_address_snapshot, buyer_notes, created_at, updated_at,
-      items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, unit, quantity, line_total )
+      items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )
     `)
         .eq("seller_id", req.sellerId).order("created_at", { ascending: false });
     if (status) query = query.eq("status", status);
+    if (orderType) query = query.eq("order_type", orderType);
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
