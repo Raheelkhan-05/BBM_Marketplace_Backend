@@ -56,10 +56,10 @@ function transitionHandler(newStatus) {
         await notifyOrderChanged(req.params.id, { status: newStatus });
         const { data: order } = await supabase.from("orders").select("buyer_id, order_number").eq("id", req.params.id).maybeSingle();
         if (order) {
-            await notifyUser(order.buyer_id, {
-                type: "order_status", title: `Order ${order.order_number} ${newStatus.replace("_", " ")}`,
-                body: reason || undefined, link: `/orders/${req.params.id}`,
-            });
+            // await notifyUser(order.buyer_id, {
+            //     type: "order_status", title: `Order ${order.order_number} ${newStatus.replace("_", " ")}`,
+            //     body: reason || undefined, link: `/orders/${req.params.id}`,
+            // });
             await notifyUserOrdersChanged(order.buyer_id);
         }
         res.json({ success: true, message: `Order marked as ${newStatus.replace("_", " ")}.` });

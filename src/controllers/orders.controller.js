@@ -244,14 +244,14 @@ export async function placeOrder(req, res) {
     if (submission) {
         const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", submission.seller_id).maybeSingle();
         if (sellerProfile) {
-            await notifyUser(sellerProfile.user_id, {
-                type: safeOrderType === "sample" ? "new_sample_order" : "new_order",
-                title: safeOrderType === "sample" ? "New sample request" : "New order received",
-                body: row.stock_shortfall
-                    ? `Order ${row.order_number} was placed for more than your current stock — fulfilment will take a little longer.`
-                    : `Order ${row.order_number} was just placed.`,
-                link: `/seller/orders/${row.order_id}`,
-            });
+            // await notifyUser(sellerProfile.user_id, {
+            //     type: safeOrderType === "sample" ? "new_sample_order" : "new_order",
+            //     title: safeOrderType === "sample" ? "New sample request" : "New order received",
+            //     body: row.stock_shortfall
+            //         ? `Order ${row.order_number} was placed for more than your current stock — fulfilment will take a little longer.`
+            //         : `Order ${row.order_number} was just placed.`,
+            //     link: `/seller/orders/${row.order_id}`,
+            // });
             await notifyUserOrdersChanged(sellerProfile.user_id);
         }
     }
@@ -311,7 +311,7 @@ export async function cancelMyOrder(req, res) {
     if (order) {
         const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", order.seller_id).maybeSingle();
         if (sellerProfile) {
-            await notifyUser(sellerProfile.user_id, { type: "order_cancelled", title: `Order ${order.order_number} cancelled`, body: reason || "Cancelled by buyer", link: `/seller/orders/${req.params.id}` });
+            // await notifyUser(sellerProfile.user_id, { type: "order_cancelled", title: `Order ${order.order_number} cancelled`, body: reason || "Cancelled by buyer", link: `/seller/orders/${req.params.id}` });
             await notifyUserOrdersChanged(sellerProfile.user_id);
         }
     }
