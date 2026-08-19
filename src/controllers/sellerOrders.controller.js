@@ -1,11 +1,22 @@
-// controllers/sellerOrders.controller.js — UPDATED
+// controllers/sellerOrders.controller.js — PATCH: de-duplicate notifications
 //
-// Only change: SELECT columns now include order_type, sample_order_id,
-// stock_shortfall (orders) and purchase_basis, pack_quantity_snapshot
-// (order_items), so SalesOrdersPage can render pack quantities and sample
-// badges. Transition handlers are unchanged.
+// CHANGED: transitionHandler no longer calls notifyUser(...) after a
+// successful RPC call. update_order_status already inserts the buyer-facing
+// notification row itself (its final `insert into notifications` block —
+// the `else` branch, since actor_role here is always 'seller'). The
+// controller's notifyUser(...) call duplicated that with a second, shorter
+// notification for the same status change.
+//
+// Also fixed: the broadcast/notify block previously ran even when the RPC
+// itself errored (it sat after the `if (error) return ...` check already —
+// that part was correct — no change needed there, only the duplicate
+// removal). notifyOrderChanged and notifyUserOrdersChanged are KEPT: both
+// are realtime channel broadcasts, not notifications-table rows.
+//
+// listSellerOrders and getSellerOrder are unchanged, reproduced for
+// completeness so this is a drop-in replacement.
 import { supabase } from "../config/supabase.js";
-import { notifyOrderChanged, notifyUser, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
+import { notifyOrderChanged, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
 
 // GET /api/seller/orders
 export async function listSellerOrders(req, res) {
@@ -56,10 +67,6 @@ function transitionHandler(newStatus) {
         await notifyOrderChanged(req.params.id, { status: newStatus });
         const { data: order } = await supabase.from("orders").select("buyer_id, order_number").eq("id", req.params.id).maybeSingle();
         if (order) {
-            // await notifyUser(order.buyer_id, {
-            //     type: "order_status", title: `Order ${order.order_number} ${newStatus.replace("_", " ")}`,
-            //     body: reason || undefined, link: `/orders/${req.params.id}`,
-            // });
             await notifyUserOrdersChanged(order.buyer_id);
         }
         res.json({ success: true, message: `Order marked as ${newStatus.replace("_", " ")}.` });

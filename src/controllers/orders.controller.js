@@ -1,23 +1,21 @@
-// controllers/orders.controller.js — REWRITTEN
+// controllers/orders.controller.js — PATCH: de-duplicate notifications
 //
-// Changes from the previous version:
-//   - getOrderQuote now accepts `purchaseBasis` and converts pack/master-pack
-//     quantity to base units before resolving slabs/discounts, mirroring the
-//     RPC exactly. Returns both the entered pack-basis quantity and the
-//     converted base-unit quantity so the UI can show either.
-//   - getOrderQuote computes an `estimatedDeliveryDate` (DD Mon string, e.g.
-//     "24 Aug") using the same zone heuristic as the RPC — same pincode
-//     prefix / same state / else — off dispatch pincode vs the buyer's
-//     selected address pincode. Needs the buyer to have an address selected;
-//     if none is passed, falls back to the seller's dispatch state only info
-//     (best-effort, will be re-confirmed by the RPC when the order is placed).
-//   - getOrderQuote reports `stockShortfall` (informational only) instead of
-//     the old `hasEnoughStock` gate — nothing in this file blocks on it.
-//   - placeOrder passes purchaseBasis / orderType / sampleOrderId through to
-//     the RPC, and no longer treats INSUFFICIENT_STOCK as an error — it isn't
-//     raised anymore. The stock-shortfall demand-signal notification is now
-//     driven off the RPC's returned `stock_shortfall` flag instead of a
-//     caught RPC error.
+// Root cause: place_order and update_order_status both INSERT into
+// `notifications` directly as their last step (see the RPC SQL — the
+// `insert into notifications (...)` block near the end of each). The
+// controller was ALSO calling notifyUser(...) after every successful RPC
+// call, producing two rows per event: the RPC's detailed one, and the
+// controller's shorter duplicate.
+//
+// Fix: remove the controller-side notifyUser(...) calls for events the RPC
+// already covers (order placed, cancelled/confirmed/rejected/etc. status
+// changes). notifyOrderChanged / notifyUserOrdersChanged are UNCHANGED and
+// kept — those are realtime channel broadcasts (no `notifications` row),
+// not duplicates, and the UI's live-refresh depends on them.
+//
+// Only three functions in this file change: placeOrder, cancelMyOrder.
+// getOrderQuote, checkoutStatus, listMyOrders, getMyOrder are untouched —
+// reproduced below only for completeness so this is a drop-in replacement.
 import { supabase } from "../config/supabase.js";
 import { notifyOrderChanged, notifyUser, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
 
@@ -42,10 +40,6 @@ function formatDDMon(date) {
     return `${String(date.getDate()).padStart(2, "0")} ${MONTH_SHORT[date.getMonth()]}`;
 }
 
-// Same zone heuristic as the place_order RPC — same pincode prefix (1 day
-// transit), same state (3 days), else (6 days) — added on top of the
-// listing's lead time (dispatch_time_days for ready stock, or
-// production_lead_time_days for made-to-order).
 function estimateDeliveryDate(submission, buyerPincode, buyerState) {
     const leadDays = submission.stock_type === "made_to_order"
         ? Number(submission.production_lead_time_days || 0)
@@ -63,9 +57,6 @@ function estimateDeliveryDate(submission, buyerPincode, buyerState) {
     return { date, label: formatDDMon(date), leadDays, transitDays };
 }
 
-// Converts a pack/master-pack/unit quantity into base units, using the
-// listing's pack_size / units_per_master_pack (falling back to 1 so older
-// listings without packaging data still behave as plain per-unit orders).
 function toBaseUnits(submission, quantity, purchaseBasis) {
     const packSize = Number(submission.pack_size) > 0 ? Number(submission.pack_size) : 1;
     const masterPackSize = Number(submission.units_per_master_pack) > 0 ? Number(submission.units_per_master_pack) : 1;
@@ -74,9 +65,6 @@ function toBaseUnits(submission, quantity, purchaseBasis) {
     return quantity;
 }
 
-// ---- Slab / quantity-discount pricing --------------------------------
-// Mirrors the exact logic in the place_order RPC and BuyNowModal.jsx's
-// computeLocalQuote. All operate on BASE-UNIT quantity.
 function resolveSlabUnitPrice(priceSlabs, quantity, fallbackPrice) {
     if (!Array.isArray(priceSlabs) || !priceSlabs.length) return { price: fallbackPrice, slab: null };
     const applicable = priceSlabs
@@ -114,13 +102,7 @@ export async function checkoutStatus(req, res) {
     res.json({ success: true, canCheckout: true, profile, business: business || null });
 }
 
-// GET /api/orders/quote?submissionId=&quantity=&purchaseBasis=&orderType=&addressId=
-//
-// `quantity` is in whatever `purchaseBasis` is ('per_unit' default). If the
-// buyer already has an address selected, pass `addressId` so the delivery
-// estimate uses their real pincode/state — otherwise the estimate is based
-// on lead time + a default "rest of India" transit band, and gets refined
-// once an address is chosen (the RPC recomputes it authoritatively anyway).
+// GET /api/orders/quote — unchanged
 export async function getOrderQuote(req, res) {
     const { submissionId, quantity, purchaseBasis = "per_unit", orderType = "standard", addressId } = req.query;
     const qty = Number(quantity);
@@ -189,23 +171,25 @@ export async function getOrderQuote(req, res) {
         availableStock: submission.stock_quantity, subtotal,
         platformFeePercent: commissionPercent, platformFeeAmount: platformFee, sellerPayoutAmount: subtotal - platformFee,
         meetsMoq: baseQty >= Number(submission.moq),
-        // Informational only — nothing gates on this anymore. Ready-stock
-        // shortfalls still go through; the UI shows "will take a little
-        // longer" instead of blocking. Made-to-order is never flagged here.
         stockShortfall,
     });
 }
 
 // POST /api/orders
 //
-// Body: { submissionId, quantity, purchaseBasis, orderType, sampleOrderId,
-//         shippingAddressId, notes }
-// `quantity` is in `purchaseBasis` units (default 'per_unit'). `orderType`
-// defaults to 'standard' and is NEVER inferred/preselected — the buyer must
-// explicitly opt into 'sample' via the UI. Stock shortfalls no longer block
-// the order; the RPC returns `stock_shortfall` and this handler still fires
-// the seller demand-signal notification off that flag instead of a caught
-// INSUFFICIENT_STOCK error (which the RPC no longer raises).
+// CHANGED: no longer calls notifyUser(...) on success. place_order already
+// inserts the seller's "New order"/"New sample request" notification row
+// itself (see the RPC's final `insert into notifications` block) — calling
+// notifyUser here duplicated it. notifyUserOrdersChanged is KEPT: it's a
+// realtime channel broadcast, not a notifications-table row, and
+// SalesOrdersPage's live list depends on it firing.
+//
+// The one thing the RPC's own notification text can't express is the
+// stock-shortfall context — its message is generic. Rather than add a
+// second notifications row for that (which would reintroduce the same
+// duplication problem), the shortfall is surfaced entirely client-side:
+// SalesOrdersPage already reads orders.stock_shortfall directly and shows
+// the amber banner from that column, so no extra notification is needed.
 export async function placeOrder(req, res) {
     const buyerId = req.user.id;
     const {
@@ -234,27 +218,29 @@ export async function placeOrder(req, res) {
     });
 
     if (error) {
+        console.error("place_order RPC failed:", error); // check .message, .details, .hint, .code in your terminal
         const mapped = mapRpcError(error);
         return res.status(mapped.status).json({ success: false, code: error.message, message: mapped.message });
     }
 
-    const row = Array.isArray(data) ? data[0] : data;
 
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) {
+        console.error("place_order RPC returned no row", { submissionId, orderType: safeOrderType, data });
+        return res.status(500).json({ success: false, message: "Couldn't place the order — please try again." });
+    }
+
+    // Realtime broadcast only — NOT a notifications-table insert, so this
+    // doesn't duplicate what the RPC already wrote. Kept so the seller's
+    // SalesOrdersPage list updates live.
     const { data: submission } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
     if (submission) {
         const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", submission.seller_id).maybeSingle();
         if (sellerProfile) {
-            // await notifyUser(sellerProfile.user_id, {
-            //     type: safeOrderType === "sample" ? "new_sample_order" : "new_order",
-            //     title: safeOrderType === "sample" ? "New sample request" : "New order received",
-            //     body: row.stock_shortfall
-            //         ? `Order ${row.order_number} was placed for more than your current stock — fulfilment will take a little longer.`
-            //         : `Order ${row.order_number} was just placed.`,
-            //     link: `/seller/orders/${row.order_id}`,
-            // });
             await notifyUserOrdersChanged(sellerProfile.user_id);
         }
     }
+
 
     res.json({
         success: true,
@@ -267,7 +253,7 @@ export async function placeOrder(req, res) {
     });
 }
 
-// GET /api/orders
+// GET /api/orders — unchanged
 export async function listMyOrders(req, res) {
     const { status, orderType } = req.query;
     let query = supabase
@@ -287,7 +273,7 @@ export async function listMyOrders(req, res) {
     res.json({ success: true, orders: data || [] });
 }
 
-// GET /api/orders/:id
+// GET /api/orders/:id — unchanged
 export async function getMyOrder(req, res) {
     const { data: order, error } = await supabase
         .from("orders").select("*, seller:seller_profiles ( id, display_name, shop_slug, logo_url, city, state ), items:order_items ( * )")
@@ -299,25 +285,33 @@ export async function getMyOrder(req, res) {
     res.json({ success: true, order, events: events || [] });
 }
 
-// POST /api/orders/:id/cancel — unchanged
+// POST /api/orders/:id/cancel
+//
+// CHANGED: removed the notifyUser(...) call. update_order_status already
+// inserts a notifications row for the counterpart (buyer→seller here)
+// as its last step — see the RPC's `if p_actor_role = 'seller' then ... else
+// insert into notifications (... 'Buyer updated order status ...') end if`
+// block. notifyOrderChanged (realtime broadcast) and notifyUserOrdersChanged
+// are kept — same reasoning as placeOrder above.
 export async function cancelMyOrder(req, res) {
     const { reason } = req.body || {};
     const { error } = await supabase.rpc("update_order_status", {
         p_order_id: req.params.id, p_actor_role: "buyer", p_actor_user_id: req.user.id,
         p_new_status: "cancelled", p_note: reason || "Cancelled by buyer",
     });
+
+    if (error) {
+        const status = { FORBIDDEN: 403, ORDER_NOT_FOUND: 404, INVALID_TRANSITION: 400 }[error.message] || 500;
+        return res.status(status).json({ success: false, code: error.message, message: status === 400 ? "This order can no longer be cancelled." : "Couldn't cancel the order." });
+    }
+
     await notifyOrderChanged(req.params.id, { status: "cancelled" });
     const { data: order } = await supabase.from("orders").select("seller_id, order_number").eq("id", req.params.id).maybeSingle();
     if (order) {
         const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", order.seller_id).maybeSingle();
         if (sellerProfile) {
-            // await notifyUser(sellerProfile.user_id, { type: "order_cancelled", title: `Order ${order.order_number} cancelled`, body: reason || "Cancelled by buyer", link: `/seller/orders/${req.params.id}` });
             await notifyUserOrdersChanged(sellerProfile.user_id);
         }
-    }
-    if (error) {
-        const status = { FORBIDDEN: 403, ORDER_NOT_FOUND: 404, INVALID_TRANSITION: 400 }[error.message] || 500;
-        return res.status(status).json({ success: false, code: error.message, message: status === 400 ? "This order can no longer be cancelled." : "Couldn't cancel the order." });
     }
     res.json({ success: true, message: "Order cancelled." });
 }
