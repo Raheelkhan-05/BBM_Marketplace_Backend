@@ -121,37 +121,37 @@ function hasRejectedAncestor(level, row) {
 // (hs_generic_product_brands) has the same name/image/is_ai_generated
 // shape as every other level, so it goes through the exact same generic
 // path as category/subcategory/generic_product.
-export async function listCatalogEntries(req, res) {
-    const { level = "all", status = "pending_review", q = "", parentId = "" } = req.query;
-    const levels = level === "all" ? Object.keys(LEVEL_CONFIG) : [level];
-    const parentFieldForFilter = level !== "all" ? LEVEL_PARENT_FIELD[level] : null;
+// export async function listCatalogEntries(req, res) {
+//     const { level = "all", status = "pending_review", q = "", parentId = "" } = req.query;
+//     const levels = level === "all" ? Object.keys(LEVEL_CONFIG) : [level];
+//     const parentFieldForFilter = level !== "all" ? LEVEL_PARENT_FIELD[level] : null;
 
-    try {
-        const results = await Promise.all(
-            levels.map(async (lvl) => {
-                const cfg = LEVEL_CONFIG[lvl];
-                if (!cfg) return [];
-                let query = supabase
-                    .from(cfg.table)
-                    .select(`id, name, image, is_ai_generated, review_status, created_at, rejection_reason${cfg.embed ? `, ${cfg.embed}` : ""}${lvl === "brand_item" ? ", brand_name, images, manufacturer, model_no, grade_variant" : ""}`)
-                    .order("created_at", { ascending: false })
-                    .limit(200);
-                if (status !== "all") query = query.eq("review_status", status);
-                if (q) query = query.ilike("name", `%${q}%`);
-                if (parentId && parentFieldForFilter) query = query.eq(parentFieldForFilter, parentId);
-                const { data, error } = await query;
-                if (error) throw error;
-                return (data || [])
-                    .filter((row) => !hasRejectedAncestor(lvl, row))
-                    .map((row) => ({ ...row, level: lvl }));
-            })
-        );
-        const merged = results.flat().sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-        res.json({ success: true, entries: merged });
-    } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-    }
-}
+//     try {
+//         const results = await Promise.all(
+//             levels.map(async (lvl) => {
+//                 const cfg = LEVEL_CONFIG[lvl];
+//                 if (!cfg) return [];
+//                 let query = supabase
+//                     .from(cfg.table)
+//                     .select(`id, name, image, is_ai_generated, review_status, created_at, rejection_reason${cfg.embed ? `, ${cfg.embed}` : ""}${lvl === "brand_item" ? ", brand_name, images, manufacturer, model_no, grade_variant" : ""}`)
+//                     .order("created_at", { ascending: false })
+//                     .limit(200);
+//                 if (status !== "all") query = query.eq("review_status", status);
+//                 if (q) query = query.ilike("name", `%${q}%`);
+//                 if (parentId && parentFieldForFilter) query = query.eq(parentFieldForFilter, parentId);
+//                 const { data, error } = await query;
+//                 if (error) throw error;
+//                 return (data || [])
+//                     .filter((row) => !hasRejectedAncestor(lvl, row))
+//                     .map((row) => ({ ...row, level: lvl }));
+//             })
+//         );
+//         const merged = results.flat().sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+//         res.json({ success: true, entries: merged });
+//     } catch (error) {
+//         res.status(500).json({ success: false, message: error.message });
+//     }
+// }
 
 // GET /api/admin/catalog/:level/:id
 export async function getCatalogEntry(req, res) {
@@ -206,41 +206,41 @@ export async function getCatalogEntry(req, res) {
 }
 
 // PATCH /api/admin/catalog/:level/:id — save edits without changing review_status
-export async function updateCatalogEntry(req, res) {
-    const { level, id } = req.params;
-    const cfg = cfgFor(level, res);
-    if (!cfg) return;
+// export async function updateCatalogEntry(req, res) {
+//     const { level, id } = req.params;
+//     const cfg = cfgFor(level, res);
+//     if (!cfg) return;
 
-    const body = req.body || {};
-    const update = {};
-    for (const key of cfg.editableFields) if (body[key] !== undefined) update[key] = body[key];
+//     const body = req.body || {};
+//     const update = {};
+//     for (const key of cfg.editableFields) if (body[key] !== undefined) update[key] = body[key];
 
-    // Keep the single `image` cover column in sync whenever `images`
-    // is provided, since every existing reader (tiles, hero sections,
-    // CatalogHierarchySearchPage, etc.) still only knows about `image`.
-    if (Array.isArray(update.images)) {
-        update.image = update.images[0] || null;
-    }
+//     // Keep the single `image` cover column in sync whenever `images`
+//     // is provided, since every existing reader (tiles, hero sections,
+//     // CatalogHierarchySearchPage, etc.) still only knows about `image`.
+//     if (Array.isArray(update.images)) {
+//         update.image = update.images[0] || null;
+//     }
 
-    // specifications is stored as jsonb — strip blank rows so we never
-    // persist { key: "", value: "" } placeholders left over from the
-    // row editor.
-    if (Array.isArray(update.specifications)) {
-        update.specifications = update.specifications.filter((s) => s?.key?.trim());
-    }
+//     // specifications is stored as jsonb — strip blank rows so we never
+//     // persist { key: "", value: "" } placeholders left over from the
+//     // row editor.
+//     if (Array.isArray(update.specifications)) {
+//         update.specifications = update.specifications.filter((s) => s?.key?.trim());
+//     }
 
-    const parentField = LEVEL_PARENT_FIELD[level];
-    if (parentField && body.parentId) update[parentField] = body.parentId;
+//     const parentField = LEVEL_PARENT_FIELD[level];
+//     if (parentField && body.parentId) update[parentField] = body.parentId;
 
-    if (!Object.keys(update).length) return res.status(400).json({ success: false, message: "No editable fields provided." });
+//     if (!Object.keys(update).length) return res.status(400).json({ success: false, message: "No editable fields provided." });
 
-    const { data, error } = await supabase.from(cfg.table).update(update).eq("id", id).select().single();
-    if (error) {
-        if (error.code === "23505") return res.status(409).json({ success: false, message: "That product + brand combo already exists here." });
-        return res.status(500).json({ success: false, message: error.message });
-    }
-    res.json({ success: true, entry: data });
-}
+//     const { data, error } = await supabase.from(cfg.table).update(update).eq("id", id).select().single();
+//     if (error) {
+//         if (error.code === "23505") return res.status(409).json({ success: false, message: "That product + brand combo already exists here." });
+//         return res.status(500).json({ success: false, message: error.message });
+//     }
+//     res.json({ success: true, entry: data });
+// }
 
 
 export async function approveCatalogEntry(req, res) {
@@ -415,71 +415,71 @@ export async function createMappingOption(req, res) {
 // grade_variant (optional) + specifications (optional) + images here;
 // commercial terms are a seller-listing concern, not part of the catalog
 // identity.
-export async function createCatalogEntry(req, res) {
-    const { level } = req.params;
-    const cfg = cfgFor(level, res);
-    if (!cfg) return;
+// export async function createCatalogEntry(req, res) {
+//     const { level } = req.params;
+//     const cfg = cfgFor(level, res);
+//     if (!cfg) return;
 
-    const body = req.body || {};
-    const name = (body.name || "").trim();
-    if (name.length < 2) return res.status(400).json({ success: false, message: "Name must be at least 2 characters." });
+//     const body = req.body || {};
+//     const name = (body.name || "").trim();
+//     if (name.length < 2) return res.status(400).json({ success: false, message: "Name must be at least 2 characters." });
 
-    if ((level === "brand" || level === "brand_item") && !(body.brand_name || "").trim()) {
-        return res.status(400).json({ success: false, message: "Brand name is required." });
-    }
-    if (level === "brand_item" && !(body.manufacturer || "").trim()) {
-        return res.status(400).json({ success: false, message: "Manufacturer is required." });
-    }
-    if (level === "brand_item" && !(body.model_no || "").trim()) {
-        return res.status(400).json({ success: false, message: "Model / Part No. / SKU is required." });
-    }
+//     if ((level === "brand" || level === "brand_item") && !(body.brand_name || "").trim()) {
+//         return res.status(400).json({ success: false, message: "Brand name is required." });
+//     }
+//     if (level === "brand_item" && !(body.manufacturer || "").trim()) {
+//         return res.status(400).json({ success: false, message: "Manufacturer is required." });
+//     }
+//     if (level === "brand_item" && !(body.model_no || "").trim()) {
+//         return res.status(400).json({ success: false, message: "Model / Part No. / SKU is required." });
+//     }
 
-    const parentField = LEVEL_PARENT_FIELD[level];
-    if (parentField && !body.parentId) {
-        return res.status(400).json({ success: false, message: "Select a parent before creating." });
-    }
+//     const parentField = LEVEL_PARENT_FIELD[level];
+//     if (parentField && !body.parentId) {
+//         return res.status(400).json({ success: false, message: "Select a parent before creating." });
+//     }
 
-    const insert = {
-        name,
-        is_ai_generated: false,
-        review_status: "approved",
-        reviewed_at: new Date().toISOString(),
-        reviewed_by: req.user.id,
-    };
-    for (const key of cfg.editableFields) {
-        if (key === "name" || key === "slug") continue;
-        if (body[key] !== undefined && body[key] !== "") insert[key] = body[key];
-    }
-    if (Array.isArray(insert.images) && insert.images.length) {
-        insert.image = insert.images[0];
-    }
-    if (Array.isArray(insert.specifications)) {
-        insert.specifications = insert.specifications.filter((s) => s?.key?.trim());
-    }
+//     const insert = {
+//         name,
+//         is_ai_generated: false,
+//         review_status: "approved",
+//         reviewed_at: new Date().toISOString(),
+//         reviewed_by: req.user.id,
+//     };
+//     for (const key of cfg.editableFields) {
+//         if (key === "name" || key === "slug") continue;
+//         if (body[key] !== undefined && body[key] !== "") insert[key] = body[key];
+//     }
+//     if (Array.isArray(insert.images) && insert.images.length) {
+//         insert.image = insert.images[0];
+//     }
+//     if (Array.isArray(insert.specifications)) {
+//         insert.specifications = insert.specifications.filter((s) => s?.key?.trim());
+//     }
 
-    if (level === "brand" || level === "brand_item") insert.brand_name = body.brand_name.trim();
-    if (level === "brand_item") {
-        insert.manufacturer = body.manufacturer.trim();
-        insert.model_no = body.model_no.trim();
-        if (body.grade_variant !== undefined) insert.grade_variant = body.grade_variant?.trim() || null;
-    }
+//     if (level === "brand" || level === "brand_item") insert.brand_name = body.brand_name.trim();
+//     if (level === "brand_item") {
+//         insert.manufacturer = body.manufacturer.trim();
+//         insert.model_no = body.model_no.trim();
+//         if (body.grade_variant !== undefined) insert.grade_variant = body.grade_variant?.trim() || null;
+//     }
 
-    insert.slug = slugify((body.slug || "").trim() || name);
-    if (parentField) insert[parentField] = body.parentId;
+//     insert.slug = slugify((body.slug || "").trim() || name);
+//     if (parentField) insert[parentField] = body.parentId;
 
-    const { data, error } = await supabase
-        .from(cfg.table)
-        .insert(insert)
-        .select(`*${cfg.embed ? `, ${cfg.embed}` : ""}`)
-        .single();
+//     const { data, error } = await supabase
+//         .from(cfg.table)
+//         .insert(insert)
+//         .select(`*${cfg.embed ? `, ${cfg.embed}` : ""}`)
+//         .single();
 
-    if (error) {
-        if (error.code === "23505") return res.status(409).json({ success: false, message: "A record with that name/brand already exists here." });
-        if (error.code === "23502") return res.status(400).json({ success: false, message: `Missing required field: ${error.column || "unknown"}.` });
-        return res.status(500).json({ success: false, message: error.message });
-    }
-    res.json({ success: true, level, entry: data });
-}
+//     if (error) {
+//         if (error.code === "23505") return res.status(409).json({ success: false, message: "A record with that name/brand already exists here." });
+//         if (error.code === "23502") return res.status(400).json({ success: false, message: `Missing required field: ${error.column || "unknown"}.` });
+//         return res.status(500).json({ success: false, message: error.message });
+//     }
+//     res.json({ success: true, level, entry: data });
+// }
 
 // GET /api/admin/catalog?level=&parentId=&q=
 export async function adminListCatalog(req, res) {
@@ -534,4 +534,73 @@ export async function adminCreateCatalogEntry(req, res) {
         return res.status(500).json({ success: false, message: error.message });
     }
     res.json({ success: true, duplicate: false, entry: data, message: `"${data.name}" created and live immediately.` });
+}
+
+const TABLES = {
+    category: { table: "hs_categories", parentCol: null },
+    subcategory: { table: "hs_subcategories", parentCol: "category_id" },
+    generic_product: { table: "hs_generic_products", parentCol: "subcategory_id" },
+};
+
+// GET /api/admin/catalog?level=category|subcategory|generic_product&parentId=&q=
+export async function listCatalogEntries(req, res) {
+    const { level, parentId, q = "" } = req.query;
+    const cfg = TABLES[level];
+    if (!cfg) return res.status(400).json({ success: false, message: `Invalid level "${level}".` });
+    if (cfg.parentCol && !parentId) return res.status(400).json({ success: false, message: "Missing parentId." });
+
+    let query = supabase.from(cfg.table).select("id, name, review_status").order("name").limit(30);
+    if (cfg.parentCol) query = query.eq(cfg.parentCol, parentId);
+    if (q.trim()) query = query.ilike("name", `%${q.trim()}%`);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    res.json({ success: true, items: data || [] });
+}
+
+// POST /api/admin/catalog/:level  { name, parentId }
+export async function createCatalogEntry(req, res) {
+    const { level } = req.params;
+    const { name, parentId } = req.body || {};
+    const cfg = TABLES[level];
+    if (!cfg) return res.status(400).json({ success: false, message: `Invalid level "${level}".` });
+    const trimmed = (name || "").trim();
+    if (trimmed.length < 2) return res.status(400).json({ success: false, message: "Name is too short." });
+    if (cfg.parentCol && !parentId) return res.status(400).json({ success: false, message: "Missing parentId." });
+
+    // Reuse an existing entry with the same name under the same parent
+    // instead of creating a duplicate.
+    let existingQuery = supabase.from(cfg.table).select("id, name, review_status").ilike("name", trimmed);
+    if (cfg.parentCol) existingQuery = existingQuery.eq(cfg.parentCol, parentId);
+    const { data: existing } = await existingQuery.maybeSingle();
+    if (existing) {
+        return res.json({ success: true, entry: existing, duplicate: true, message: `"${existing.name}" already exists — selected it.` });
+    }
+
+    const row = { name: trimmed, slug: slugify(`${trimmed}-${Date.now()}`), review_status: "approved" };
+    if (cfg.parentCol) row[cfg.parentCol] = parentId;
+
+    const { data: created, error } = await supabase.from(cfg.table).insert(row).select("id, name, review_status").single();
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    res.json({ success: true, entry: created, message: `Created "${created.name}".` });
+}
+
+// PATCH /api/admin/catalog/:level/:id   { parentId }
+// Used to re-parent hs_generic_product_brands (level = "brand_item") onto
+// a generic product — this is what "Fix mapping" ultimately writes.
+export async function updateCatalogEntry(req, res) {
+    const { level, id } = req.params;
+    const { parentId } = req.body || {};
+    if (level !== "brand_item") return res.status(400).json({ success: false, message: `Invalid level "${level}".` });
+    if (!parentId) return res.status(400).json({ success: false, message: "Missing parentId." });
+
+    const { data, error } = await supabase
+        .from("hs_generic_product_brands")
+        .update({ generic_product_id: parentId })
+        .eq("id", id)
+        .select("id, generic_product_id")
+        .maybeSingle();
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    if (!data) return res.status(404).json({ success: false, message: "Brand item not found." });
+    res.json({ success: true, entry: data });
 }

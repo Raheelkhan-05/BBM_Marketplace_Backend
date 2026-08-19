@@ -1,36 +1,33 @@
-// controllers/adminSellerSubmissions.controller.js
+// controllers/adminSellerSubmissions.controller.js — REALIGNED
 //
-// Admin review + edit for seller listings. Rewritten around the full
-// commercial spec now stored on seller_product_submissions (Product /
-// Pricing / Quantity / Packaging / Availability / Delivery / Tax & Legal /
-// Commercial Terms / Quality) — same field set the seller's own listing
-// form (SellerListingForm.jsx) collects. Admin can now see and correct
-// everything a seller filled in, not just the old 5-field shape
-// (price/moq/unit/lead_time/image).
+// This previously targeted an older commercial-spec shape (manufacturer,
+// rate_per_pack, seller_location, dispatch_time_days, gst_registration_status,
+// payment_terms, etc). The seller-facing flow (sellerCatalogListings.controller.js)
+// was rewritten around a different set of columns — this file now matches
+// that schema 1:1, so every field a seller actually submits is visible and
+// editable here, and nothing here silently targets a column that's always null.
 //
-// Product identity (name/brand/images) still lives on the linked brand
-// item (hs_generic_product_brands) and is edited there when it needs to
-// change — this controller edits identity ONLY when the admin explicitly
-// supplies productName/brandName/images, exactly as before.
+// Two things live in different places and this controller writes to both:
+//   1. Commercial-spec fields (pricing, packaging, fulfilment, delivery,
+//      tax, terms, quality, note_to_admin) — on seller_product_submissions,
+//      one row per seller.
+//   2. Product identity + admin-only descriptive fields (name, brand,
+//      images, manufacturer, model/part no., grade/variant, specifications,
+//      description, manufacturing_details) — on the linked brand item
+//      (hs_generic_product_brands), shared across every seller listing it.
 
 import { supabase } from "../config/supabase.js";
 import { notifyUser, notifySellerSubmissionsChanged, notifyAdminSubmissionsChanged } from "../services/notifications.service.js";
 import { computeFinalPrice, computeMarketplaceFigures } from "../services/pricing.service.js";
 
-// See listSubmissionsForBrandItem() at the bottom of this file for the
-// endpoint that powers AdminCatalogDetailPage's new "Seller listings"
-// panel on the brand_item level.
-
-// Full row — every commercial-spec column plus the brand-item embed.
-// Used for the list view (lighter columns) and detail/edit view (full *).
 const BRAND_EMBED = `
     id, price, base_price, gst_percent, moq, unit, lead_time, image, stock_quantity,
-    stock_type, hsn_code, price_validity_till,
+    stock_type, hsn_code, price_basis, gst_inclusive_input, freight_included,
+    dispatch_pincode, note_to_admin,
     review_status, rejection_reason, created_at, updated_at, is_active,
     seller:seller_profiles(id, display_name, user_id),
     brand:hs_generic_product_brands(
         id, name, brand_name, image, images,
-        
         generic_product:hs_generic_products(id, name,
             subcategory:hs_subcategories(id, name, category:hs_categories(id, name))
         )
@@ -39,13 +36,9 @@ const BRAND_EMBED = `
 
 const FULL_DETAIL_EMBED = `*, ${BRAND_EMBED}`;
 
-const GST_REG_STATUSES = ["regular", "composition", "unregistered"];
 const STOCK_TYPES = ["ready_stock", "made_to_order"];
+const PRICE_BASES = ["per_unit", "per_pack", "per_master_pack"];
 
-// Normalizes a row so the frontend (which expects product_name/brand_name/
-// image/generic_product directly on the item) keeps working unchanged,
-// regardless of whether the row uses the new brand-linked shape or an
-// older row that still has its own product_name/brand_name/image set.
 function normalizeSubmission(row) {
     if (!row) return row;
     const brand = row.brand || {};
@@ -56,7 +49,22 @@ function normalizeSubmission(row) {
         image: row.image || brand.image || null,
         images: (brand.images && brand.images.length ? brand.images : (row.image || brand.image ? [row.image || brand.image] : [])),
         generic_product: row.generic_product || brand.generic_product || null,
+        manufacturer: row.manufacturer ?? brand.manufacturer ?? null,
+        model_no: row.model_no ?? brand.model_no ?? null,
+        grade_variant: row.grade_variant ?? brand.grade_variant ?? null,
+        specifications: row.specifications ?? brand.specifications ?? [],
+        description: row.description ?? brand.description ?? null,
+        manufacturing_details: row.manufacturing_details ?? brand.manufacturing_details ?? null,
+        brand_not_applicable: brand.brand_not_applicable ?? false,
     };
+}
+
+async function resolvePolicyText(kind, key) {
+    if (!key) return null;
+    const { data } = await supabase
+        .from("listing_policy_options")
+        .select("full_text").eq("kind", kind).eq("key", key).maybeSingle();
+    return data?.full_text || null;
 }
 
 // GET /api/admin/seller-submissions?status=pending_review&q=
@@ -74,9 +82,6 @@ export async function listSellerSubmissions(req, res) {
 
     let items = (data || []).map(normalizeSubmission);
 
-    // Filtering by product/brand name now has to happen after the join
-    // (can't ilike across a related table in one PostgREST query), so we
-    // filter in memory once rows are normalized.
     if (q.trim()) {
         const term = q.trim().toLowerCase();
         items = items.filter(
@@ -89,8 +94,7 @@ export async function listSellerSubmissions(req, res) {
     res.json({ success: true, items });
 }
 
-// GET /api/admin/seller-submissions/:id — full record (every commercial
-// field), used to power the admin's rich edit view.
+// GET /api/admin/seller-submissions/:id
 export async function getSellerSubmission(req, res) {
     const { id } = req.params;
     const { data, error } = await supabase
@@ -108,25 +112,19 @@ export async function getSellerSubmission(req, res) {
 
 // PATCH /api/admin/seller-submissions/:id
 //
-// Admin can now correct ANY field a seller filled in — not just the old
-// price/moq/unit/lead_time/image shim. Two groups of things get touched:
+// Accepts the SAME camelCase keys the seller's own SellerListingForm posts
+// (basePrice, gstPercent, packSize, masterPackSize, stockType, hsnCode,
+// dispatchPincode, dispatchingLocations, returnPolicyKey, warrantyKey,
+// qualityCertificates, ...) plus identity/admin-only keys (productName,
+// brandName, brandNotApplicable, images, manufacturer, modelNo,
+// gradeVariant, specifications, description, manufacturingDetails).
 //
-//  1. Commercial-spec fields on the submission itself (pricing, quantity,
-//     packaging, availability, delivery, tax & legal, commercial terms,
-//     quality). Accepts the SAME camelCase keys the seller's own form
-//     posts (basePrice, gstPercent, packSize, stockType, hsnCode, etc.)
-//     so the admin edit UI can reuse the same field set 1:1.
-//
-//  2. Product identity (productName/brandName/images), which lives on
-//     the linked brand item (hs_generic_product_brands), not on the
-//     submission — updated there only when those keys are provided.
-//
-// review_status is intentionally never touched here; use approve/reject
-// for that. price is always recomputed from basePrice+gstPercent server
-// side if either is provided, so it can never drift out of sync.
+// review_status is never touched here — use approve/reject for that.
+// price is always recomputed from basePrice+gstPercent when either is
+// provided, so it can never drift.
 export async function updateSellerSubmission(req, res) {
     const { id } = req.params;
-    const body = req.body || {};
+    const b = req.body || {};
 
     const { data: existing, error: fetchErr } = await supabase
         .from("seller_product_submissions")
@@ -136,29 +134,9 @@ export async function updateSellerSubmission(req, res) {
     if (fetchErr) return res.status(500).json({ success: false, message: fetchErr.message });
     if (!existing) return res.status(404).json({ success: false, message: "Not found." });
 
-    // --- legacy flat shim: old admin UI may still post price/leadTime/stock_quantity directly ---
-    const b = { ...body };
-    if (b.price !== undefined && b.basePrice === undefined) {
-        const gstForCalc = b.gstPercent ?? existing.gst_percent ?? 0;
-        b.basePrice = Math.round((Number(b.price) / (1 + Number(gstForCalc) / 100) + Number.EPSILON) * 100) / 100;
-    }
-    if (b.leadTime !== undefined && b.dispatchTimeDays === undefined && b.productionLeadTimeDays === undefined) {
-        const stockType = b.stockType ?? existing.stock_type ?? "ready_stock";
-        if (stockType === "made_to_order") b.productionLeadTimeDays = b.leadTime;
-        else b.dispatchTimeDays = b.leadTime;
-    }
-    if (b.stock_quantity !== undefined && b.stockQuantity === undefined) b.stockQuantity = b.stock_quantity;
-    // --- end shim ---
-
     const submissionUpdate = {};
 
-    // Product
-    if (b.manufacturer !== undefined) submissionUpdate.manufacturer = b.manufacturer?.trim() || null;
-    if (b.modelNo !== undefined) submissionUpdate.model_no = b.modelNo?.trim() || null;
-    if (b.gradeVariant !== undefined) submissionUpdate.grade_variant = b.gradeVariant?.trim() || null;
-    if (b.specifications !== undefined) submissionUpdate.specifications = Array.isArray(b.specifications) ? b.specifications.filter((s) => s?.key?.trim()) : [];
-
-    // Pricing — basePrice/gstPercent drive the canonical `price` too
+    // Pricing
     const nextBasePrice = b.basePrice !== undefined ? Number(b.basePrice) : existing.base_price;
     const nextGstPercent = b.gstPercent !== undefined ? Number(b.gstPercent) : existing.gst_percent;
     if (b.basePrice !== undefined || b.gstPercent !== undefined) {
@@ -166,72 +144,86 @@ export async function updateSellerSubmission(req, res) {
         submissionUpdate.gst_percent = nextGstPercent;
         submissionUpdate.price = computeFinalPrice(nextBasePrice, nextGstPercent);
     }
-    if (b.ratePerPack !== undefined) submissionUpdate.rate_per_pack = b.ratePerPack === "" || b.ratePerPack == null ? null : Number(b.ratePerPack);
-    if (b.ratePerMasterPack !== undefined) submissionUpdate.rate_per_master_pack = b.ratePerMasterPack === "" || b.ratePerMasterPack == null ? null : Number(b.ratePerMasterPack);
-    if (b.priceValidityTill !== undefined) submissionUpdate.price_validity_till = b.priceValidityTill || null;
+    if (b.priceBasis !== undefined) {
+        if (!PRICE_BASES.includes(b.priceBasis)) return res.status(400).json({ success: false, message: "Invalid price basis." });
+        submissionUpdate.price_basis = b.priceBasis;
+    }
+    if (b.gstInclusive !== undefined) submissionUpdate.gst_inclusive_input = Boolean(b.gstInclusive);
+    if (b.freightIncluded !== undefined) submissionUpdate.freight_included = Boolean(b.freightIncluded);
 
-    // Quantity
-    if (b.moq !== undefined) submissionUpdate.moq = Number(b.moq);
+    // Sample
     if (b.sampleAvailable !== undefined) submissionUpdate.sample_available = Boolean(b.sampleAvailable);
-    if (b.samplePrice !== undefined) submissionUpdate.sample_price = b.samplePrice === "" || b.samplePrice == null ? null : Number(b.samplePrice);
-    if (b.priceSlabs !== undefined) submissionUpdate.price_slabs = Array.isArray(b.priceSlabs) ? b.priceSlabs.filter((s) => s?.minQty) : [];
-    if (b.quantityDiscounts !== undefined) submissionUpdate.quantity_discounts = Array.isArray(b.quantityDiscounts) ? b.quantityDiscounts.filter((s) => s?.minQty) : [];
+    if (b.sampleQuantity !== undefined) submissionUpdate.sample_quantity = b.sampleQuantity === "" || b.sampleQuantity == null ? null : Number(b.sampleQuantity);
+    if (b.sampleUnitBasis !== undefined) submissionUpdate.sample_unit_basis = b.sampleUnitBasis || null;
+
+    // Discount slabs — the live column is quantity_discounts (price_slabs
+    // is left empty by the current seller form; kept untouched here too).
+    if (b.priceSlabs !== undefined) {
+        submissionUpdate.quantity_discounts = Array.isArray(b.priceSlabs) ? b.priceSlabs.filter((s) => s?.minQty && s?.discountPercent) : [];
+    }
 
     // Packaging
-    if (b.packSize !== undefined) submissionUpdate.pack_size = Number(b.packSize);
     if (b.unit !== undefined) submissionUpdate.unit = b.unit;
-    if (b.unitsPerMasterPack !== undefined) submissionUpdate.units_per_master_pack = b.unitsPerMasterPack === "" || b.unitsPerMasterPack == null ? null : Number(b.unitsPerMasterPack);
-    if (b.masterPackSize !== undefined) submissionUpdate.master_pack_size = b.masterPackSize === "" || b.masterPackSize == null ? null : Number(b.masterPackSize);
-    if (b.packagingType !== undefined) submissionUpdate.packaging_type = b.packagingType?.trim() || null;
+    if (b.packSize !== undefined) submissionUpdate.pack_size = Number(b.packSize);
+    if (b.masterPackSize !== undefined) submissionUpdate.units_per_master_pack = b.masterPackSize === "" || b.masterPackSize == null ? null : Number(b.masterPackSize);
+    if (b.moq !== undefined) submissionUpdate.moq = Number(b.moq);
 
-    // Availability — lead_time (buyer-facing) recomputed alongside stock fields
+    // Fulfilment
     const nextStockType = b.stockType !== undefined ? b.stockType : existing.stock_type;
-    if (b.stockQuantity !== undefined) submissionUpdate.stock_quantity = b.stockQuantity === "" || b.stockQuantity == null ? null : Number(b.stockQuantity);
     if (b.stockType !== undefined) {
         if (!STOCK_TYPES.includes(b.stockType)) return res.status(400).json({ success: false, message: "Invalid stock type." });
         submissionUpdate.stock_type = b.stockType;
     }
-    if (b.dispatchTimeDays !== undefined) submissionUpdate.dispatch_time_days = b.dispatchTimeDays === "" || b.dispatchTimeDays == null ? null : Number(b.dispatchTimeDays);
+    if (b.stockQuantity !== undefined) submissionUpdate.stock_quantity = b.stockQuantity === "" || b.stockQuantity == null ? null : Number(b.stockQuantity);
     if (b.productionLeadTimeDays !== undefined) submissionUpdate.production_lead_time_days = b.productionLeadTimeDays === "" || b.productionLeadTimeDays == null ? null : Number(b.productionLeadTimeDays);
-    if (b.dispatchTimeDays !== undefined || b.productionLeadTimeDays !== undefined || b.stockType !== undefined) {
-        const effectiveDispatch = b.dispatchTimeDays !== undefined ? b.dispatchTimeDays : existing.dispatch_time_days;
+    if (b.stockType !== undefined || b.productionLeadTimeDays !== undefined) {
         const effectiveProduction = b.productionLeadTimeDays !== undefined ? b.productionLeadTimeDays : existing.production_lead_time_days;
-        submissionUpdate.lead_time = Number(nextStockType === "made_to_order" ? (effectiveProduction || 0) : (effectiveDispatch || 0));
+        submissionUpdate.lead_time = nextStockType === "made_to_order" ? Number(effectiveProduction || 0) : 0;
     }
 
     // Delivery
-    if (b.sellerLocation !== undefined) submissionUpdate.seller_location = b.sellerLocation?.trim() || null;
-    if (b.dispatchLocation !== undefined) submissionUpdate.dispatch_location = b.dispatchLocation?.trim() || null;
-    if (b.deliveryTimeline !== undefined) submissionUpdate.delivery_timeline = b.deliveryTimeline?.trim() || null;
-    if (b.freightTerms !== undefined) submissionUpdate.freight_terms = b.freightTerms?.trim() || null;
-
-    // Tax & Legal
-    if (b.hsnCode !== undefined) submissionUpdate.hsn_code = b.hsnCode?.trim() || null;
-    if (b.gstRegistrationStatus !== undefined) {
-        if (!GST_REG_STATUSES.includes(b.gstRegistrationStatus)) return res.status(400).json({ success: false, message: "Invalid GST registration status." });
-        submissionUpdate.gst_registration_status = b.gstRegistrationStatus;
+    if (b.dispatchPincode !== undefined) submissionUpdate.dispatch_pincode = b.dispatchPincode?.trim() || null;
+    if (b.dispatchDistrict !== undefined) submissionUpdate.dispatch_district = b.dispatchDistrict?.trim() || null;
+    if (b.dispatchState !== undefined) submissionUpdate.dispatch_state = b.dispatchState?.trim() || null;
+    if (b.dispatchingLocations !== undefined) {
+        submissionUpdate.dispatching_locations = Array.isArray(b.dispatchingLocations) ? b.dispatchingLocations : [];
     }
-    if (b.taxInvoiceAvailable !== undefined) submissionUpdate.tax_invoice_available = Boolean(b.taxInvoiceAvailable);
 
-    // Commercial terms
-    if (b.paymentTerms !== undefined) submissionUpdate.payment_terms = b.paymentTerms?.trim() || null;
-    if (b.returnPolicy !== undefined) submissionUpdate.return_policy = b.returnPolicy?.trim() || null;
-    if (b.warranty !== undefined) submissionUpdate.warranty = b.warranty?.trim() || null;
+    // Tax
+    if (b.hsnCode !== undefined) submissionUpdate.hsn_code = b.hsnCode?.trim() || null;
+
+    // Terms — canonical key + resolved free text, kept in sync (matches
+    // how the seller's own submission endpoint resolves these on create).
+    if (b.returnPolicyKey !== undefined) {
+        submissionUpdate.return_policy_key = b.returnPolicyKey || null;
+        submissionUpdate.return_policy = await resolvePolicyText("return_policy", b.returnPolicyKey);
+    }
+    if (b.warrantyKey !== undefined) {
+        submissionUpdate.warranty_key = b.warrantyKey || null;
+        submissionUpdate.warranty = await resolvePolicyText("warranty", b.warrantyKey);
+    }
 
     // Quality
-    if (b.qualityCertificates !== undefined) submissionUpdate.quality_certificates = Array.isArray(b.qualityCertificates) ? b.qualityCertificates.filter((c) => c?.url) : [];
-    if (b.tdsMsdsCoa !== undefined) submissionUpdate.tds_msds_coa = Array.isArray(b.tdsMsdsCoa) ? b.tdsMsdsCoa.filter((c) => c?.url) : [];
-    if (b.otherCertifications !== undefined) submissionUpdate.other_certifications = Array.isArray(b.otherCertifications) ? b.otherCertifications.filter((c) => c?.url) : [];
+    if (b.qualityCertificates !== undefined) {
+        submissionUpdate.quality_certificates = Array.isArray(b.qualityCertificates) ? b.qualityCertificates.filter((c) => c?.url) : [];
+    }
 
-    // --- product identity lives on the linked brand item, not here ---
+    // --- product / brand-item identity + admin-only descriptive fields ---
     const brandUpdate = {};
     if (b.productName !== undefined) brandUpdate.name = b.productName.trim();
-    if (b.brandName !== undefined) brandUpdate.brand_name = b.brandName.trim();
+    if (b.brandNotApplicable !== undefined) brandUpdate.brand_not_applicable = Boolean(b.brandNotApplicable);
+    if (b.brandName !== undefined) brandUpdate.brand_name = b.brandNotApplicable ? null : (b.brandName?.trim() || null);
     if (Array.isArray(b.images)) {
         brandUpdate.images = b.images;
         brandUpdate.image = b.images[0] || null;
         submissionUpdate.image = b.images[0] || null; // keep the submission's cover in sync too
     }
+    if (b.manufacturer !== undefined) brandUpdate.manufacturer = b.manufacturer?.trim() || null;
+    if (b.modelNo !== undefined) brandUpdate.model_no = b.modelNo?.trim() || null;
+    if (b.gradeVariant !== undefined) brandUpdate.grade_variant = b.gradeVariant?.trim() || null;
+    if (b.specifications !== undefined) brandUpdate.specifications = Array.isArray(b.specifications) ? b.specifications.filter((s) => s?.key?.trim()) : [];
+    if (b.description !== undefined) brandUpdate.description = b.description?.trim() || null;
+    if (b.manufacturingDetails !== undefined) brandUpdate.manufacturing_details = b.manufacturingDetails?.trim() || null;
 
     if (!Object.keys(submissionUpdate).length && !Object.keys(brandUpdate).length) {
         return res.status(400).json({ success: false, message: "No editable fields provided." });
@@ -291,7 +283,8 @@ export async function approveSellerSubmission(req, res) {
     if (!existing.brand?.generic_product?.id) {
         return res.status(400).json({
             success: false,
-            message: "This item's category hasn't been mapped yet. Map it from Admin → Catalog → this brand item first.",
+            message: "This item's category hasn't been mapped yet. Map it below (Hierarchy mapping), then approve again.",
+            code: "NOT_MAPPED",
         });
     }
     const { data, error } = await supabase
@@ -302,9 +295,6 @@ export async function approveSellerSubmission(req, res) {
         .single();
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    // Approving the listing is what makes any newly-proposed hierarchy
-    // nodes "real" — cascade top-down so buyer-facing browse (which only
-    // reads approved rows) picks the whole chain up in one shot.
     const now = new Date().toISOString();
     const cat = existing.brand?.generic_product?.subcategory?.category;
     const sub = existing.brand?.generic_product?.subcategory;
@@ -337,7 +327,7 @@ export async function approveSellerSubmission(req, res) {
         });
         await notifySellerSubmissionsChanged(existing.seller.user_id);
     }
-    await notifyAdminSubmissionsChanged(); // so other open admin tabs drop this from "Pending" live
+    await notifyAdminSubmissionsChanged();
     res.json({ success: true, submission: normalizeSubmission(data) });
 }
 
@@ -379,12 +369,6 @@ export async function rejectSellerSubmission(req, res) {
 }
 
 // GET /api/admin/seller-submissions/by-brand-item/:brandItemId
-//
-// Powers the "Seller listings" panel on AdminCatalogDetailPage for
-// level === "brand_item". Since commercial terms live entirely on
-// seller_product_submissions (not on hs_generic_product_brands itself),
-// this is how an admin editing a brand item's identity discovers who's
-// actually selling it and jumps to their full commercial-spec edit.
 export async function listSubmissionsForBrandItem(req, res) {
     const { brandItemId } = req.params;
     const { data, error } = await supabase

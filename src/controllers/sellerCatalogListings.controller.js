@@ -1,4 +1,16 @@
 // controllers/sellerCatalogListings.controller.js — REWRITTEN
+//
+// FIX (this pass): createSubmission's admin notification for a brand-new
+// product used to link to /admin/catalog/brand_item/:id. Approving there
+// only flips the brand item's own review_status — it never touches the
+// seller_product_submissions row that actually carries price/MOQ/etc. and
+// makes a seller show up as available to buy from. That meant every
+// brand-new submission needed two separate admin trips: one to map +
+// "approve" the catalog node, then a second to find the listing under
+// "New listing submission" and approve THAT. Both notification paths now
+// point at the same place — /admin/listings — which already has
+// inline hierarchy mapping and refuses to approve until that mapping
+// exists, so one visit is enough.
 import { supabase } from "../config/supabase.js";
 import { notifyAdmins, notifyAdminSubmissionsChanged } from "../services/notifications.service.js";
 import { slugify } from "../services/slugify.js";
@@ -14,14 +26,9 @@ export const ALLOWED_UNITS = [
 const STOCK_TYPES = ["ready_stock", "made_to_order"];
 const PRICE_BASES = ["per_unit", "per_pack", "per_master_pack"];
 const GROUP_FIELD_MAP = {
-    // dispatch group now carries pincode + the locations tree, alongside
-    // the seller's usual delivery defaults.
     delivery: ["dispatchPincode", "dispatchingLocations", "freightIncluded"],
 };
 
-// Columns returned for the seller's own submissions list / detail views.
-// Kept explicit (rather than "*") so we control payload size and don't leak
-// anything unexpected if columns get added later.
 const SUBMISSION_LIST_COLUMNS = `
     id, created_at, updated_at, review_status, rejection_reason,
     reviewed_at, is_active, generic_product_brand_id,
@@ -52,9 +59,6 @@ async function autoSaveDeliveryDefaults(sellerId, body) {
 
 /* ------------------------- brand resolution ------------------------- */
 
-// Three paths: reuse an existing named brand, create a new named brand
-// (optionally with brand_image), or mark brand_not_applicable=true.
-// generic_product_id is intentionally NULL here — admin maps it later.
 async function resolveOrCreateBrandItem({ productName, brandName, brandImage, brandNotApplicable, images }) {
     const trimmedProduct = productName.trim();
 
@@ -80,9 +84,6 @@ async function resolveOrCreateBrandItem({ productName, brandName, brandImage, br
 
     const trimmedBrand = brandName.trim();
 
-    // Reuse: same product name + same brand name, still unmapped
-    // (generic_product_id null) or already mapped — either way, if it
-    // matches exactly, don't fork a duplicate identity.
     const { data: existing } = await supabase
         .from("hs_generic_product_brands")
         .select("id, name, brand_name")
@@ -162,16 +163,13 @@ function toListingRow(body) {
     );
     const effectiveLeadTime = body.stockType === "made_to_order"
         ? Number(body.productionLeadTimeDays || 0)
-        : Number(body.dispatchTimeDays || 0); // dispatch time optional/legacy; defaults 0 if unused
+        : Number(body.dispatchTimeDays || 0);
     const images = Array.isArray(body.images) ? body.images : [];
 
     return {
-        // identity — was missing before, which left these columns null on
-        // every insert/update and broke the seller's own submissions list.
         product_name: body.productName?.trim() || null,
         brand_name: body.brandNotApplicable ? null : (body.brandName?.trim() || null),
 
-        // canonical buyer-facing (unchanged shape for every existing reader)
         price: finalPricePerUnit,
         base_price: basePricePerUnit,
         moq: Number(body.moq),
@@ -180,47 +178,36 @@ function toListingRow(body) {
         image: images[0] || null,
         stock_quantity: body.stockType === "ready_stock" && body.stockQuantity !== "" ? Number(body.stockQuantity) : null,
 
-        // pricing basis / GST handling
         gst_percent: Number(body.gstPercent),
         price_basis: body.priceBasis,
         gst_inclusive_input: Boolean(body.gstInclusive),
         freight_included: Boolean(body.freightIncluded),
 
-        // packaging
         pack_size: Number(body.packSize),
         units_per_master_pack: Number(body.masterPackSize),
 
-        // sample
         sample_available: Boolean(body.sampleAvailable),
         sample_quantity: body.sampleAvailable ? Number(body.sampleQuantity) : null,
         sample_unit_basis: body.sampleAvailable ? body.sampleUnitBasis : null,
 
-        // discount slabs (reuse existing price_slabs/quantity_discounts columns)
         price_slabs: [],
         quantity_discounts: Array.isArray(body.priceSlabs) ? body.priceSlabs.filter((s) => s?.minQty && s?.discountPercent) : [],
 
-
-        // fulfilment
         stock_type: body.stockType,
         production_lead_time_days: body.stockType === "made_to_order" ? Number(body.productionLeadTimeDays) : null,
 
-        // delivery
         dispatch_district: body.dispatchDistrict?.trim() || null,
         dispatch_state: body.dispatchState?.trim() || null,
         dispatch_pincode: body.dispatchPincode?.trim() || null,
         dispatching_locations: Array.isArray(body.dispatchingLocations) ? body.dispatchingLocations : [],
 
-        // tax
         hsn_code: body.hsnCode?.trim() || null,
 
-        // policies — key is canonical, full_text resolved server-side (see resolvePolicyText)
         return_policy_key: body.returnPolicyKey,
         warranty_key: body.warrantyKey,
 
-        // admin note
         note_to_admin: body.noteToAdmin?.trim() || null,
 
-        // quality
         quality_certificates: Array.isArray(body.qualityCertificates) ? body.qualityCertificates.filter((c) => c?.url) : [],
     };
 }
@@ -270,7 +257,7 @@ export async function createSubmission(req, res) {
         resolvePolicyText("return_policy", body.returnPolicyKey),
         resolvePolicyText("warranty", body.warrantyKey),
     ]);
-    row.return_policy = returnText; // keep legacy free-text column in sync for existing readers (BuyNowModal etc.)
+    row.return_policy = returnText;
     row.warranty = warrantyText;
 
     let inserted, error;
@@ -292,11 +279,15 @@ export async function createSubmission(req, res) {
 
     await autoSaveDeliveryDefaults(sellerId, body);
 
+    // Single admin entry point for every submission, new-brand or not: the
+    // Listings review page, never the catalog page. Hierarchy mapping now
+    // happens inline there, and approval is server-side blocked until it's
+    // done — so this is the only notification, and the only trip needed.
     await notifyAdmins({
         type: "seller_submission",
-        title: existingRow ? "Listing resubmitted for review" : "New product submission",
-        message: `${brand.brand_name || "(No brand)"} — ${brand.name} ${existingRow ? "was resubmitted after rejection" : "needs category mapping and review"}.`,
-        link: `/admin/catalog/brand_item/${brand.id}`,
+        title: existingRow ? "Listing resubmitted for review" : "New listing submitted",
+        message: `${brand.brand_name || "(No brand)"} — ${brand.name} ${existingRow ? "was resubmitted after rejection" : "is a brand-new product — map it to a category before approving"}.`,
+        link: `/admin/listings?highlight=${inserted.id}`,
     });
     await notifyAdminSubmissionsChanged();
 
@@ -304,13 +295,11 @@ export async function createSubmission(req, res) {
     res.json({ success: true, submission: inserted, marketplace, message: "Submitted for review. We'll notify you once it's approved." });
 }
 
-// GET /api/seller/catalog/commission-info (unchanged)
+// GET /api/seller/catalog/commission-info
 export async function getCommissionInfo(req, res) {
     const commissionPercent = await getCommissionPercent();
     res.json({ success: true, commissionPercent });
 }
-
-// controllers/sellerCatalogListings.controller.js — REPLACE createListingForExistingBrand
 
 export async function createListingForExistingBrand(req, res) {
     const sellerId = req.sellerId;
@@ -326,7 +315,6 @@ export async function createListingForExistingBrand(req, res) {
     if (!brand) return res.status(400).json({ success: false, message: "That item wasn't found." });
     if (brand.review_status !== "approved") return res.status(400).json({ success: false, message: "This item isn't available to list under yet." });
 
-    // Identity comes from the brand row, not the client — same guarantee as before.
     const merged = { ...body, productName: brand.name, brandName: brand.brand_name, images: brand.images?.length ? brand.images : (brand.image ? [brand.image] : []) };
 
     const missing = validateListingPayload(merged).filter((m) => !["Product name", "Brand", "Product image"].includes(m));
@@ -363,11 +351,14 @@ export async function createListingForExistingBrand(req, res) {
     }
 
     await autoSaveDeliveryDefaults(sellerId, body);
+    // Already-approved brand item, so no mapping step is needed here — but
+    // still funnels through the same single review page as every other
+    // submission notification, for one consistent admin workflow.
     await notifyAdmins({
         type: "seller_submission",
         title: existingRow ? "Listing resubmitted for review" : "New listing submitted",
         message: existingRow ? `A seller resubmitted "${brand.name}" after rejection.` : `A seller wants to list "${brand.name}".`,
-        link: `/admin/seller-submissions?highlight=${result.id}`,
+        link: `/admin/listings?highlight=${result.id}`,
     });
     await notifyAdminSubmissionsChanged();
 
@@ -377,9 +368,6 @@ export async function createListingForExistingBrand(req, res) {
 
 /* ------------------------- list / detail / update / active ------------------------- */
 
-// GET /api/seller/catalog/submissions
-// Optional query params: status=pending_review|approved|rejected, is_active=true|false,
-// page (1-based, default 1), pageSize (default 20, max 100).
 export async function listMySubmissions(req, res) {
     const sellerId = req.sellerId;
     const { status, is_active } = req.query;
@@ -410,8 +398,6 @@ export async function listMySubmissions(req, res) {
     const { data, error, count } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    // Frontend (SellerManageListingsPage) expects `items` and a `brand`
-    // key per row, not the raw supabase join name.
     const items = (data || []).map(({ hs_generic_product_brands, ...rest }) => ({
         ...rest,
         brand: hs_generic_product_brands || null,
@@ -424,7 +410,6 @@ export async function listMySubmissions(req, res) {
     });
 }
 
-// GET /api/seller/catalog/submissions/:id
 export async function getSubmissionDetail(req, res) {
     const sellerId = req.sellerId;
     const { id } = req.params;
@@ -445,32 +430,66 @@ export async function getSubmissionDetail(req, res) {
     res.json({ success: true, submission });
 }
 
-// PATCH /api/seller/catalog/submissions/:id
-// Sellers can edit their own submission. Any edit (other than toggling
-// is_active, which has its own endpoint) sends it back to pending_review,
-// mirroring the resubmission-after-rejection behaviour above.
 export async function updateSubmission(req, res) {
     const sellerId = req.sellerId;
     const { id } = req.params;
     const body = req.body || {};
 
+    // Fetch the FULL existing row, not just identity columns — we need
+    // every field as a fallback so a partial PATCH (e.g. the row-level
+    // "Resubmit" quick-edit, which only sends price/moq/lead_time/stock)
+    // doesn't get rejected for "missing" fields that are already saved.
     const { data: existing, error: fetchErr } = await supabase
         .from("seller_product_submissions")
-        .select("id, review_status, product_name, brand_name, image")
+        .select("*")
         .eq("id", id).eq("seller_id", sellerId).maybeSingle();
     if (fetchErr) return res.status(500).json({ success: false, message: fetchErr.message });
     if (!existing) return res.status(404).json({ success: false, message: "Submission not found." });
 
-    // Identity fields (product/brand/images) aren't editable here — that
-    // would mean re-resolving hs_generic_product_brands, which is out of
-    // scope for a simple listing edit. Merge in the stored identity so
-    // validation has what it needs.
+    // Build the payload validateListingPayload/toListingRow expect,
+    // preferring anything explicitly sent in `body`, and otherwise
+    // falling back to what's already saved on the row. This makes the
+    // endpoint behave like a real PATCH (partial update) instead of
+    // requiring the entire form on every call.
     const merged = {
-        ...body,
         productName: existing.product_name,
         brandName: existing.brand_name,
-        images: Array.isArray(body.images) && body.images.length ? body.images : [existing.image].filter(Boolean),
         brandNotApplicable: !existing.brand_name,
+        images: Array.isArray(body.images) && body.images.length ? body.images : [existing.image].filter(Boolean),
+
+        unit: body.unit ?? existing.unit,
+        packSize: body.packSize ?? existing.pack_size,
+        masterPackSize: body.masterPackSize ?? existing.units_per_master_pack,
+        moq: body.moq ?? existing.moq,
+        hsnCode: body.hsnCode ?? existing.hsn_code,
+        gstPercent: body.gstPercent ?? existing.gst_percent,
+
+        basePrice: body.basePrice ?? existing.base_price,
+        priceBasis: body.priceBasis ?? existing.price_basis,
+        gstInclusive: body.gstInclusive ?? existing.gst_inclusive_input,
+        freightIncluded: body.freightIncluded ?? existing.freight_included,
+
+        sampleAvailable: body.sampleAvailable ?? existing.sample_available,
+        sampleQuantity: body.sampleQuantity ?? existing.sample_quantity,
+        sampleUnitBasis: body.sampleUnitBasis ?? existing.sample_unit_basis,
+
+        priceSlabs: body.priceSlabs ?? existing.quantity_discounts,
+
+        stockType: body.stockType ?? existing.stock_type,
+        stockQuantity: body.stockQuantity ?? existing.stock_quantity,
+        productionLeadTimeDays: body.productionLeadTimeDays ?? existing.production_lead_time_days,
+        dispatchTimeDays: body.dispatchTimeDays ?? existing.dispatch_time_days,
+
+        dispatchPincode: body.dispatchPincode ?? existing.dispatch_pincode,
+        dispatchDistrict: body.dispatchDistrict ?? existing.dispatch_district,
+        dispatchState: body.dispatchState ?? existing.dispatch_state,
+        dispatchingLocations: body.dispatchingLocations ?? existing.dispatching_locations,
+
+        returnPolicyKey: body.returnPolicyKey ?? existing.return_policy_key,
+        warrantyKey: body.warrantyKey ?? existing.warranty_key,
+
+        noteToAdmin: body.noteToAdmin ?? existing.note_to_admin,
+        qualityCertificates: body.qualityCertificates ?? existing.quality_certificates,
     };
 
     const missing = validateListingPayload(merged).filter((m) => !["Product name", "Brand", "Product image"].includes(m));
@@ -478,8 +497,8 @@ export async function updateSubmission(req, res) {
 
     const row = toListingRow(merged);
     const [returnText, warrantyText] = await Promise.all([
-        resolvePolicyText("return_policy", body.returnPolicyKey),
-        resolvePolicyText("warranty", body.warrantyKey),
+        resolvePolicyText("return_policy", merged.returnPolicyKey),
+        resolvePolicyText("warranty", merged.warrantyKey),
     ]);
     row.return_policy = returnText;
     row.warranty = warrantyText;
@@ -497,7 +516,7 @@ export async function updateSubmission(req, res) {
         type: "seller_submission",
         title: "Listing edited and resubmitted for review",
         message: `${existing.brand_name || "(No brand)"} — ${existing.product_name} was edited and needs review.`,
-        link: `/admin/seller-submissions?highlight=${updated.id}`,
+        link: `/admin/listings?highlight=${updated.id}`,
     });
     await notifyAdminSubmissionsChanged();
 
@@ -505,8 +524,6 @@ export async function updateSubmission(req, res) {
     res.json({ success: true, submission: updated, marketplace, message: "Changes submitted for review." });
 }
 
-// PATCH /api/seller/catalog/submissions/:id/active
-// Toggle visibility of an already-approved listing without touching review status.
 export async function setSubmissionActive(req, res) {
     const sellerId = req.sellerId;
     const { id } = req.params;
@@ -527,7 +544,6 @@ export async function setSubmissionActive(req, res) {
     res.json({ success: true, submission: updated, message: isActive ? "Listing is now active." : "Listing is now inactive." });
 }
 
-// DELETE /api/seller/catalog/submissions/:id
 export async function deleteSubmission(req, res) {
     const sellerId = req.sellerId;
     const { id } = req.params;
