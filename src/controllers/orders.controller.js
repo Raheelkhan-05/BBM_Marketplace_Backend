@@ -18,6 +18,7 @@
 // reproduced below only for completeness so this is a drop-in replacement.
 import { supabase } from "../config/supabase.js";
 import { notifyOrderChanged, notifyUser, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
+import { getRoadDistanceKm } from "../services/pincodeDistance.js";
 
 const ERROR_MAP = {
     LISTING_NOT_FOUND: { status: 404, message: "That listing is no longer available." },
@@ -43,12 +44,12 @@ function formatDDMon(date) {
 // Rough zone-to-zone transit day estimates based on PIN code first digit
 // (1=Delhi/N, 2=Punjab/Haryana/UP-W, 3=Rajasthan/Gujarat, 4=Maharashtra/MP,
 //  5=AP/Karnataka, 6=TN/Kerala, 7=WB/Odisha/NE, 8=Bihar/Jharkhand, 9=Army PO)
-function estimateDeliveryDate(submission, buyerPincode, buyerState) {
+async function estimateDeliveryDate(submission, buyerPincode, buyerState) {
     const leadDays = submission.stock_type === "made_to_order"
         ? Number(submission.production_lead_time_days || 0)
         : Number(submission.dispatch_time_days ?? submission.lead_time ?? 0);
 
-    const transitDays = estimateTransitDays(
+    const transitDays = await estimateTransitDays(
         submission.dispatch_pincode,
         submission.dispatch_state,
         buyerPincode,
@@ -60,37 +61,46 @@ function estimateDeliveryDate(submission, buyerPincode, buyerState) {
     return { date, label: formatDDMon(date), leadDays, transitDays };
 }
 
-function estimateTransitDays(originPincode, originState, destPincode, destState) {
+function estimateTransitDaysByZone(originPincode, originState, destPincode, destState) {
     if (!originPincode || !destPincode) return 4; // unknown -> conservative fallback
 
     const originPrefix3 = originPincode.slice(0, 3);
     const destPrefix3 = destPincode.slice(0, 3);
-
-    // Same local delivery zone (~city/nearby town) -> same-day/next-day
     if (originPrefix3 === destPrefix3) return 1;
+
+    const sameState = originState && destState &&
+        originState.trim().toLowerCase() === destState.trim().toLowerCase();
+    if (sameState) return 2;
 
     const originZone = Number(originPincode[0]);
     const destZone = Number(destPincode[0]);
-    const sameState = originState && destState &&
-        originState.trim().toLowerCase() === destState.trim().toLowerCase();
-
-    // Same state, different city -> typically overnight to 1 day road transit
-    if (sameState) return 2;
-
     const zoneDiff = Math.abs(originZone - destZone);
 
-    // Neighbouring zone (e.g. Maharashtra <-> Gujarat) -> ~1 day road transit,
-    // matches Mumbai -> Rajkot (~700km / ~15hrs) real-world case
-    if (zoneDiff <= 1) return 2;
+    if (zoneDiff <= 1) return 3;
+    if (zoneDiff === 2) return 4;
+    return 5;
+}
 
-    // 2 zones apart -> ~2 days transit
-    if (zoneDiff === 2) return 3;
+async function estimateTransitDays(originPincode, originState, destPincode, destState) {
+    const originPrefix3 = originPincode?.slice(0, 3);
+    const destPrefix3 = destPincode?.slice(0, 3);
+    if (originPrefix3 && originPrefix3 === destPrefix3) return 1; // same local zone, skip distance lookup
 
-    // 3 zones apart -> ~3 days transit
-    if (zoneDiff === 3) return 4;
+    const km = await getRoadDistanceKm(originPincode, destPincode);
+    if (km == null) {
+        // pincode not in our geo table (rare, or missing data) — fall back
+        // to the old state/zone heuristic rather than guessing wildly
+        return estimateTransitDaysByZone(originPincode, originState, destPincode, destState);
+    }
 
-    // Far corners of the country (e.g. Gujarat <-> NE) -> ~4-5 days
-    return zoneDiff >= 5 ? 6 : 5;
+    // Bands roughly matched to surface-freight transit times: local
+    // trucking ~500-600km/day achievable, but pickup/linehaul/last-mile
+    // handoffs add a floor even for short hops.
+    if (km <= 150) return 1;
+    if (km <= 500) return 2;
+    if (km <= 1000) return 3;
+    if (km <= 1800) return 4;
+    return 5;
 }
 
 function toBaseUnits(submission, quantity, purchaseBasis) {
@@ -165,7 +175,7 @@ export async function getOrderQuote(req, res) {
         const { data: addr } = await supabase.from("buyer_addresses").select("pincode, state").eq("id", addressId).maybeSingle();
         if (addr) { addressPincode = addr.pincode; addressState = addr.state; }
     }
-    const delivery = estimateDeliveryDate(submission, addressPincode, addressState);
+    const delivery = await estimateDeliveryDate(submission, addressPincode, addressState);
 
     if (isSample) {
         if (!submission.sample_available) return res.status(400).json({ success: false, message: "This seller doesn't offer a sample for this item." });
@@ -254,11 +264,10 @@ export async function placeOrder(req, res) {
     });
 
     if (error) {
-        console.error("place_order RPC failed:", error); // check .message, .details, .hint, .code in your terminal
+        console.error("place_order RPC failed:", error);
         const mapped = mapRpcError(error);
         return res.status(mapped.status).json({ success: false, code: error.message, message: mapped.message });
     }
-
 
     const row = Array.isArray(data) ? data[0] : data;
     if (!row) {
@@ -266,9 +275,6 @@ export async function placeOrder(req, res) {
         return res.status(500).json({ success: false, message: "Couldn't place the order — please try again." });
     }
 
-    // Realtime broadcast only — NOT a notifications-table insert, so this
-    // doesn't duplicate what the RPC already wrote. Kept so the seller's
-    // SalesOrdersPage list updates live.
     const { data: submission } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
     if (submission) {
         const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", submission.seller_id).maybeSingle();
@@ -276,7 +282,6 @@ export async function placeOrder(req, res) {
             await notifyUserOrdersChanged(sellerProfile.user_id);
         }
     }
-
 
     res.json({
         success: true,
