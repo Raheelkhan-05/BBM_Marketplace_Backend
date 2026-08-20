@@ -19,6 +19,7 @@ import buyerAddressRoutes from "./routes/buyerAddresses.routes.js";
 import catalogRoutes from "./routes/catalog.routes.js";
 import geoRoutes from "./routes/geo.routes.js";
 import listingPolicyOptionsRoutes from "./routes/listingPolicyOptions.routes.js";
+import chatRoutes from "./routes/chat.routes.js";
 
 export function createApp() {
   const app = express();
@@ -66,6 +67,7 @@ export function createApp() {
   app.use("/api/catalog-search", catalogSearchRoutes);
   // app.use("/api/catalog", catalogLandingRoutes);
   app.use("/api/catalogs", catalogImportRoutes);
+  app.use("/api/chat", chatRoutes);
   app.use("/api/whatsapp", whatsappRoutes);
   app.use("/api/orders", ordersRoutes);
   app.use("/api/buyer/addresses", buyerAddressRoutes);
