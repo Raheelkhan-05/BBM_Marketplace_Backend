@@ -29,7 +29,7 @@ export async function listSellerOrders(req, res) {
       payment_status, buyer_contact_name, buyer_contact_phone, buyer_contact_email,
       buyer_gstin, buyer_business_name, buyer_gst_verified,
       shipping_address_snapshot, buyer_notes, created_at, updated_at,
-      items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )
+      items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied, discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )
     `)
         .eq("seller_id", req.sellerId).order("created_at", { ascending: false });
     if (status) query = query.eq("status", status);

@@ -40,21 +40,57 @@ function formatDDMon(date) {
     return `${String(date.getDate()).padStart(2, "0")} ${MONTH_SHORT[date.getMonth()]}`;
 }
 
+// Rough zone-to-zone transit day estimates based on PIN code first digit
+// (1=Delhi/N, 2=Punjab/Haryana/UP-W, 3=Rajasthan/Gujarat, 4=Maharashtra/MP,
+//  5=AP/Karnataka, 6=TN/Kerala, 7=WB/Odisha/NE, 8=Bihar/Jharkhand, 9=Army PO)
 function estimateDeliveryDate(submission, buyerPincode, buyerState) {
     const leadDays = submission.stock_type === "made_to_order"
         ? Number(submission.production_lead_time_days || 0)
         : Number(submission.dispatch_time_days ?? submission.lead_time ?? 0);
 
-    let transitDays = 6;
-    if (submission.dispatch_pincode && buyerPincode && submission.dispatch_pincode.slice(0, 3) === buyerPincode.slice(0, 3)) {
-        transitDays = 1;
-    } else if (submission.dispatch_state && buyerState && submission.dispatch_state.toLowerCase() === buyerState.toLowerCase()) {
-        transitDays = 3;
-    }
+    const transitDays = estimateTransitDays(
+        submission.dispatch_pincode,
+        submission.dispatch_state,
+        buyerPincode,
+        buyerState
+    );
 
     const date = new Date();
     date.setDate(date.getDate() + leadDays + transitDays);
     return { date, label: formatDDMon(date), leadDays, transitDays };
+}
+
+function estimateTransitDays(originPincode, originState, destPincode, destState) {
+    if (!originPincode || !destPincode) return 4; // unknown -> conservative fallback
+
+    const originPrefix3 = originPincode.slice(0, 3);
+    const destPrefix3 = destPincode.slice(0, 3);
+
+    // Same local delivery zone (~city/nearby town) -> same-day/next-day
+    if (originPrefix3 === destPrefix3) return 1;
+
+    const originZone = Number(originPincode[0]);
+    const destZone = Number(destPincode[0]);
+    const sameState = originState && destState &&
+        originState.trim().toLowerCase() === destState.trim().toLowerCase();
+
+    // Same state, different city -> typically overnight to 1 day road transit
+    if (sameState) return 2;
+
+    const zoneDiff = Math.abs(originZone - destZone);
+
+    // Neighbouring zone (e.g. Maharashtra <-> Gujarat) -> ~1 day road transit,
+    // matches Mumbai -> Rajkot (~700km / ~15hrs) real-world case
+    if (zoneDiff <= 1) return 2;
+
+    // 2 zones apart -> ~2 days transit
+    if (zoneDiff === 2) return 3;
+
+    // 3 zones apart -> ~3 days transit
+    if (zoneDiff === 3) return 4;
+
+    // Far corners of the country (e.g. Gujarat <-> NE) -> ~4-5 days
+    return zoneDiff >= 5 ? 6 : 5;
 }
 
 function toBaseUnits(submission, quantity, purchaseBasis) {
@@ -262,7 +298,7 @@ export async function listMyOrders(req, res) {
       id, order_number, status, order_type, sample_order_id, stock_shortfall,
       subtotal_amount, total_amount, payment_status, created_at, updated_at,
       seller:seller_profiles ( id, display_name, shop_slug, logo_url, city, state ),
-      items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )
+      items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied, discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )
     `)
         .eq("buyer_id", req.user.id).order("created_at", { ascending: false });
     if (status) query = query.eq("status", status);
