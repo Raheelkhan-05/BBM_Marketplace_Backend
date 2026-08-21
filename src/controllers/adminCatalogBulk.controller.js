@@ -16,6 +16,27 @@ const LEVELS = {
     brand_item: { table: "hs_generic_product_brands", parentField: "generic_product_id", label: "Brand Item" },
 };
 
+// Converts a Google Drive "share" link into a direct-view image URL.
+// Share links look like:
+//   https://drive.google.com/file/d/FILE_ID/view?usp=sharing
+//   https://drive.google.com/open?id=FILE_ID
+// Neither serves raw image bytes — only https://drive.google.com/uc?... does.
+function toDirectImageUrl(url) {
+    const trimmed = (url || "").trim();
+    const fileIdMatch =
+        trimmed.match(/drive\.google\.com\/file\/d\/([^/]+)/) ||
+        trimmed.match(/[?&]id=([^&]+)/);
+    if (fileIdMatch) {
+        // thumbnail endpoint is far more reliable for <img> hotlinking
+        // than uc?export=view, which frequently serves an interstitial
+        // HTML page instead of the image bytes when not navigated to
+        // directly. sz=w1000 caps width at 1000px — bump if you need
+        // full-res.
+        return `https://drive.google.com/thumbnail?id=${fileIdMatch[1]}&sz=w1000`;
+    }
+    return trimmed;
+}
+
 const SIMPLE_HEADERS = ["Name", "Image Link"];
 const BRAND_ITEM_HEADERS = ["Product Name", "Brand Name", "Manufacturer", "Model/Part No/SKU", "Grade/Variant", "Specifications", "Image Links"];
 // Columns that must be filled for every brand_item row. Grade/Variant and
@@ -35,7 +56,8 @@ function parseImageLinks(raw) {
     return String(raw || "")
         .split(/[,;\n]+/)
         .map((s) => s.trim())
-        .filter(Boolean);
+        .filter(Boolean)
+        .map(toDirectImageUrl);   // ← added
 }
 
 // Splits a single "Specifications" cell into { key, value } rows.
@@ -202,7 +224,7 @@ export async function bulkUploadCatalog(req, res) {
             }
         } else {
             const name = String(raw["Name"] || "").trim();
-            const image = String(raw["Image Link"] || "").trim();
+            const image = toDirectImageUrl(String(raw["Image Link"] || "").trim());  // ← wrap
             displayName = name || `(row ${rowNum})`;
 
             if (!name || name.length < 2) errors.push("Name must be at least 2 characters");

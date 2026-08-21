@@ -540,22 +540,27 @@ const TABLES = {
     category: { table: "hs_categories", parentCol: null },
     subcategory: { table: "hs_subcategories", parentCol: "category_id" },
     generic_product: { table: "hs_generic_products", parentCol: "subcategory_id" },
+    brand_item: { table: "hs_generic_product_brands", parentCol: "generic_product_id" },
 };
 
-// GET /api/admin/catalog?level=category|subcategory|generic_product&parentId=&q=
+// GET /api/admin/catalog?level=category|subcategory|generic_product|brand_item&parentId=&q=
 export async function listCatalogEntries(req, res) {
     const { level, parentId, q = "" } = req.query;
     const cfg = TABLES[level];
     if (!cfg) return res.status(400).json({ success: false, message: `Invalid level "${level}".` });
     if (cfg.parentCol && !parentId) return res.status(400).json({ success: false, message: "Missing parentId." });
 
-    let query = supabase.from(cfg.table).select("id, name, review_status").order("name").limit(30);
+    const selectCols = level === "brand_item"
+        ? "id, name, image, images, brand_name, review_status, is_ai_generated"
+        : "id, name, image, review_status, is_ai_generated";
+
+    let query = supabase.from(cfg.table).select(selectCols).order("name").limit(200);
     if (cfg.parentCol) query = query.eq(cfg.parentCol, parentId);
     if (q.trim()) query = query.ilike("name", `%${q.trim()}%`);
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
-    res.json({ success: true, items: data || [] });
+    res.json({ success: true, entries: data || [] });   // ← renamed to entries
 }
 
 // POST /api/admin/catalog/:level  { name, parentId }
