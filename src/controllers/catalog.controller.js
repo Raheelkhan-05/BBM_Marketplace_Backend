@@ -131,3 +131,32 @@ export async function getBrandItemSellers(req, res) {
     }
     return res.json({ success: true, ...data });
 }
+
+// GET /api/catalog/brand-items-feed?categoryId=&q=&sort=&limit=&offset=
+// Home feed, one level flatter than getGenericProductsFeed — returns
+// hs_generic_product_brands rows directly (same shape as
+// getGenericProductBrands), scoped by category only, with no generic
+// product picked yet. categoryId omitted = browse everything.
+export async function getBrandItemsFeed(req, res) {
+    const { categoryId = "", q = "", sort = "relevance" } = req.query;
+    const limit = parseIntSafe(req.query.limit, 24);
+    const offset = parseIntSafe(req.query.offset, 0);
+
+    const { data, error } = await supabaseAdmin.rpc("catalog_browse", {
+        p_category_id: categoryId || null,
+        p_subcategory_ids: null,
+        p_generic_product_ids: null,
+        p_brand_names: null,
+        p_q: q,
+        p_sort: sort,
+        p_limit: limit,
+        p_offset: offset,
+        p_seller_id: req.sellerProfileId || null,
+    });
+
+    if (error) {
+        console.error("[catalog] getBrandItemsFeed failed:", error.message);
+        return res.status(500).json({ success: false, message: "Couldn't load products right now." });
+    }
+    return res.json({ success: true, ...data });
+}
