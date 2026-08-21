@@ -20,21 +20,68 @@ const LEVELS = {
 // Share links look like:
 //   https://drive.google.com/file/d/FILE_ID/view?usp=sharing
 //   https://drive.google.com/open?id=FILE_ID
-// Neither serves raw image bytes — only https://drive.google.com/uc?... does.
-function toDirectImageUrl(url) {
-    const trimmed = (url || "").trim();
+// Neither serves raw image bytes — only https://drive.google.com/thumbnail?... does.
+function driveToDirectImageUrl(url) {
     const fileIdMatch =
-        trimmed.match(/drive\.google\.com\/file\/d\/([^/]+)/) ||
-        trimmed.match(/[?&]id=([^&]+)/);
+        url.match(/drive\.google\.com\/file\/d\/([^/]+)/) ||
+        url.match(/[?&]id=([^&]+)/);
     if (fileIdMatch) {
-        // thumbnail endpoint is far more reliable for <img> hotlinking
-        // than uc?export=view, which frequently serves an interstitial
-        // HTML page instead of the image bytes when not navigated to
-        // directly. sz=w1000 caps width at 1000px — bump if you need
-        // full-res.
         return `https://drive.google.com/thumbnail?id=${fileIdMatch[1]}&sz=w1000`;
     }
+    return null;
+}
+
+// Resolves an imgbb *viewer* page (https://ibb.co/xxxxxxx) to its real
+// direct image URL (https://i.ibb.co/.../filename.jpg) by fetching the
+// viewer page's HTML and reading the og:image meta tag it embeds — the
+// same fix applied by the one-off backfill script, just run inline at
+// upload time so bad links get corrected automatically instead of
+// rejected. There's no way to derive i.ibb.co from the ibb.co ID
+// algorithmically, so this has to actually fetch the page.
+async function resolveImgbbDirectUrl(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`imgbb page returned HTTP ${res.status}`);
+    const html = await res.text();
+    const match = html.match(/<meta property="og:image" content="([^"]+)"/);
+    if (!match) throw new Error("couldn't find image on that imgbb page");
+    return match[1];
+}
+
+// Best-effort normalizer: rewrites known "viewer page" hosts (Drive,
+// imgbb) into their real direct-image URL. Anything it doesn't
+// recognize is passed through unchanged — isDirectImageUrl() below is
+// the actual gate that decides whether the final URL is acceptable.
+async function toDirectImageUrl(rawUrl) {
+    const trimmed = (rawUrl || "").trim();
+    if (!trimmed) return trimmed;
+
+    const drive = driveToDirectImageUrl(trimmed);
+    if (drive) return drive;
+
+    if (/^https?:\/\/ibb\.co\//i.test(trimmed)) {
+        try {
+            return await resolveImgbbDirectUrl(trimmed);
+        } catch {
+            // leave as-is; isDirectImageUrl will catch and report it below
+            return trimmed;
+        }
+    }
+
     return trimmed;
+}
+
+// Final safety net after resolution — rejects anything that's still a
+// known viewer/share page rather than a direct image URL. Catches
+// imgbb links that failed to resolve (network hiccup, page removed,
+// imgbb changed their markup) and any Drive share link that somehow
+// didn't get rewritten above.
+function isDirectImageUrl(url) {
+    const trimmed = (url || "").trim();
+    if (!/^https?:\/\/\S+$/i.test(trimmed)) return false;
+    if (/^https?:\/\/ibb\.co\//i.test(trimmed)) return false;
+    if (/drive\.google\.com\/file\/d\//i.test(trimmed) && !/\/thumbnail\?/i.test(trimmed)) return false;
+    if (/drive\.google\.com\/open\?/i.test(trimmed)) return false;
+    return true;
 }
 
 const SIMPLE_HEADERS = ["Name", "Image Link"];
@@ -44,20 +91,18 @@ const BRAND_ITEM_HEADERS = ["Product Name", "Brand Name", "Manufacturer", "Model
 // they are in the UI forms.
 const BRAND_ITEM_REQUIRED = ["Product Name", "Brand Name", "Manufacturer", "Model/Part No/SKU"];
 
-function isUrl(v) {
-    return /^https?:\/\/\S+$/i.test(v || "");
-}
-
-// Splits a single "Image Links" cell into individual URLs. Admins can
-// separate multiple photos with a comma, semicolon, or newline (Excel
-// lets a cell contain line breaks) — all three are common ways people
-// naturally paste a list of links into one cell.
-function parseImageLinks(raw) {
-    return String(raw || "")
+// Splits a single "Image Links" cell into individual URLs and resolves
+// each one to a direct-image URL. Admins can separate multiple photos
+// with a comma, semicolon, or newline (Excel lets a cell contain line
+// breaks) — all three are common ways people naturally paste a list of
+// links into one cell. Resolution happens in parallel per row since
+// each imgbb link needs its own HTTP fetch.
+async function parseImageLinks(raw) {
+    const urls = String(raw || "")
         .split(/[,;\n]+/)
         .map((s) => s.trim())
-        .filter(Boolean)
-        .map(toDirectImageUrl);   // ← added
+        .filter(Boolean);
+    return Promise.all(urls.map(toDirectImageUrl));
 }
 
 // Splits a single "Specifications" cell into { key, value } rows.
@@ -186,17 +231,22 @@ export async function bulkUploadCatalog(req, res) {
             const modelNo = String(raw["Model/Part No/SKU"] || "").trim();
             const gradeVariant = String(raw["Grade/Variant"] || "").trim();
             const specifications = parseSpecifications(raw["Specifications"]);
-            const imageLinks = parseImageLinks(raw["Image Links"]);
+            const imageLinks = await parseImageLinks(raw["Image Links"]);
             displayName = productName || `(row ${rowNum})`;
 
             if (!productName || productName.length < 2) errors.push("Product Name must be at least 2 characters");
             if (!brandName) errors.push("Brand Name is required");
             if (!manufacturer) errors.push("Manufacturer is required");
             if (!modelNo) errors.push("Model/Part No/SKU is required");
-            if (!imageLinks.length) errors.push("At least one Image Link is required");
-            else {
-                const badUrls = imageLinks.filter((u) => !isUrl(u));
-                if (badUrls.length) errors.push(`Image Links must all be valid http(s) URLs (bad: ${badUrls.slice(0, 2).join(", ")}${badUrls.length > 2 ? "…" : ""})`);
+            if (!imageLinks.length) {
+                errors.push("At least one Image Link is required");
+            } else {
+                const badUrls = imageLinks.filter((u) => !isDirectImageUrl(u));
+                if (badUrls.length) {
+                    errors.push(
+                        `Couldn't resolve some Image Links to a direct image (bad: ${badUrls.slice(0, 2).join(", ")}${badUrls.length > 2 ? "…" : ""}). Double-check the link opens directly to the image.`
+                    );
+                }
             }
             // If the cell wasn't blank but nothing parsed out of it, the
             // admin likely typed specs without a colon — flag it instead
@@ -224,12 +274,15 @@ export async function bulkUploadCatalog(req, res) {
             }
         } else {
             const name = String(raw["Name"] || "").trim();
-            const image = toDirectImageUrl(String(raw["Image Link"] || "").trim());  // ← wrap
+            const image = await toDirectImageUrl(String(raw["Image Link"] || "").trim());
             displayName = name || `(row ${rowNum})`;
 
             if (!name || name.length < 2) errors.push("Name must be at least 2 characters");
-            if (!image) errors.push("Image Link is required");
-            else if (!isUrl(image)) errors.push("Image Link must be a valid http(s) URL");
+            if (!image) {
+                errors.push("Image Link is required");
+            } else if (!isDirectImageUrl(image)) {
+                errors.push("Couldn't resolve Image Link to a direct image. Double-check the link opens directly to the image.");
+            }
 
             dedupKey = name.toLowerCase();
             if (!errors.length) {
