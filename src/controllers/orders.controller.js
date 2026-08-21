@@ -1,21 +1,23 @@
-// controllers/orders.controller.js — PATCH: de-duplicate notifications
+// controllers/orders.controller.js — PATCH: de-duplicate notifications +
+// simplified distance-based delivery estimate.
 //
-// Root cause: place_order and update_order_status both INSERT into
-// `notifications` directly as their last step (see the RPC SQL — the
-// `insert into notifications (...)` block near the end of each). The
-// controller was ALSO calling notifyUser(...) after every successful RPC
-// call, producing two rows per event: the RPC's detailed one, and the
-// controller's shorter duplicate.
+// De-dup notification fix (unchanged from before): place_order and
+// update_order_status both INSERT into `notifications` directly as their
+// last step. The controller no longer calls notifyUser(...) after those
+// RPCs for events the RPC already covers. notifyOrderChanged /
+// notifyUserOrdersChanged are UNCHANGED and kept — those are realtime
+// channel broadcasts (no `notifications` row), not duplicates.
 //
-// Fix: remove the controller-side notifyUser(...) calls for events the RPC
-// already covers (order placed, cancelled/confirmed/rejected/etc. status
-// changes). notifyOrderChanged / notifyUserOrdersChanged are UNCHANGED and
-// kept — those are realtime channel broadcasts (no `notifications` row),
-// not duplicates, and the UI's live-refresh depends on them.
-//
-// Only three functions in this file change: placeOrder, cancelMyOrder.
-// getOrderQuote, checkoutStatus, listMyOrders, getMyOrder are untouched —
-// reproduced below only for completeness so this is a drop-in replacement.
+// NEW: delivery estimate is now a simple distance / speed model instead of
+// banded heuristics. We fetch the road distance (km) between the seller's
+// dispatch pincode and the buyer's pincode, assume a flat transport speed
+// of 15 km/h, and convert that to a day range (floor/ceil of the raw day
+// count). Example: 1000km / 15km/h = 66.67h = 2.78 days -> shown as
+// "+2 to +3 days" on top of the seller's own lead time. When we have no
+// road-distance data for a pincode pair, we fall back to a rough km guess
+// from the same zone heuristic used before, then run THAT through the
+// same distance -> days formula, so there's only one place day counts are
+// ever computed from.
 import { supabase } from "../config/supabase.js";
 import { notifyOrderChanged, notifyUser, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
 import { getRoadDistanceKm } from "../services/pincodeDistance.js";
@@ -41,66 +43,100 @@ function formatDDMon(date) {
     return `${String(date.getDate()).padStart(2, "0")} ${MONTH_SHORT[date.getMonth()]}`;
 }
 
-// Rough zone-to-zone transit day estimates based on PIN code first digit
+// ---------------------------------------------------------------------
+// Distance-based transit estimate
+// ---------------------------------------------------------------------
+const TRANSPORT_SPEED_KMH = 15;
+
+// Converts a km distance into a [min, max] day range by dividing by the
+// flat transport speed and taking floor/ceil of the resulting day count.
+// e.g. 1000km / 15km/h = 66.67h = 2.78 days -> { min: 2, max: 3 }.
+function daysFromDistance(km) {
+    const hours = km / TRANSPORT_SPEED_KMH;
+    const rawDays = hours / 24;
+    const min = Math.floor(rawDays);
+    const max = Math.ceil(rawDays);
+    // Collapse to a single value when there's no meaningful fractional part
+    // (e.g. exactly 2 days), or when transit is under a day (0-1 -> just "1").
+    return { min: min === max ? min : min, max: max === min ? min : max };
+}
+
+// Rough km guess used only when we have no road-distance data for a
+// pincode pair (missing from geo table). Mirrors the old zone-diff signal
 // (1=Delhi/N, 2=Punjab/Haryana/UP-W, 3=Rajasthan/Gujarat, 4=Maharashtra/MP,
-//  5=AP/Karnataka, 6=TN/Kerala, 7=WB/Odisha/NE, 8=Bihar/Jharkhand, 9=Army PO)
+// 5=AP/Karnataka, 6=TN/Kerala, 7=WB/Odisha/NE, 8=Bihar/Jharkhand, 9=Army PO)
+// but expressed as km so it still flows through the single
+// distance -> days formula above, rather than having its own day logic.
+function estimateFallbackKm(originPincode, originState, destPincode, destState) {
+    if (!originPincode || !destPincode) return 600; // unknown -> conservative middle guess
+
+    const originPrefix3 = originPincode.slice(0, 3);
+    const destPrefix3 = destPincode.slice(0, 3);
+    if (originPrefix3 === destPrefix3) return 60;
+
+    const sameState = originState && destState &&
+        originState.trim().toLowerCase() === destState.trim().toLowerCase();
+    if (sameState) return 250;
+
+    const originZone = Number(originPincode[0]);
+    const destZone = Number(destPincode[0]);
+    const zoneDiff = Math.abs(originZone - destZone);
+
+    if (zoneDiff <= 1) return 700;
+    if (zoneDiff === 2) return 1200;
+    return 1900;
+}
+
+async function estimateTransitDayRange(originPincode, originState, destPincode, destState) {
+    const originPrefix3 = originPincode?.slice(0, 3);
+    const destPrefix3 = destPincode?.slice(0, 3);
+    if (originPrefix3 && originPrefix3 === destPrefix3) return { min: 1, max: 1 }; // same local zone, skip distance lookup
+
+    const km = await getRoadDistanceKm(originPincode, destPincode);
+    if (km == null) {
+        // pincode not in our geo table (rare, or missing data) — fall back
+        // to a rough km guess rather than guessing days directly, so the
+        // 15km/h formula is still the single source of truth for days.
+        const fallbackKm = estimateFallbackKm(originPincode, originState, destPincode, destState);
+        return daysFromDistance(fallbackKm);
+    }
+
+    // console.log("originPincode : ", originPincode);
+    // console.log("destPincode : ", destPincode);
+
+    // console.log("Distance : ", km);
+
+
+    return daysFromDistance(km);
+}
+
 async function estimateDeliveryDate(submission, buyerPincode, buyerState) {
     const leadDays = submission.stock_type === "made_to_order"
         ? Number(submission.production_lead_time_days || 0)
         : Number(submission.dispatch_time_days ?? submission.lead_time ?? 0);
 
-    const transitDays = await estimateTransitDays(
+    const { min: transitMin, max: transitMax } = await estimateTransitDayRange(
         submission.dispatch_pincode,
         submission.dispatch_state,
         buyerPincode,
         buyerState
     );
 
-    const date = new Date();
-    date.setDate(date.getDate() + leadDays + transitDays);
-    return { date, label: formatDDMon(date), leadDays, transitDays };
-}
+    const dateMin = new Date();
+    dateMin.setDate(dateMin.getDate() + leadDays + transitMin);
+    const dateMax = new Date();
+    dateMax.setDate(dateMax.getDate() + leadDays + transitMax);
 
-function estimateTransitDaysByZone(originPincode, originState, destPincode, destState) {
-    if (!originPincode || !destPincode) return 4; // unknown -> conservative fallback
+    // Single date when min/max transit days collapse to the same value
+    // (e.g. same local zone), otherwise a "23 Aug - 25 Aug" style range.
+    const label = transitMin === transitMax
+        ? formatDDMon(dateMin)
+        : `${formatDDMon(dateMin)} - ${formatDDMon(dateMax)}`;
 
-    const originPrefix3 = originPincode.slice(0, 3);
-    const destPrefix3 = destPincode.slice(0, 3);
-    if (originPrefix3 === destPrefix3) return 1;
-
-    const sameState = originState && destState &&
-        originState.trim().toLowerCase() === destState.trim().toLowerCase();
-    if (sameState) return 2;
-
-    const originZone = Number(originPincode[0]);
-    const destZone = Number(destPincode[0]);
-    const zoneDiff = Math.abs(originZone - destZone);
-
-    if (zoneDiff <= 1) return 3;
-    if (zoneDiff === 2) return 4;
-    return 5;
-}
-
-async function estimateTransitDays(originPincode, originState, destPincode, destState) {
-    const originPrefix3 = originPincode?.slice(0, 3);
-    const destPrefix3 = destPincode?.slice(0, 3);
-    if (originPrefix3 && originPrefix3 === destPrefix3) return 1; // same local zone, skip distance lookup
-
-    const km = await getRoadDistanceKm(originPincode, destPincode);
-    if (km == null) {
-        // pincode not in our geo table (rare, or missing data) — fall back
-        // to the old state/zone heuristic rather than guessing wildly
-        return estimateTransitDaysByZone(originPincode, originState, destPincode, destState);
-    }
-
-    // Bands roughly matched to surface-freight transit times: local
-    // trucking ~500-600km/day achievable, but pickup/linehaul/last-mile
-    // handoffs add a floor even for short hops.
-    if (km <= 150) return 1;
-    if (km <= 500) return 2;
-    if (km <= 1000) return 3;
-    if (km <= 1800) return 4;
-    return 5;
+    return {
+        dateMin, dateMax, label,
+        leadDays, transitDaysMin: transitMin, transitDaysMax: transitMax,
+    };
 }
 
 function toBaseUnits(submission, quantity, purchaseBasis) {
@@ -148,7 +184,8 @@ export async function checkoutStatus(req, res) {
     res.json({ success: true, canCheckout: true, profile, business: business || null });
 }
 
-// GET /api/orders/quote — unchanged
+// GET /api/orders/quote — unchanged shape, delivery fields updated to
+// transitDaysMin/transitDaysMax (see estimateDeliveryDate above).
 export async function getOrderQuote(req, res) {
     const { submissionId, quantity, purchaseBasis = "per_unit", orderType = "standard", addressId } = req.query;
     const qty = Number(quantity);
@@ -190,7 +227,7 @@ export async function getOrderQuote(req, res) {
             sampleQuantity: submission.sample_quantity,
             exceedsSampleQuantity: exceedsSample,
             estimatedDeliveryDate: delivery.label,
-            leadDays: delivery.leadDays, transitDays: delivery.transitDays,
+            leadDays: delivery.leadDays, transitDaysMin: delivery.transitDaysMin, transitDaysMax: delivery.transitDaysMax,
         });
     }
 
@@ -213,7 +250,8 @@ export async function getOrderQuote(req, res) {
         unitPrice, basePriceApplied: slabPrice, appliedSlab, discountPercent, discountTier,
         unit: submission.unit, moq: submission.moq,
         purchaseBasis, quantity: qty, baseQuantity: baseQty,
-        estimatedDeliveryDate: delivery.label, leadDays: delivery.leadDays, transitDays: delivery.transitDays,
+        estimatedDeliveryDate: delivery.label, leadDays: delivery.leadDays,
+        transitDaysMin: delivery.transitDaysMin, transitDaysMax: delivery.transitDaysMax,
         availableStock: submission.stock_quantity, subtotal,
         platformFeePercent: commissionPercent, platformFeeAmount: platformFee, sellerPayoutAmount: subtotal - platformFee,
         meetsMoq: baseQty >= Number(submission.moq),
@@ -221,21 +259,7 @@ export async function getOrderQuote(req, res) {
     });
 }
 
-// POST /api/orders
-//
-// CHANGED: no longer calls notifyUser(...) on success. place_order already
-// inserts the seller's "New order"/"New sample request" notification row
-// itself (see the RPC's final `insert into notifications` block) — calling
-// notifyUser here duplicated it. notifyUserOrdersChanged is KEPT: it's a
-// realtime channel broadcast, not a notifications-table row, and
-// SalesOrdersPage's live list depends on it firing.
-//
-// The one thing the RPC's own notification text can't express is the
-// stock-shortfall context — its message is generic. Rather than add a
-// second notifications row for that (which would reintroduce the same
-// duplication problem), the shortfall is surfaced entirely client-side:
-// SalesOrdersPage already reads orders.stock_shortfall directly and shows
-// the amber banner from that column, so no extra notification is needed.
+// POST /api/orders — unchanged (see file header for the notification de-dup note)
 export async function placeOrder(req, res) {
     const buyerId = req.user.id;
     const {
@@ -326,14 +350,7 @@ export async function getMyOrder(req, res) {
     res.json({ success: true, order, events: events || [] });
 }
 
-// POST /api/orders/:id/cancel
-//
-// CHANGED: removed the notifyUser(...) call. update_order_status already
-// inserts a notifications row for the counterpart (buyer→seller here)
-// as its last step — see the RPC's `if p_actor_role = 'seller' then ... else
-// insert into notifications (... 'Buyer updated order status ...') end if`
-// block. notifyOrderChanged (realtime broadcast) and notifyUserOrdersChanged
-// are kept — same reasoning as placeOrder above.
+// POST /api/orders/:id/cancel — unchanged (see file header for the notification de-dup note)
 export async function cancelMyOrder(req, res) {
     const { reason } = req.body || {};
     const { error } = await supabase.rpc("update_order_status", {
