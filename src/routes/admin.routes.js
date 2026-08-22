@@ -17,6 +17,8 @@ import {
 import multer from "multer";
 import { downloadCatalogTemplate, bulkUploadCatalog } from "../controllers/adminCatalogBulk.controller.js";
 import { uploadCatalogImage } from "../controllers/adminUpload.controller.js";
+import { listPendingPaymentProofs, verifyPayment, rejectPayment } from "../controllers/paymentVerification.controller.js";
+
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
 
@@ -48,5 +50,9 @@ router.post("/catalog/options", requireAuth, requireAdmin, authWriteLimiter, cre
 router.post("/catalog/upload", requireAuth, requireAdmin, upload.single("file"), uploadCatalogImage);
 router.delete("/catalog/:level/:id", requireAuth, requireAdmin, deleteCatalogEntry);
 router.post("/catalog/:level", requireAuth, requireAdmin, authWriteLimiter, createCatalogEntry);
+
+router.get("/payment-proofs", requireAuth, requireAdmin, listPendingPaymentProofs);
+router.post("/payment-proofs/:id/verify", requireAuth, requireAdmin, authWriteLimiter, verifyPayment);
+router.post("/payment-proofs/:id/reject", requireAuth, requireAdmin, authWriteLimiter, rejectPayment);
 
 export default router;

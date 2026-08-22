@@ -300,11 +300,19 @@ export async function placeOrder(req, res) {
         return res.status(500).json({ success: false, message: "Couldn't place the order — please try again." });
     }
 
-    const { data: submission } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
-    if (submission) {
-        const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", submission.seller_id).maybeSingle();
-        if (sellerProfile) {
-            await notifyUserOrdersChanged(sellerProfile.user_id);
+
+    // row.order_status is 'awaiting_payment' for standard orders (gated on
+    // UPI verification) or 'pending_confirmation' for sample/credit (which
+    // skip the gate). Only broadcast the seller's live "orders changed" realtime
+    // event for the latter — standard orders' seller broadcast now fires from
+    // admin_verify_payment() instead, once payment is actually confirmed.
+    if (row.order_status !== "awaiting_payment") {
+        const { data: submission } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
+        if (submission) {
+            const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", submission.seller_id).maybeSingle();
+            if (sellerProfile) {
+                await notifyUserOrdersChanged(sellerProfile.user_id);
+            }
         }
     }
 
@@ -312,11 +320,14 @@ export async function placeOrder(req, res) {
         success: true,
         orderId: row.order_id,
         orderNumber: row.order_number,
+        orderStatus: row.order_status,       // NEW — "awaiting_payment" | "pending_confirmation"
         estimatedDeliveryDate: row.estimated_delivery_date,
         stockShortfall: row.stock_shortfall,
         paymentMethod: row.payment_method,
         orderType: safeOrderType,
-        message: safeOrderType === "sample" ? "Sample requested. The seller has been notified." : "Order placed. The seller has been notified.",
+        message: row.order_status === "awaiting_payment"
+            ? "Order created. Complete the payment to confirm it."
+            : (safeOrderType === "sample" ? "Sample requested. The seller has been notified." : "Order placed. The seller has been notified."),
     });
 }
 
