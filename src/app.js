@@ -20,6 +20,7 @@ import catalogRoutes from "./routes/catalog.routes.js";
 import geoRoutes from "./routes/geo.routes.js";
 import listingPolicyOptionsRoutes from "./routes/listingPolicyOptions.routes.js";
 import chatRoutes from "./routes/chat.routes.js";
+import creditRoutes from "./routes/credit.routes.js";
 
 export function createApp() {
   const app = express();
@@ -74,6 +75,7 @@ export function createApp() {
   app.use("/api/catalog", catalogRoutes);
   app.use("/api/geo", geoRoutes);
   app.use("/api/listing-policy-options", listingPolicyOptionsRoutes);
+  app.use("/api/credit", creditRoutes);
 
   app.use((err, req, res, next) => {
     console.error(err);

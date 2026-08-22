@@ -29,6 +29,7 @@ const ERROR_MAP = {
     BELOW_MOQ: { status: 400, message: "Quantity is below the seller's minimum order quantity." },
     SAMPLE_NOT_AVAILABLE: { status: 400, message: "This seller doesn't offer a sample for this item." },
     EXCEEDS_SAMPLE_QUANTITY: { status: 400, message: "Requested quantity exceeds the sample limit for this item." },
+    CREDIT_NOT_APPROVED: { status: 403, message: "You don't have approved credit with this seller." },
     BUYER_NOT_FOUND: { status: 401, message: "Please sign in again." },
     BUYER_NOT_VERIFIED: { status: 403, message: "Please verify your email or phone before placing an order." },
     ADDRESS_NOT_FOUND: { status: 400, message: "Please select a valid shipping address." },
@@ -274,7 +275,7 @@ export async function placeOrder(req, res) {
     if (!["per_unit", "per_pack", "per_master_pack"].includes(purchaseBasis)) {
         return res.status(400).json({ success: false, message: "Invalid purchase basis." });
     }
-    const safeOrderType = orderType === "sample" ? "sample" : "standard";
+    const safeOrderType = orderType === "sample" ? "sample" : orderType === "credit" ? "credit" : "standard";
 
     const { data, error } = await supabase.rpc("place_order", {
         p_buyer_id: buyerId,
@@ -313,6 +314,7 @@ export async function placeOrder(req, res) {
         orderNumber: row.order_number,
         estimatedDeliveryDate: row.estimated_delivery_date,
         stockShortfall: row.stock_shortfall,
+        paymentMethod: row.payment_method,
         orderType: safeOrderType,
         message: safeOrderType === "sample" ? "Sample requested. The seller has been notified." : "Order placed. The seller has been notified.",
     });

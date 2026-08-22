@@ -94,7 +94,7 @@ export async function listMessages(req, res) {
 
     let query = supabase
         .from("chat_messages")
-        .select("id, conversation_id, sender_id, body, attachment_url, created_at, edited_at, deleted_at, client_message_id")
+        .select("id, conversation_id, sender_id, body, attachment_url, created_at, edited_at, deleted_at, client_message_id, message_type, metadata")
         .eq("conversation_id", conversationId)
         .order("created_at", { ascending: false })
         .limit(MESSAGE_PAGE_SIZE);
