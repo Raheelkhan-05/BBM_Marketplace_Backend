@@ -190,7 +190,7 @@ export async function updateSellerSubmission(req, res) {
     }
 
     // Tax
-    if (b.hsnCode !== undefined) submissionUpdate.hsn_code = b.hsnCode?.trim() || null;
+    // if (b.hsnCode !== undefined) submissionUpdate.hsn_code = b.hsnCode?.trim() || null;
 
     // Terms — canonical key + resolved free text, kept in sync (matches
     // how the seller's own submission endpoint resolves these on create).

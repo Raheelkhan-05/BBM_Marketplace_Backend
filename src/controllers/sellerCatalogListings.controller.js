@@ -142,7 +142,7 @@ function validateListingPayload(body) {
     // orders up to packs first). Never multiply/divide this by pack_size when
     // storing it — it's stored exactly as the seller entered it.
     if (!(Number(body.moq) > 0)) missing.push("MOQ");
-    if (!body.hsnCode?.trim()) missing.push("HSN Code");
+    // if (!body.hsnCode?.trim()) missing.push("HSN Code");
     if (body.gstPercent === undefined || body.gstPercent === null || Number(body.gstPercent) < 0) missing.push("GST %");
 
     if (!(Number(body.basePrice) > 0)) missing.push("Base price");
@@ -220,7 +220,7 @@ function toListingRow(body, brand) {
         dispatch_pincode: body.dispatchPincode?.trim() || null,
         dispatching_locations: Array.isArray(body.dispatchingLocations) ? body.dispatchingLocations : [],
 
-        hsn_code: body.hsnCode?.trim() || null,
+        // hsn_code: body.hsnCode?.trim() || null,
         return_policy_key: body.returnPolicyKey,
         warranty_key: body.warrantyKey,
         note_to_admin: body.noteToAdmin?.trim() || null,
@@ -581,7 +581,7 @@ export async function updateSubmission(req, res) {
         images: Array.isArray(body.images) && body.images.length ? body.images : [existing.image].filter(Boolean),
 
         moq: body.moq ?? existing.moq,
-        hsnCode: body.hsnCode ?? existing.hsn_code,
+        // hsnCode: body.hsnCode ?? existing.hsn_code,
         gstPercent: body.gstPercent ?? existing.gst_percent,
 
         basePrice: body.basePrice ?? existing.base_price,
