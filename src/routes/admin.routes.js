@@ -19,6 +19,7 @@ import { downloadCatalogTemplate, bulkUploadCatalog } from "../controllers/admin
 import { uploadCatalogImage } from "../controllers/adminUpload.controller.js";
 import { listPendingPaymentProofs, verifyPayment, rejectPayment } from "../controllers/paymentVerification.controller.js";
 
+import { downloadFullCatalogTemplate, bulkUploadFullCatalog } from "../controllers/adminCatalogFullBulk.controller.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
 
@@ -54,5 +55,8 @@ router.post("/catalog/:level", requireAuth, requireAdmin, authWriteLimiter, crea
 router.get("/payment-proofs", requireAuth, requireAdmin, listPendingPaymentProofs);
 router.post("/payment-proofs/:id/verify", requireAuth, requireAdmin, authWriteLimiter, verifyPayment);
 router.post("/payment-proofs/:id/reject", requireAuth, requireAdmin, authWriteLimiter, rejectPayment);
+
+router.get("/catalog-bulk/excel-template", requireAuth, requireAdmin, downloadFullCatalogTemplate);
+router.post("/catalog-bulk/excel-upload", requireAuth, requireAdmin, upload.single("file"), bulkUploadFullCatalog);
 
 export default router;
