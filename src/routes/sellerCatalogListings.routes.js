@@ -26,7 +26,7 @@ import {
     updateTemplate,
     deleteTemplate,
 } from "../controllers/sellerListingTemplates.controller.js";
-import { searchBrandNames } from "../controllers/sellerBrands.controller.js";
+import { searchBrandNames, findBrandItemMatch } from "../controllers/sellerBrands.controller.js";
 
 const router = Router();
 
@@ -55,5 +55,6 @@ router.patch("/templates/:id", requireAuth, requireApprovedSeller, updateTemplat
 router.delete("/templates/:id", requireAuth, requireApprovedSeller, deleteTemplate);
 
 router.get("/brands", searchBrandNames);
+router.get("/brand-item-match", findBrandItemMatch);
 
 export default router;

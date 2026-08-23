@@ -1,6 +1,7 @@
 import * as XLSX from "xlsx";
 import { supabase } from "../config/supabase.js";
 import { slugify } from "../services/slugify.js";
+import { ALLOWED_UNITS } from "./sellerCatalogListings.controller.js";
 
 // Every simple level uses the same lightweight template. brand_item's
 // template now carries the full catalog-identity shape: Name + Brand +
@@ -85,11 +86,8 @@ function isDirectImageUrl(url) {
 }
 
 const SIMPLE_HEADERS = ["Name", "Image Link"];
-const BRAND_ITEM_HEADERS = ["Product Name", "Brand Name", "Manufacturer", "Model/Part No/SKU", "Grade/Variant", "Specifications", "Image Links"];
-// Columns that must be filled for every brand_item row. Grade/Variant and
-// Specifications are intentionally excluded — both are optional, same as
-// they are in the UI forms.
-const BRAND_ITEM_REQUIRED = ["Product Name", "Brand Name", "Manufacturer", "Model/Part No/SKU"];
+const BRAND_ITEM_HEADERS = ["Product Name", "Brand Name", "Manufacturer", "Model/Part No/SKU", "Grade/Variant", "Unit", "Pack Size", "Units per Master Pack", "Specifications", "Image Links"];
+const BRAND_ITEM_REQUIRED = ["Product Name", "Brand Name", "Manufacturer", "Model/Part No/SKU", "Unit", "Pack Size", "Units per Master Pack"];
 
 // Splits a single "Image Links" cell into individual URLs and resolves
 // each one to a direct-image URL. Admins can separate multiple photos
@@ -154,6 +152,9 @@ export async function downloadCatalogTemplate(req, res) {
             "Model/Part No/SKU": "MDL-1234",
             "Grade/Variant": "Grade A",
             "Specifications": "Material: Stainless Steel 304; Finish: Matte; Weight: 1.2kg",
+            "Unit": "Litres",
+            "Pack Size": "1",
+            "Units per Master Pack": "12",
             "Image Links": "https://example.com/front.jpg, https://example.com/side.jpg, https://example.com/back.jpg",
         }
         : { Name: "Example Item", "Image Link": "https://example.com/image.jpg" };
@@ -231,6 +232,10 @@ export async function bulkUploadCatalog(req, res) {
             const modelNo = String(raw["Model/Part No/SKU"] || "").trim();
             const gradeVariant = String(raw["Grade/Variant"] || "").trim();
             const specifications = parseSpecifications(raw["Specifications"]);
+            const unit = String(raw["Unit"] || "").trim();
+            const packSize = Number(raw["Pack Size"]);
+            const unitsPerMasterPack = Number(raw["Units per Master Pack"]);
+
             const imageLinks = await parseImageLinks(raw["Image Links"]);
             displayName = productName || `(row ${rowNum})`;
 
@@ -238,6 +243,10 @@ export async function bulkUploadCatalog(req, res) {
             if (!brandName) errors.push("Brand Name is required");
             if (!manufacturer) errors.push("Manufacturer is required");
             if (!modelNo) errors.push("Model/Part No/SKU is required");
+            if (!ALLOWED_UNITS.includes(unit)) errors.push(`Unit must be one of: ${ALLOWED_UNITS.join(", ")}`);
+            if (!(packSize > 0)) errors.push("Pack Size must be a positive number");
+            if (!(unitsPerMasterPack > 0)) errors.push("Units per Master Pack must be a positive number");
+
             if (!imageLinks.length) {
                 errors.push("At least one Image Link is required");
             } else {
@@ -265,6 +274,9 @@ export async function bulkUploadCatalog(req, res) {
                     model_no: modelNo,
                     grade_variant: gradeVariant || null,
                     specifications,
+                    unit,
+                    pack_size: packSize,
+                    units_per_master_pack: unitsPerMasterPack,
                     slug: slugify(`${productName}-${brandName}`),
                     image: imageLinks[0],
                     images: imageLinks,

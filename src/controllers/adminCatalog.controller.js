@@ -37,7 +37,8 @@ const LEVEL_CONFIG = {
         editableFields: [
             "name", "slug", "image", "images", "brand_name", "brand_image", "brand_not_applicable",
             "manufacturer", "model_no", "grade_variant", "specifications",
-            "description", "manufacturing_details",   // ← NEW: admin-only fields
+            "description", "manufacturing_details",
+            "unit", "pack_size", "units_per_master_pack",   // NEW — fixed packaging identity
         ],
         embed: "hs_generic_products(id, name, review_status, hs_subcategories(id, name, review_status, hs_categories(id, name, review_status)))",
     },
@@ -261,6 +262,16 @@ export async function approveCatalogEntry(req, res) {
             .from("hs_generic_products").select("id, review_status").eq("id", genericProductId).maybeSingle();
         if (gpErr) return res.status(500).json({ success: false, message: gpErr.message });
         if (!gp) return res.status(400).json({ success: false, message: "Selected generic product wasn't found." });
+
+        // NEW — packaging must be set (either already on the row, or in this
+        // approval's body) before this brand item can go live for sellers.
+        const { data: current } = await supabase.from("hs_generic_product_brands").select("unit, pack_size, units_per_master_pack").eq("id", id).maybeSingle();
+        const finalUnit = body.unit ?? current?.unit;
+        const finalPack = body.pack_size ?? current?.pack_size;
+        const finalMaster = body.units_per_master_pack ?? current?.units_per_master_pack;
+        if (!finalUnit || !(Number(finalPack) > 0) || !(Number(finalMaster) > 0)) {
+            return res.status(400).json({ success: false, message: "Set Unit, Pack Size, and Units per Master Pack before approving." });
+        }
     }
 
     const update = { review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: req.user.id, rejection_reason: null };
@@ -551,7 +562,7 @@ export async function listCatalogEntries(req, res) {
     if (cfg.parentCol && !parentId) return res.status(400).json({ success: false, message: "Missing parentId." });
 
     const selectCols = level === "brand_item"
-        ? "id, name, image, images, brand_name, review_status, is_ai_generated"
+        ? "id, name, image, images, brand_name, review_status, is_ai_generated, unit, pack_size, units_per_master_pack"
         : "id, name, image, review_status, is_ai_generated";
 
     let query = supabase.from(cfg.table).select(selectCols).order("name").limit(200);

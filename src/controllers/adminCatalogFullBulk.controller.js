@@ -12,20 +12,25 @@
 import * as XLSX from "xlsx";
 import { supabase } from "../config/supabase.js";
 import { slugify } from "../services/slugify.js";
+import { ALLOWED_UNITS } from "./sellerCatalogListings.controller.js";
 
 const FULL_HEADERS = [
     "Category Name", "Category Image",
     "Subcategory Name", "Subcategory Image",
     "Generic Product Name", "Generic Product Image",
     "Product Name", "Brand Name", "Manufacturer", "Model/Part No/SKU",
-    "Grade/Variant", "Specifications", "Image Links",
+    "Grade/Variant",
+    "Unit", "Pack Size", "Units per Master Pack",
+    "Specifications", "Image Links",
 ];
 // Only these are non-negotiable. Category/Subcategory/Generic Product
 // *Image* columns are intentionally absent from this list — the whole
 // point is that the hierarchy can be created from names alone.
 const REQUIRED_HEADERS = [
     "Category Name", "Subcategory Name", "Generic Product Name",
-    "Product Name", "Brand Name", "Manufacturer", "Model/Part No/SKU", "Image Links",
+    "Product Name", "Brand Name", "Manufacturer", "Model/Part No/SKU",
+    "Unit", "Pack Size", "Units per Master Pack",
+    "Image Links",
 ];
 
 // ---- same URL-resolution helpers used by the single-level bulk uploader ----
@@ -115,6 +120,9 @@ export async function downloadFullCatalogTemplate(req, res) {
         "Manufacturer": "Shell India Markets Pvt Ltd",
         "Model/Part No/SKU": "AX7-10W30-1L",
         "Grade/Variant": "10W-30",
+        "Unit": "Litres",
+        "Pack Size": "1",
+        "Units per Master Pack": "12",
         "Specifications": "Volume: 1L; API Grade: SL",
         "Image Links": "https://example.com/front.jpg, https://example.com/back.jpg",
     };
@@ -234,6 +242,9 @@ export async function bulkUploadFullCatalog(req, res) {
         const manufacturer = String(raw["Manufacturer"] || "").trim();
         const modelNo = String(raw["Model/Part No/SKU"] || "").trim();
         const gradeVariant = String(raw["Grade/Variant"] || "").trim();
+        const unit = String(raw["Unit"] || "").trim();
+        const packSize = Number(raw["Pack Size"]);
+        const unitsPerMasterPack = Number(raw["Units per Master Pack"]);
 
         const displayName = productName || `(row ${rowNum})`;
 
@@ -244,6 +255,9 @@ export async function bulkUploadFullCatalog(req, res) {
         if (!brandName) errors.push("Brand Name is required");
         if (!manufacturer) errors.push("Manufacturer is required");
         if (!modelNo) errors.push("Model/Part No/SKU is required");
+        if (!ALLOWED_UNITS.includes(unit)) errors.push(`Unit must be one of: ${ALLOWED_UNITS.join(", ")}`);
+        if (!(packSize > 0)) errors.push("Pack Size must be a positive number");
+        if (!(unitsPerMasterPack > 0)) errors.push("Units per Master Pack must be a positive number");
 
         // Hierarchy images are OPTIONAL — only validate them if a value
         // was actually provided.
@@ -329,6 +343,9 @@ export async function bulkUploadFullCatalog(req, res) {
                     manufacturer,
                     model_no: modelNo,
                     grade_variant: gradeVariant || null,
+                    unit,                              // NEW
+                    pack_size: packSize,               // NEW
+                    units_per_master_pack: unitsPerMasterPack, // NEW
                     specifications,
                     slug: slugify(`${productName}-${brandName}`),
                     image: imageLinks[0],

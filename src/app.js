@@ -5,7 +5,7 @@ import authRoutes from "./routes/auth.routes.js";
 import sellerRoutes from "./routes/seller.routes.js";
 import adminRoutes from "./routes/admin.routes.js";
 import notificationRoutes from "./routes/notifications.routes.js";
-import shopRoutes from "./routes/shop.routes.js"
+import shopRoutes from "./routes/shop.routes.js";
 import hierarchySearchRoutes from "./routes/hierarchysearch.routes.js";
 import catalogLandingRoutes from "./routes/catalogLanding.routes.js";
 import catalogImportRoutes from "./routes/catalogImport.routes.js";

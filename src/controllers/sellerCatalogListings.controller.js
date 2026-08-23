@@ -39,6 +39,261 @@ const SUBMISSION_LIST_COLUMNS = `
 
 const SUBMISSION_DETAIL_COLUMNS = `*, hs_generic_product_brands ( id, name, brand_name, image, images, brand_not_applicable )`;
 
+/* ------------------------- brand resolution ------------------------- */
+// Unit / pack size / master pack size are now a fixed property of the
+// BRAND ITEM (hs_generic_product_brands), not something re-entered per
+// seller listing. They're only asked for once — when a seller is the
+// one establishing this catalog entry for the first time. Every seller
+// who lists an already-existing brand item inherits these values as-is.
+
+const BRAND_PACKAGING_COLS = "unit, pack_size, units_per_master_pack";
+
+async function findExistingBrandItem({ productName, brandName, brandNotApplicable }) {
+    const trimmedProduct = productName.trim();
+    let query = supabase
+        .from("hs_generic_product_brands")
+        .select(`id, name, brand_name, ${BRAND_PACKAGING_COLS}`)
+        .ilike("name", trimmedProduct);
+    query = brandNotApplicable ? query.is("brand_name", null) : query.ilike("brand_name", brandName.trim());
+    const { data } = await query.maybeSingle();
+    return data || null;
+}
+
+function validateNewBrandPackaging(body) {
+    const missing = [];
+    if (!body.unit || !ALLOWED_UNITS.includes(body.unit)) missing.push("Unit of measurement");
+    if (!(Number(body.packSize) > 0)) missing.push("Pack size");
+    if (!(Number(body.masterPackSize) > 0)) missing.push("Master pack size");
+    return missing;
+}
+
+async function createBrandItem({ productName, brandName, brandImage, brandNotApplicable, images, unit, packSize, masterPackSize }) {
+    const trimmedProduct = productName.trim();
+    const insertRow = {
+        generic_product_id: null,
+        name: trimmedProduct,
+        brand_name: brandNotApplicable ? null : brandName.trim(),
+        brand_image: brandNotApplicable ? null : (brandImage || null),
+        brand_not_applicable: Boolean(brandNotApplicable),
+        slug: slugify(`${trimmedProduct}-${brandNotApplicable ? Date.now() : brandName.trim()}`),
+        image: images[0] || null,
+        images,
+        unit,
+        pack_size: Number(packSize),
+        units_per_master_pack: Number(masterPackSize),
+        is_ai_generated: false,
+        review_status: "pending_review",
+    };
+
+    const { data: created, error } = await supabase
+        .from("hs_generic_product_brands")
+        .insert(insertRow)
+        .select(`id, name, brand_name, ${BRAND_PACKAGING_COLS}`)
+        .single();
+
+    if (!error) return created;
+    if (error.code !== "23505") throw error;
+
+    // Someone else created the same brand item a moment ago — use theirs.
+    const raced = await findExistingBrandItem({ productName, brandName, brandNotApplicable });
+    if (raced) return raced;
+    throw error;
+}
+
+/* ------------------------- validation ------------------------- */
+
+function validateListingPayload(body) {
+    const missing = [];
+
+    if (!body.productName?.trim()) missing.push("Product name");
+    if (!body.brandNotApplicable && !body.brandName?.trim()) missing.push("Brand");
+    if (!(Array.isArray(body.images) && body.images.length)) missing.push("Product image");
+
+    // NOTE: unit / packSize / masterPackSize are NOT validated here anymore
+    // — see validateNewBrandPackaging, applied only when this seller is
+    // creating a brand-new catalog entry.
+
+    if (!(Number(body.moq) > 0)) missing.push("MOQ");
+    if (!body.hsnCode?.trim()) missing.push("HSN Code");
+    if (body.gstPercent === undefined || body.gstPercent === null || Number(body.gstPercent) < 0) missing.push("GST %");
+
+    if (!(Number(body.basePrice) > 0)) missing.push("Base price");
+    if (!PRICE_BASES.includes(body.priceBasis)) missing.push("Price basis (per unit / pack / master pack)");
+    if (typeof body.gstInclusive !== "boolean") missing.push("Whether price includes GST");
+    if (typeof body.freightIncluded !== "boolean") missing.push("Whether freight is included");
+
+    if (body.sampleAvailable) {
+        if (!(Number(body.sampleQuantity) > 0)) missing.push("Sample quantity");
+        if (!PRICE_BASES.includes(body.sampleUnitBasis)) missing.push("Sample quantity basis");
+    }
+
+    if (!STOCK_TYPES.includes(body.stockType)) missing.push("Ready stock / Made-to-order");
+    if (body.stockType === "ready_stock" && !(Number(body.stockQuantity) >= 0)) missing.push("Available stock");
+    if (body.stockType === "made_to_order" && !(Number(body.productionLeadTimeDays) >= 0)) missing.push("Lead time");
+
+    if (!body.dispatchPincode?.trim()) missing.push("Dispatch pincode");
+    if (!(Array.isArray(body.dispatchingLocations) && body.dispatchingLocations.length)) missing.push("Dispatching locations");
+
+    if (!body.returnPolicyKey?.trim()) missing.push("Return / replacement policy");
+    if (!body.warrantyKey?.trim()) missing.push("Warranty");
+
+    return missing;
+}
+
+// `brand` supplies the fixed packaging identity (unit/pack_size/
+// units_per_master_pack) — always sourced from hs_generic_product_brands,
+// never from the seller's own submission.
+function toListingRow(body, brand) {
+    const unit = brand.unit;
+    const packSize = Number(brand.pack_size);
+    const masterPackSize = Number(brand.units_per_master_pack);
+
+    const { basePricePerUnit, finalPricePerUnit } = normalizeEnteredPrice(
+        body.basePrice, body.gstPercent, body.gstInclusive, body.priceBasis,
+        packSize, masterPackSize
+    );
+    const effectiveLeadTime = body.stockType === "made_to_order"
+        ? Number(body.productionLeadTimeDays || 0)
+        : Number(body.dispatchTimeDays || 0);
+    const images = Array.isArray(body.images) ? body.images : [];
+
+    return {
+        product_name: body.productName?.trim() || null,
+        brand_name: body.brandNotApplicable ? null : (body.brandName?.trim() || null),
+
+        price: finalPricePerUnit,
+        base_price: basePricePerUnit,
+        moq: Number(body.moq),
+        unit,                                   // ← from brand item
+        lead_time: effectiveLeadTime,
+        image: images[0] || null,
+        stock_quantity: body.stockType === "ready_stock" && body.stockQuantity !== "" ? Number(body.stockQuantity) : null,
+
+        gst_percent: Number(body.gstPercent),
+        price_basis: body.priceBasis,
+        gst_inclusive_input: Boolean(body.gstInclusive),
+        freight_included: Boolean(body.freightIncluded),
+
+        pack_size: packSize,                    // ← from brand item
+        units_per_master_pack: masterPackSize,   // ← from brand item
+
+        sample_available: Boolean(body.sampleAvailable),
+        sample_quantity: body.sampleAvailable ? Number(body.sampleQuantity) : null,
+        sample_unit_basis: body.sampleAvailable ? body.sampleUnitBasis : null,
+
+        price_slabs: [],
+        quantity_discounts: Array.isArray(body.priceSlabs) ? body.priceSlabs.filter((s) => s?.minQty && s?.discountPercent) : [],
+
+        stock_type: body.stockType,
+        production_lead_time_days: body.stockType === "made_to_order" ? Number(body.productionLeadTimeDays) : null,
+
+        dispatch_district: body.dispatchDistrict?.trim() || null,
+        dispatch_state: body.dispatchState?.trim() || null,
+        dispatch_pincode: body.dispatchPincode?.trim() || null,
+        dispatching_locations: Array.isArray(body.dispatchingLocations) ? body.dispatchingLocations : [],
+
+        hsn_code: body.hsnCode?.trim() || null,
+        return_policy_key: body.returnPolicyKey,
+        warranty_key: body.warrantyKey,
+        note_to_admin: body.noteToAdmin?.trim() || null,
+        quality_certificates: Array.isArray(body.qualityCertificates) ? body.qualityCertificates.filter((c) => c?.url) : [],
+    };
+}
+
+async function resolvePolicyText(kind, key) {
+    if (!key) return null;
+    const { data } = await supabase.from("listing_policy_options").select("full_text").eq("kind", kind).eq("key", key).maybeSingle();
+    return data?.full_text || null;
+}
+
+/* ------------------------- create submission (brand-new-or-matched flow) ------------------------- */
+
+export async function createSubmission(req, res) {
+    const sellerId = req.sellerId;
+    const body = req.body || {};
+
+    const missing = validateListingPayload(body);
+    if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.`, missing });
+
+    // 1) Does this exact product+brand already exist in the catalog?
+    let brand;
+    try {
+        brand = await findExistingBrandItem({
+            productName: body.productName,
+            brandName: body.brandName,
+            brandNotApplicable: Boolean(body.brandNotApplicable),
+        });
+
+        // 2) Only if it's genuinely new do we need packaging info from
+        // this seller — they're the one establishing it.
+        if (!brand) {
+            const packagingMissing = validateNewBrandPackaging(body);
+            if (packagingMissing.length) {
+                return res.status(400).json({ success: false, message: `Please provide: ${packagingMissing.join(", ")}.`, missing: packagingMissing });
+            }
+            brand = await createBrandItem({
+                productName: body.productName,
+                brandName: body.brandName,
+                brandImage: body.brandImage,
+                brandNotApplicable: Boolean(body.brandNotApplicable),
+                images: Array.isArray(body.images) ? body.images : [],
+                unit: body.unit,
+                packSize: body.packSize,
+                masterPackSize: body.masterPackSize,
+            });
+        }
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+
+    const isNewBrand = !brand.pack_size && !brand.unit ? false : true; // brand always has packaging by this point
+    const { data: existingRow } = await supabase
+        .from("seller_product_submissions")
+        .select("id, review_status")
+        .eq("seller_id", sellerId).eq("generic_product_brand_id", brand.id)
+        .maybeSingle();
+    if (existingRow && existingRow.review_status !== "rejected") {
+        return res.status(409).json({ success: false, message: "You're already listing this item." });
+    }
+
+    const row = toListingRow(body, brand);
+    const [returnText, warrantyText] = await Promise.all([
+        resolvePolicyText("return_policy", body.returnPolicyKey),
+        resolvePolicyText("warranty", body.warrantyKey),
+    ]);
+    row.return_policy = returnText;
+    row.warranty = warrantyText;
+
+    let inserted, error;
+    if (existingRow) {
+        ({ data: inserted, error } = await supabase
+            .from("seller_product_submissions")
+            .update({ ...row, review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null })
+            .eq("id", existingRow.id).select("id, created_at, price").single());
+    } else {
+        ({ data: inserted, error } = await supabase
+            .from("seller_product_submissions")
+            .insert({ seller_id: sellerId, generic_product_brand_id: brand.id, ...row })
+            .select("id, created_at, price").single());
+    }
+    if (error) {
+        if (error.code === "23505") return res.status(409).json({ success: false, message: "You're already listing this item." });
+        return res.status(500).json({ success: false, message: error.message });
+    }
+
+    await autoSaveDeliveryDefaults(sellerId, body);
+    await notifyAdmins({
+        type: "seller_submission",
+        title: existingRow ? "Listing resubmitted for review" : "New listing submitted",
+        message: `${brand.brand_name || "(No brand)"} — ${brand.name} ${existingRow ? "was resubmitted after rejection" : "is a brand-new product — map it to a category before approving"}.`,
+        link: `/admin/listings?highlight=${inserted.id}`,
+    });
+    await notifyAdminSubmissionsChanged();
+
+    const marketplace = await computeMarketplaceFigures(inserted.price);
+    res.json({ success: true, submission: inserted, marketplace, message: "Submitted for review. We'll notify you once it's approved." });
+}
+
 async function autoSaveDeliveryDefaults(sellerId, body) {
     const keys = GROUP_FIELD_MAP.delivery;
     const data = Object.fromEntries(keys.map((k) => [k, body[k]]));
@@ -117,184 +372,6 @@ async function resolveOrCreateBrandItem({ productName, brandName, brandImage, br
     return created;
 }
 
-/* ------------------------- validation ------------------------- */
-
-function validateListingPayload(body) {
-    const missing = [];
-
-    if (!body.productName?.trim()) missing.push("Product name");
-    if (!body.brandNotApplicable && !body.brandName?.trim()) missing.push("Brand");
-    if (!(Array.isArray(body.images) && body.images.length)) missing.push("Product image");
-
-    if (!body.unit || !ALLOWED_UNITS.includes(body.unit)) missing.push("Unit of measurement");
-    if (!(Number(body.packSize) > 0)) missing.push("Pack size");
-    if (!(Number(body.masterPackSize) > 0)) missing.push("Master pack size");
-    if (!(Number(body.moq) > 0)) missing.push("MOQ");
-    if (!body.hsnCode?.trim()) missing.push("HSN Code");
-    if (body.gstPercent === undefined || body.gstPercent === null || Number(body.gstPercent) < 0) missing.push("GST %");
-
-    if (!(Number(body.basePrice) > 0)) missing.push("Base price");
-    if (!PRICE_BASES.includes(body.priceBasis)) missing.push("Price basis (per unit / pack / master pack)");
-    if (typeof body.gstInclusive !== "boolean") missing.push("Whether price includes GST");
-    if (typeof body.freightIncluded !== "boolean") missing.push("Whether freight is included");
-
-    if (body.sampleAvailable) {
-        if (!(Number(body.sampleQuantity) > 0)) missing.push("Sample quantity");
-        if (!PRICE_BASES.includes(body.sampleUnitBasis)) missing.push("Sample quantity basis");
-    }
-
-    if (!STOCK_TYPES.includes(body.stockType)) missing.push("Ready stock / Made-to-order");
-    if (body.stockType === "ready_stock" && !(Number(body.stockQuantity) >= 0)) missing.push("Available stock");
-    if (body.stockType === "made_to_order" && !(Number(body.productionLeadTimeDays) >= 0)) missing.push("Lead time");
-
-    if (!body.dispatchPincode?.trim()) missing.push("Dispatch pincode");
-    if (!(Array.isArray(body.dispatchingLocations) && body.dispatchingLocations.length)) missing.push("Dispatching locations");
-
-    if (!body.returnPolicyKey?.trim()) missing.push("Return / replacement policy");
-    if (!body.warrantyKey?.trim()) missing.push("Warranty");
-
-    return missing;
-}
-
-function toListingRow(body) {
-    const { basePricePerUnit, finalPricePerUnit } = normalizeEnteredPrice(
-        body.basePrice, body.gstPercent, body.gstInclusive, body.priceBasis,
-        body.packSize, body.masterPackSize
-    );
-    const effectiveLeadTime = body.stockType === "made_to_order"
-        ? Number(body.productionLeadTimeDays || 0)
-        : Number(body.dispatchTimeDays || 0);
-    const images = Array.isArray(body.images) ? body.images : [];
-
-    return {
-        product_name: body.productName?.trim() || null,
-        brand_name: body.brandNotApplicable ? null : (body.brandName?.trim() || null),
-
-        price: finalPricePerUnit,
-        base_price: basePricePerUnit,
-        moq: Number(body.moq),
-        unit: body.unit,
-        lead_time: effectiveLeadTime,
-        image: images[0] || null,
-        stock_quantity: body.stockType === "ready_stock" && body.stockQuantity !== "" ? Number(body.stockQuantity) : null,
-
-        gst_percent: Number(body.gstPercent),
-        price_basis: body.priceBasis,
-        gst_inclusive_input: Boolean(body.gstInclusive),
-        freight_included: Boolean(body.freightIncluded),
-
-        pack_size: Number(body.packSize),
-        units_per_master_pack: Number(body.masterPackSize),
-
-        sample_available: Boolean(body.sampleAvailable),
-        sample_quantity: body.sampleAvailable ? Number(body.sampleQuantity) : null,
-        sample_unit_basis: body.sampleAvailable ? body.sampleUnitBasis : null,
-
-        price_slabs: [],
-        quantity_discounts: Array.isArray(body.priceSlabs) ? body.priceSlabs.filter((s) => s?.minQty && s?.discountPercent) : [],
-
-        stock_type: body.stockType,
-        production_lead_time_days: body.stockType === "made_to_order" ? Number(body.productionLeadTimeDays) : null,
-
-        dispatch_district: body.dispatchDistrict?.trim() || null,
-        dispatch_state: body.dispatchState?.trim() || null,
-        dispatch_pincode: body.dispatchPincode?.trim() || null,
-        dispatching_locations: Array.isArray(body.dispatchingLocations) ? body.dispatchingLocations : [],
-
-        hsn_code: body.hsnCode?.trim() || null,
-
-        return_policy_key: body.returnPolicyKey,
-        warranty_key: body.warrantyKey,
-
-        note_to_admin: body.noteToAdmin?.trim() || null,
-
-        quality_certificates: Array.isArray(body.qualityCertificates) ? body.qualityCertificates.filter((c) => c?.url) : [],
-    };
-}
-
-async function resolvePolicyText(kind, key) {
-    if (!key) return null;
-    const { data } = await supabase
-        .from("listing_policy_options")
-        .select("full_text").eq("kind", kind).eq("key", key).maybeSingle();
-    return data?.full_text || null;
-}
-
-/* ------------------------- create submission ------------------------- */
-
-// POST /api/seller/catalog/submissions
-export async function createSubmission(req, res) {
-    const sellerId = req.sellerId;
-    const body = req.body || {};
-
-    const missing = validateListingPayload(body);
-    if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.`, missing });
-
-    let brand;
-    try {
-        brand = await resolveOrCreateBrandItem({
-            productName: body.productName,
-            brandName: body.brandName,
-            brandImage: body.brandImage,
-            brandNotApplicable: Boolean(body.brandNotApplicable),
-            images: Array.isArray(body.images) ? body.images : [],
-        });
-    } catch (err) {
-        return res.status(500).json({ success: false, message: err.message });
-    }
-
-    const { data: existingRow } = await supabase
-        .from("seller_product_submissions")
-        .select("id, review_status")
-        .eq("seller_id", sellerId).eq("generic_product_brand_id", brand.id)
-        .maybeSingle();
-    if (existingRow && existingRow.review_status !== "rejected") {
-        return res.status(409).json({ success: false, message: "You're already listing this item." });
-    }
-
-    const row = toListingRow(body);
-    const [returnText, warrantyText] = await Promise.all([
-        resolvePolicyText("return_policy", body.returnPolicyKey),
-        resolvePolicyText("warranty", body.warrantyKey),
-    ]);
-    row.return_policy = returnText;
-    row.warranty = warrantyText;
-
-    let inserted, error;
-    if (existingRow) {
-        ({ data: inserted, error } = await supabase
-            .from("seller_product_submissions")
-            .update({ ...row, review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null })
-            .eq("id", existingRow.id).select("id, created_at, price").single());
-    } else {
-        ({ data: inserted, error } = await supabase
-            .from("seller_product_submissions")
-            .insert({ seller_id: sellerId, generic_product_brand_id: brand.id, ...row })
-            .select("id, created_at, price").single());
-    }
-    if (error) {
-        if (error.code === "23505") return res.status(409).json({ success: false, message: "You're already listing this item." });
-        return res.status(500).json({ success: false, message: error.message });
-    }
-
-    await autoSaveDeliveryDefaults(sellerId, body);
-
-    // Single admin entry point for every submission, new-brand or not: the
-    // Listings review page, never the catalog page. Hierarchy mapping now
-    // happens inline there, and approval is server-side blocked until it's
-    // done — so this is the only notification, and the only trip needed.
-    await notifyAdmins({
-        type: "seller_submission",
-        title: existingRow ? "Listing resubmitted for review" : "New listing submitted",
-        message: `${brand.brand_name || "(No brand)"} — ${brand.name} ${existingRow ? "was resubmitted after rejection" : "is a brand-new product — map it to a category before approving"}.`,
-        link: `/admin/listings?highlight=${inserted.id}`,
-    });
-    await notifyAdminSubmissionsChanged();
-
-    const marketplace = await computeMarketplaceFigures(inserted.price);
-    res.json({ success: true, submission: inserted, marketplace, message: "Submitted for review. We'll notify you once it's approved." });
-}
-
 // GET /api/seller/catalog/commission-info
 export async function getCommissionInfo(req, res) {
     const commissionPercent = await getCommissionPercent();
@@ -309,7 +386,7 @@ export async function createListingForExistingBrand(req, res) {
 
     const { data: brand, error: brandErr } = await supabase
         .from("hs_generic_product_brands")
-        .select("id, name, brand_name, image, images, review_status")
+        .select(`id, name, brand_name, image, images, review_status, ${BRAND_PACKAGING_COLS}`)
         .eq("id", genericProductBrandId).maybeSingle();
     if (brandErr) return res.status(500).json({ success: false, message: brandErr.message });
     if (!brand) return res.status(400).json({ success: false, message: "That item wasn't found." });
@@ -317,7 +394,9 @@ export async function createListingForExistingBrand(req, res) {
 
     const merged = { ...body, productName: brand.name, brandName: brand.brand_name, images: brand.images?.length ? brand.images : (brand.image ? [brand.image] : []) };
 
-    const missing = validateListingPayload(merged).filter((m) => !["Product name", "Brand", "Product image"].includes(m));
+    // Packaging is entirely fixed by the catalog entry here — never
+    // required from the seller, and never taken from body even if sent.
+    const missing = validateListingPayload(merged);
     if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.`, missing });
 
     const { data: existingRow } = await supabase
@@ -327,7 +406,7 @@ export async function createListingForExistingBrand(req, res) {
         return res.status(409).json({ success: false, message: "You're already listing this item." });
     }
 
-    const row = toListingRow(merged);
+    const row = toListingRow(merged, brand);
     const [returnText, warrantyText] = await Promise.all([
         resolvePolicyText("return_policy", body.returnPolicyKey),
         resolvePolicyText("warranty", body.warrantyKey),
@@ -351,9 +430,6 @@ export async function createListingForExistingBrand(req, res) {
     }
 
     await autoSaveDeliveryDefaults(sellerId, body);
-    // Already-approved brand item, so no mapping step is needed here — but
-    // still funnels through the same single review page as every other
-    // submission notification, for one consistent admin workflow.
     await notifyAdmins({
         type: "seller_submission",
         title: existingRow ? "Listing resubmitted for review" : "New listing submitted",
@@ -435,31 +511,23 @@ export async function updateSubmission(req, res) {
     const { id } = req.params;
     const body = req.body || {};
 
-    // Fetch the FULL existing row, not just identity columns — we need
-    // every field as a fallback so a partial PATCH (e.g. the row-level
-    // "Resubmit" quick-edit, which only sends price/moq/lead_time/stock)
-    // doesn't get rejected for "missing" fields that are already saved.
     const { data: existing, error: fetchErr } = await supabase
         .from("seller_product_submissions")
-        .select("*")
+        .select(`*, hs_generic_product_brands ( ${BRAND_PACKAGING_COLS} )`)
         .eq("id", id).eq("seller_id", sellerId).maybeSingle();
     if (fetchErr) return res.status(500).json({ success: false, message: fetchErr.message });
     if (!existing) return res.status(404).json({ success: false, message: "Submission not found." });
 
-    // Build the payload validateListingPayload/toListingRow expect,
-    // preferring anything explicitly sent in `body`, and otherwise
-    // falling back to what's already saved on the row. This makes the
-    // endpoint behave like a real PATCH (partial update) instead of
-    // requiring the entire form on every call.
+    const brandPackaging = existing.hs_generic_product_brands || {
+        unit: existing.unit, pack_size: existing.pack_size, units_per_master_pack: existing.units_per_master_pack,
+    };
+
     const merged = {
         productName: existing.product_name,
         brandName: existing.brand_name,
         brandNotApplicable: !existing.brand_name,
         images: Array.isArray(body.images) && body.images.length ? body.images : [existing.image].filter(Boolean),
 
-        unit: body.unit ?? existing.unit,
-        packSize: body.packSize ?? existing.pack_size,
-        masterPackSize: body.masterPackSize ?? existing.units_per_master_pack,
         moq: body.moq ?? existing.moq,
         hsnCode: body.hsnCode ?? existing.hsn_code,
         gstPercent: body.gstPercent ?? existing.gst_percent,
@@ -492,10 +560,10 @@ export async function updateSubmission(req, res) {
         qualityCertificates: body.qualityCertificates ?? existing.quality_certificates,
     };
 
-    const missing = validateListingPayload(merged).filter((m) => !["Product name", "Brand", "Product image"].includes(m));
+    const missing = validateListingPayload(merged);
     if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.`, missing });
 
-    const row = toListingRow(merged);
+    const row = toListingRow(merged, brandPackaging);
     const [returnText, warrantyText] = await Promise.all([
         resolvePolicyText("return_policy", merged.returnPolicyKey),
         resolvePolicyText("warranty", merged.warrantyKey),
@@ -511,7 +579,6 @@ export async function updateSubmission(req, res) {
     if (error) return res.status(500).json({ success: false, message: error.message });
 
     await autoSaveDeliveryDefaults(sellerId, body);
-
     await notifyAdmins({
         type: "seller_submission",
         title: "Listing edited and resubmitted for review",
