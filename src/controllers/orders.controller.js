@@ -140,12 +140,22 @@ async function estimateDeliveryDate(submission, buyerPincode, buyerState) {
     };
 }
 
+// toBaseUnits is no longer used in getOrderQuote (stock is tracked in
+// Packs too, same as pricing/MOQ/discounts) — kept only if some other
+// caller still needs true base-unit counts elsewhere.
 function toBaseUnits(submission, quantity, purchaseBasis) {
     const packSize = Number(submission.pack_size) > 0 ? Number(submission.pack_size) : 1;
     const masterPackSize = Number(submission.units_per_master_pack) > 0 ? Number(submission.units_per_master_pack) : 1;
     if (purchaseBasis === "per_pack") return quantity * packSize;
     if (purchaseBasis === "per_master_pack") return quantity * packSize * masterPackSize;
     return quantity;
+}
+
+// Pack is the atomic unit for pricing, MOQ, discounts, AND stock.
+function toPackQty(submission, quantity, purchaseBasis) {
+    const masterPackSize = Number(submission.units_per_master_pack) > 0 ? Number(submission.units_per_master_pack) : 1;
+    if (purchaseBasis === "per_master_pack") return quantity * masterPackSize;
+    return quantity; // per_pack — quantity is already a pack count
 }
 
 function resolveSlabUnitPrice(priceSlabs, quantity, fallbackPrice) {
@@ -188,11 +198,11 @@ export async function checkoutStatus(req, res) {
 // GET /api/orders/quote — unchanged shape, delivery fields updated to
 // transitDaysMin/transitDaysMax (see estimateDeliveryDate above).
 export async function getOrderQuote(req, res) {
-    const { submissionId, quantity, purchaseBasis = "per_unit", orderType = "standard", addressId } = req.query;
+    const { submissionId, quantity, purchaseBasis = "per_pack", orderType = "standard", addressId } = req.query;
     const qty = Number(quantity);
     if (!submissionId) return res.status(400).json({ success: false, message: "submissionId is required." });
     if (!(qty > 0)) return res.status(400).json({ success: false, message: "Enter a valid quantity." });
-    if (!["per_unit", "per_pack", "per_master_pack"].includes(purchaseBasis)) {
+    if (!["per_pack", "per_master_pack"].includes(purchaseBasis)) {
         return res.status(400).json({ success: false, message: "Invalid purchase basis." });
     }
 
@@ -206,7 +216,8 @@ export async function getOrderQuote(req, res) {
     }
 
     const isSample = orderType === "sample";
-    const baseQty = toBaseUnits(submission, qty, purchaseBasis);
+    const baseQty = toBaseUnits(submission, qty, purchaseBasis); // stock checks only
+    const packQty = toPackQty(submission, qty, purchaseBasis); // pricing / MOQ / discounts
 
     let addressPincode = null, addressState = null;
     if (addressId) {
@@ -232,30 +243,30 @@ export async function getOrderQuote(req, res) {
         });
     }
 
-    const { price: slabPrice, slab: appliedSlab } = resolveSlabUnitPrice(submission.price_slabs, baseQty, Number(submission.price));
-    const { percent: discountPercent, tier: discountTier } = resolveDiscountPercent(submission.quantity_discounts, baseQty);
+    const { price: slabPrice, slab: appliedSlab } = resolveSlabUnitPrice(submission.price_slabs, packQty, Number(submission.price));
+    const { percent: discountPercent, tier: discountTier } = resolveDiscountPercent(submission.quantity_discounts, packQty);
     const unitPrice = Math.round(slabPrice * (1 - discountPercent / 100) * 100) / 100;
 
     const { data: settings } = await supabase.from("platform_settings").select("commission_percent").eq("id", true).maybeSingle();
     const commissionPercent = Number(settings?.commission_percent ?? 5);
-    const subtotal = Math.round(unitPrice * baseQty * 100) / 100;
+    const subtotal = Math.round(unitPrice * packQty * 100) / 100;
     const platformFee = Math.round((subtotal * commissionPercent / 100) * 100) / 100;
 
     const stockShortfall = submission.stock_type === "ready_stock"
         && submission.stock_quantity != null
-        && baseQty > Number(submission.stock_quantity);
+        && packQty > Number(submission.stock_quantity); // ← was baseQty, now packQty
 
     res.json({
         success: true,
         orderType: "standard",
         unitPrice, basePriceApplied: slabPrice, appliedSlab, discountPercent, discountTier,
         unit: submission.unit, moq: submission.moq,
-        purchaseBasis, quantity: qty, baseQuantity: baseQty,
+        purchaseBasis, quantity: qty, baseQuantity: packQty, // NOTE: baseQuantity now reports pack-equivalent qty, see below
         estimatedDeliveryDate: delivery.label, leadDays: delivery.leadDays,
         transitDaysMin: delivery.transitDaysMin, transitDaysMax: delivery.transitDaysMax,
         availableStock: submission.stock_quantity, subtotal,
         platformFeePercent: commissionPercent, platformFeeAmount: platformFee, sellerPayoutAmount: subtotal - platformFee,
-        meetsMoq: baseQty >= Number(submission.moq),
+        meetsMoq: packQty >= Number(submission.moq),
         stockShortfall,
     });
 }
