@@ -25,9 +25,37 @@ export const ALLOWED_UNITS = [
 ];
 const STOCK_TYPES = ["ready_stock", "made_to_order"];
 const PRICE_BASES = ["per_unit", "per_pack", "per_master_pack"];
+// Was: only "delivery". Now maps every field the seller listing form
+// should be able to prefill from their last submission, split across the
+// three existing group_type buckets (no schema change needed — these
+// group types already existed for the "groups" feature).
 const GROUP_FIELD_MAP = {
     delivery: ["dispatchPincode", "dispatchingLocations", "freightIncluded"],
+    tax_legal: ["hsnCode", "gstPercent", "gstInclusive", "returnPolicyKey", "warrantyKey"],
+    commercial_terms: ["priceBasis"],
 };
+
+// Replaces autoSaveDeliveryDefaults — same call sites (createSubmission,
+// createListingForExistingBrand, updateSubmission), just saves across all
+// three groups instead of only delivery.
+async function autoSaveSellerDefaults(sellerId, body) {
+    for (const [groupType, keys] of Object.entries(GROUP_FIELD_MAP)) {
+        const data = Object.fromEntries(keys.map((k) => [k, body[k]]));
+        const hasValue = Object.values(data).some((v) => v !== "" && v != null && !(Array.isArray(v) && v.length === 0));
+        if (!hasValue) continue;
+        try {
+            const { data: existingTpl } = await supabase
+                .from("seller_listing_templates")
+                .select("id").eq("seller_id", sellerId).eq("group_type", groupType).eq("is_default", true)
+                .maybeSingle();
+            if (existingTpl) {
+                await supabase.from("seller_listing_templates").update({ data }).eq("id", existingTpl.id);
+            } else {
+                await supabase.from("seller_listing_templates").insert({ seller_id: sellerId, group_type: groupType, name: "Default", data, is_default: true });
+            }
+        } catch { /* best-effort */ }
+    }
+}
 
 const SUBMISSION_LIST_COLUMNS = `
     id, created_at, updated_at, review_status, rejection_reason,
@@ -109,10 +137,10 @@ function validateListingPayload(body) {
     if (!body.brandNotApplicable && !body.brandName?.trim()) missing.push("Brand");
     if (!(Array.isArray(body.images) && body.images.length)) missing.push("Product image");
 
-    // NOTE: unit / packSize / masterPackSize are NOT validated here anymore
-    // — see validateNewBrandPackaging, applied only when this seller is
-    // creating a brand-new catalog entry.
-
+    // NOTE: moq is now expressed in PACKS, not base units (see place_order()
+    // in Postgres — it compares against pack-quantity, converting master-pack
+    // orders up to packs first). Never multiply/divide this by pack_size when
+    // storing it — it's stored exactly as the seller entered it.
     if (!(Number(body.moq) > 0)) missing.push("MOQ");
     if (!body.hsnCode?.trim()) missing.push("HSN Code");
     if (body.gstPercent === undefined || body.gstPercent === null || Number(body.gstPercent) < 0) missing.push("GST %");
@@ -281,7 +309,7 @@ export async function createSubmission(req, res) {
         return res.status(500).json({ success: false, message: error.message });
     }
 
-    await autoSaveDeliveryDefaults(sellerId, body);
+    await autoSaveSellerDefaults(sellerId, body);
     await notifyAdmins({
         type: "seller_submission",
         title: existingRow ? "Listing resubmitted for review" : "New listing submitted",
@@ -453,7 +481,7 @@ export async function createListingForExistingBrand(req, res) {
         return res.status(500).json({ success: false, message: error.message });
     }
 
-    await autoSaveDeliveryDefaults(sellerId, body);
+    await autoSaveSellerDefaults(sellerId, body);
     await notifyAdmins({
         type: "seller_submission",
         title: existingRow ? "Listing resubmitted for review" : "New listing submitted",
@@ -602,7 +630,7 @@ export async function updateSubmission(req, res) {
         .select("id, created_at, price").single();
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    await autoSaveDeliveryDefaults(sellerId, body);
+    await autoSaveSellerDefaults(sellerId, body);
     await notifyAdmins({
         type: "seller_submission",
         title: "Listing edited and resubmitted for review",
