@@ -19,10 +19,10 @@ export async function getCommissionPercent() {
     }
     const { data } = await supabase
         .from("platform_settings")
-        .select("default_commission_percent")
+        .select("commission_percent")
         .eq("id", 1)
         .maybeSingle();
-    cachedCommissionPercent = Number(data?.default_commission_percent ?? 5);
+    cachedCommissionPercent = Number(data?.commission_percent ?? 2.5);
     cachedAt = Date.now();
     return cachedCommissionPercent;
 }
