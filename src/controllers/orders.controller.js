@@ -202,7 +202,13 @@ export async function getOrderQuote(req, res) {
     const qty = Number(quantity);
     if (!submissionId) return res.status(400).json({ success: false, message: "submissionId is required." });
     if (!(qty > 0)) return res.status(400).json({ success: false, message: "Enter a valid quantity." });
-    if (!["per_pack", "per_master_pack"].includes(purchaseBasis)) {
+
+    const isSample = orderType === "sample";
+    // Sample orders are still expressed in base units ("per_unit") — only
+    // standard orders are restricted to Pack/Master Pack basis now that
+    // pricing, MOQ, and stock are all tracked in Packs.
+    const allowedBases = isSample ? ["per_unit", "per_pack", "per_master_pack"] : ["per_pack", "per_master_pack"];
+    if (!allowedBases.includes(purchaseBasis)) {
         return res.status(400).json({ success: false, message: "Invalid purchase basis." });
     }
 
@@ -215,9 +221,9 @@ export async function getOrderQuote(req, res) {
         return res.status(404).json({ success: false, message: "Listing not available." });
     }
 
-    const isSample = orderType === "sample";
     const baseQty = toBaseUnits(submission, qty, purchaseBasis); // stock checks only
     const packQty = toPackQty(submission, qty, purchaseBasis); // pricing / MOQ / discounts
+
 
     let addressPincode = null, addressState = null;
     if (addressId) {
