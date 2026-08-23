@@ -74,8 +74,8 @@ export function normalizeEnteredPrice(enteredPrice, gstPercent, gstInclusive, ba
 
     // 2. bring it down to a single-unit basis
     let perUnitExGst = exGst;
-    if (basis === "per_pack") perUnitExGst = exGst / pack;
-    if (basis === "per_master_pack") perUnitExGst = exGst / (pack * master);
+    if (basis === "per_pack") perUnitExGst = exGst;
+    if (basis === "per_master_pack") perUnitExGst = exGst / master;
 
     const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
     return {
