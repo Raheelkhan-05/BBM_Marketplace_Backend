@@ -392,21 +392,45 @@ export async function createListingForExistingBrand(req, res) {
     if (!brand) return res.status(400).json({ success: false, message: "That item wasn't found." });
     if (brand.review_status !== "approved") return res.status(400).json({ success: false, message: "This item isn't available to list under yet." });
 
-    const merged = { ...body, productName: brand.name, brandName: brand.brand_name, images: brand.images?.length ? brand.images : (brand.image ? [brand.image] : []) };
+    // NEW — this brand item predates packaging being tracked (or was
+    // otherwise created without it). The frontend detects this via
+    // findBrandItemMatch and asks the seller to fill it in — so trust
+    // body.unit/packSize/masterPackSize here, validate them, and BACKFILL
+    // the brand item itself so this is the last time anyone has to.
+    const packagingMissing = !brand.unit || !(Number(brand.pack_size) > 0) || !(Number(brand.units_per_master_pack) > 0);
+    let effectiveBrand = brand;
+    if (packagingMissing) {
+        const missingFields = validateNewBrandPackaging(body);
+        if (missingFields.length) {
+            return res.status(400).json({ success: false, message: `Please provide: ${missingFields.join(", ")}.`, missing: missingFields });
+        }
+        const { data: backfilled, error: backfillErr } = await supabase
+            .from("hs_generic_product_brands")
+            .update({
+                unit: body.unit,
+                pack_size: Number(body.packSize),
+                units_per_master_pack: Number(body.masterPackSize),
+            })
+            .eq("id", brand.id)
+            .select(`id, name, brand_name, image, images, review_status, ${BRAND_PACKAGING_COLS}`)
+            .single();
+        if (backfillErr) return res.status(500).json({ success: false, message: backfillErr.message });
+        effectiveBrand = backfilled;
+    }
 
-    // Packaging is entirely fixed by the catalog entry here — never
-    // required from the seller, and never taken from body even if sent.
+    const merged = { ...body, productName: effectiveBrand.name, brandName: effectiveBrand.brand_name, images: effectiveBrand.images?.length ? effectiveBrand.images : (effectiveBrand.image ? [effectiveBrand.image] : []) };
+
     const missing = validateListingPayload(merged);
     if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.`, missing });
 
     const { data: existingRow } = await supabase
         .from("seller_product_submissions").select("id, review_status")
-        .eq("seller_id", sellerId).eq("generic_product_brand_id", brand.id).maybeSingle();
+        .eq("seller_id", sellerId).eq("generic_product_brand_id", effectiveBrand.id).maybeSingle();
     if (existingRow && existingRow.review_status !== "rejected") {
         return res.status(409).json({ success: false, message: "You're already listing this item." });
     }
 
-    const row = toListingRow(merged, brand);
+    const row = toListingRow(merged, effectiveBrand);   // ← was `brand`, now `effectiveBrand`
     const [returnText, warrantyText] = await Promise.all([
         resolvePolicyText("return_policy", body.returnPolicyKey),
         resolvePolicyText("warranty", body.warrantyKey),
@@ -421,7 +445,7 @@ export async function createListingForExistingBrand(req, res) {
             .eq("id", existingRow.id).select("id, created_at, price").single());
     } else {
         ({ data: result, error } = await supabase.from("seller_product_submissions")
-            .insert({ seller_id: sellerId, generic_product_brand_id: brand.id, ...row })
+            .insert({ seller_id: sellerId, generic_product_brand_id: effectiveBrand.id, ...row })
             .select("id, created_at, price").single());
     }
     if (error) {
@@ -433,13 +457,13 @@ export async function createListingForExistingBrand(req, res) {
     await notifyAdmins({
         type: "seller_submission",
         title: existingRow ? "Listing resubmitted for review" : "New listing submitted",
-        message: existingRow ? `A seller resubmitted "${brand.name}" after rejection.` : `A seller wants to list "${brand.name}".`,
+        message: existingRow ? `A seller resubmitted "${effectiveBrand.name}" after rejection.` : `A seller wants to list "${effectiveBrand.name}".`,
         link: `/admin/listings?highlight=${result.id}`,
     });
     await notifyAdminSubmissionsChanged();
 
     const marketplace = await computeMarketplaceFigures(result.price);
-    res.json({ success: true, submission: result, marketplace, message: `You're now listing "${brand.name}"${existingRow ? " again" : ""}. We'll notify you once it's approved.` });
+    res.json({ success: true, submission: result, marketplace, message: `You're now listing "${effectiveBrand.name}"${existingRow ? " again" : ""}. We'll notify you once it's approved.` });
 }
 
 /* ------------------------- list / detail / update / active ------------------------- */
