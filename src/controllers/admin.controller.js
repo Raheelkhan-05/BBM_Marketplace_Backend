@@ -62,8 +62,8 @@ export async function updateSellerAsAdmin(req, res) {
       userId: data.user_id, type: "seller_updated_by_admin",
       title: "Your shop details were updated by our team",
       body: "An administrator made changes to your shop profile.",
-      link: `/shop/${data.shop_slug}`,
-    }).catch(() => {});
+      link: `/seller/listings`,
+    }).catch(() => { });
   }
 
   res.json({ success: true, seller: data });
@@ -101,7 +101,7 @@ export async function approveSeller(req, res) {
     userId: updated.user_id, type: wasFirstApproval ? "seller_approved" : "seller_edit_approved",
     title: wasFirstApproval ? "Your shop is live! 🎉" : "Your shop updates are live",
     body: wasFirstApproval ? `${updated.display_name} is now visible to buyers on BBM.` : "Your recent changes have been approved and are now visible to buyers.",
-    link: `/shop/${updated.shop_slug}`,
+    link: `/seller/listings`,
     email: updated.profiles?.email,
     emailSubject: wasFirstApproval ? "Your BBM seller shop is now live" : "Your BBM shop updates are approved",
     emailHtml: `<p>Hi ${updated.profiles?.name || "there"},</p><p>${wasFirstApproval ? `Your shop <strong>${updated.display_name}</strong> has been approved and is now live to buyers.` : "The changes you made to your shop are now approved and visible to buyers."}</p><p><a href="${process.env.APP_BASE_URL}/shop/${updated.shop_slug}">View your shop</a></p>`,
@@ -146,7 +146,7 @@ export async function rejectSeller(req, res) {
     userId: updated.user_id, type: "seller_rejected",
     title: shopStaysLive ? "Your recent shop update wasn't approved" : "Action needed on your shop details",
     body: reason.trim(),
-    link: shopStaysLive ? "/shop/dashboard" : "/seller/onboarding",
+    link: shopStaysLive ? "/seller/listings" : "/seller/listings",
     email: updated.profiles?.email,
     emailSubject: shopStaysLive ? "Update to your BBM shop wasn't approved" : "Update needed on your BBM seller application",
     emailHtml: `<p>Hi ${updated.profiles?.name || "there"},</p><p>${shopStaysLive ? "We reviewed the recent changes to your live shop and need a few adjustments before they can go live:" : `We reviewed your seller application for <strong>${updated.display_name}</strong> and need a few changes before approving it:`}</p><blockquote>${reason.trim()}</blockquote>`,

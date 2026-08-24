@@ -2,20 +2,35 @@ import { supabase } from "../config/supabase.js";
 import { notifyAdmins, notifyUser } from "../utils/notify.js";
 import { sendOtp, verifyOtpCode } from "../utils/otp.js";
 
+// const REQUIRED_FIELDS = [
+//   "display_name", "business_type", "year_established",
+//   "contact_person", "whatsapp_number",
+//   "address", "pincode", "city", "state", "logo_url",
+// ];
+
+// // Fields that require re-review once a shop is already approved
+// const GATED_FIELDS = [
+//   "display_name", "business_type", "year_established", "employee_range", "annual_turnover",
+//   "contact_person", "whatsapp_number", "whatsapp_verified", "website",
+//   "address", "pincode", "city", "state", "country", "dispatch_same_as_registered",
+//   "logo_url", "primary_color", "secondary_color",
+//   "pan", "iec_code", "udyam_number", "cin",
+//   "export_countries", "working_days", "order_acceptance_start", "order_acceptance_end", "holidays",
+// ];
+
 const REQUIRED_FIELDS = [
-  "display_name", "business_type", "year_established",
+  "display_name", "business_type",
   "contact_person", "whatsapp_number",
-  "address", "pincode", "city", "state", "logo_url",
+  "logo_url",
+  "order_acceptance_start", "order_acceptance_end",
 ];
 
-// Fields that require re-review once a shop is already approved
 const GATED_FIELDS = [
-  "display_name", "business_type", "year_established", "employee_range", "annual_turnover",
+  "display_name", "business_type",
   "contact_person", "whatsapp_number", "whatsapp_verified", "website",
-  "address", "pincode", "city", "state", "country", "dispatch_same_as_registered",
   "logo_url", "primary_color", "secondary_color",
-  "pan", "iec_code", "udyam_number", "cin",
-  "export_countries", "working_days", "order_acceptance_start", "order_acceptance_end", "holidays",
+  "pan",
+  "working_days", "order_acceptance_start", "order_acceptance_end",
 ];
 
 const THEME_FIELDS = ["primary_color", "secondary_color"];
