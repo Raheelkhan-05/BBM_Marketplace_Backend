@@ -91,7 +91,7 @@ function validateNewBrandPackaging(body) {
     const missing = [];
     if (!body.unit || !ALLOWED_UNITS.includes(body.unit)) missing.push("Unit of measurement");
     if (!(Number(body.packSize) > 0)) missing.push("Pack size");
-    if (!(Number(body.masterPackSize) > 0)) missing.push("Master pack size");
+    // if (!(Number(body.masterPackSize) > 0)) missing.push("Master pack size");
     return missing;
 }
 
