@@ -27,16 +27,50 @@ export async function listPendingPaymentProofs(req, res) {
         .from("payment_proofs")
         .select(`
             id, utr_number, screenshot_url, amount_claimed, status, admin_note, created_at, reviewed_at,
+            order_id, order_group_id,
             order:orders (
                 id, order_number, total_amount, status, buyer_contact_name, buyer_contact_phone,
+                order_group_id,
                 seller:seller_profiles ( display_name, shop_slug )
+            ),
+            group:order_groups (
+                id, group_number
             )
         `)
         .eq("status", status)
         .order("created_at", { ascending: true });
 
     if (error) return res.status(500).json({ success: false, message: error.message });
-    res.json({ success: true, proofs: data || [] });
+
+    // Group proofs (order_id null) don't get an `order` via the FK embed
+    // above — resolve their sibling orders separately so the admin still
+    // sees a buyer, a total, and every seller the one UTR covers.
+    const groupProofIds = (data || []).filter(p => !p.order_id && p.order_group_id).map(p => p.order_group_id);
+    let ordersByGroup = {};
+    if (groupProofIds.length) {
+        const { data: groupOrders } = await supabase
+            .from("orders")
+            .select("id, order_number, total_amount, status, buyer_contact_name, buyer_contact_phone, order_group_id, seller:seller_profiles ( display_name, shop_slug )")
+            .in("order_group_id", groupProofIds);
+        ordersByGroup = (groupOrders || []).reduce((acc, o) => {
+            (acc[o.order_group_id] ||= []).push(o);
+            return acc;
+        }, {});
+    }
+
+    const proofs = (data || []).map((p) => {
+        const groupNumber = p.group?.group_number ?? null;
+        if (p.order) return { ...p, groupOrders: null, groupNumber };
+        const orders = ordersByGroup[p.order_group_id] || [];
+        return {
+            ...p,
+            order: orders[0] || null, // primary, for the existing card layout
+            groupOrders: orders,      // full set, for a "covers N sellers" line
+            groupNumber,
+        };
+    });
+
+    res.json({ success: true, proofs });
 }
 
 // POST /api/admin/payment-proofs/:id/verify

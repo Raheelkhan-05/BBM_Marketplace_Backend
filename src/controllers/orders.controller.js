@@ -367,6 +367,7 @@ export async function listMyOrders(req, res) {
         .from("orders")
         .select(`
       id, order_number, status, order_type, sample_order_id, stock_shortfall,
+      order_group_id, group_number,
       subtotal_amount, total_amount, payment_status, created_at, updated_at,
       seller:seller_profiles ( id, display_name, shop_slug, logo_url, city, state ),
       items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied, discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )

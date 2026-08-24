@@ -25,6 +25,7 @@ export async function listSellerOrders(req, res) {
         .from("orders")
         .select(`
       id, order_number, status, order_type, sample_order_id, stock_shortfall,
+      order_group_id, group_number,
       subtotal_amount, platform_fee_percent, platform_fee_amount, seller_payout_amount, total_amount,
       payment_status, buyer_contact_name, buyer_contact_phone, buyer_contact_email,
       buyer_gstin, buyer_business_name, buyer_gst_verified,
