@@ -204,9 +204,6 @@ export async function getOrderQuote(req, res) {
     if (!(qty > 0)) return res.status(400).json({ success: false, message: "Enter a valid quantity." });
 
     const isSample = orderType === "sample";
-    // Sample orders are still expressed in base units ("per_unit") — only
-    // standard orders are restricted to Pack/Master Pack basis now that
-    // pricing, MOQ, and stock are all tracked in Packs.
     const allowedBases = isSample ? ["per_unit", "per_pack", "per_master_pack"] : ["per_pack", "per_master_pack"];
     if (!allowedBases.includes(purchaseBasis)) {
         return res.status(400).json({ success: false, message: "Invalid purchase basis." });
@@ -224,7 +221,6 @@ export async function getOrderQuote(req, res) {
     const baseQty = toBaseUnits(submission, qty, purchaseBasis); // stock checks only
     const packQty = toPackQty(submission, qty, purchaseBasis); // pricing / MOQ / discounts
 
-
     let addressPincode = null, addressState = null;
     if (addressId) {
         const { data: addr } = await supabase.from("buyer_addresses").select("pincode, state").eq("id", addressId).maybeSingle();
@@ -233,6 +229,8 @@ export async function getOrderQuote(req, res) {
     const delivery = await estimateDeliveryDate(submission, addressPincode, addressState);
 
     if (isSample) {
+        // unchanged — sample_price is genuinely per base-unit, multiplied
+        // against baseQty (also base units), so this was already correct.
         if (!submission.sample_available) return res.status(400).json({ success: false, message: "This seller doesn't offer a sample for this item." });
         const exceedsSample = submission.sample_quantity != null && baseQty > Number(submission.sample_quantity);
         return res.json({
@@ -249,8 +247,22 @@ export async function getOrderQuote(req, res) {
         });
     }
 
-    const { price: slabPrice, slab: appliedSlab } = resolveSlabUnitPrice(submission.price_slabs, packQty, Number(submission.price));
-    const { percent: discountPercent, tier: discountTier } = resolveDiscountPercent(submission.quantity_discounts, packQty);
+    // submission.price is stored per base UNIT (matches SellerListingForm's
+    // basePrice/priceBasis="per_unit" convention and place_order's own use
+    // of v_submission.price against base units). Slab/discount resolution
+    // and subtotal here are expressed against packQty (a Pack count), so
+    // scale up to a per-Pack price first — same anchor-then-scale-up fix
+    // as BuyNowModal.computeLocalQuote and HomeProductFeed.computePriceBreakdown.
+    const packSize = Number(submission.pack_size) > 0 ? Number(submission.pack_size) : 1;
+    const pricePerPack = Math.round(Number(submission.price) * packSize * 100) / 100;
+
+    const { price: slabPrice, slab: appliedSlab } = resolveSlabUnitPrice(submission.price_slabs, packQty, pricePerPack);
+    // quantity_discounts is set by the seller directly in whatever basis they
+    // sell by (Pack or Master Pack) — resolve against the quantity exactly as
+    // the buyer entered it (qty), never converted to Packs. price_slabs above
+    // stays on packQty — that one is canonically Pack-normalized per
+    // SellerListingForm's convention.
+    const { percent: discountPercent, tier: discountTier } = resolveDiscountPercent(submission.quantity_discounts, qty);
     const unitPrice = Math.round(slabPrice * (1 - discountPercent / 100) * 100) / 100;
 
     const { data: settings } = await supabase.from("platform_settings").select("commission_percent").eq("id", true).maybeSingle();
@@ -260,14 +272,14 @@ export async function getOrderQuote(req, res) {
 
     const stockShortfall = submission.stock_type === "ready_stock"
         && submission.stock_quantity != null
-        && packQty > Number(submission.stock_quantity); // ← was baseQty, now packQty
+        && packQty > Number(submission.stock_quantity);
 
     res.json({
         success: true,
         orderType: "standard",
         unitPrice, basePriceApplied: slabPrice, appliedSlab, discountPercent, discountTier,
         unit: submission.unit, moq: submission.moq,
-        purchaseBasis, quantity: qty, baseQuantity: packQty, // NOTE: baseQuantity now reports pack-equivalent qty, see below
+        purchaseBasis, quantity: qty, baseQuantity: packQty,
         estimatedDeliveryDate: delivery.label, leadDays: delivery.leadDays,
         transitDaysMin: delivery.transitDaysMin, transitDaysMax: delivery.transitDaysMax,
         availableStock: submission.stock_quantity, subtotal,
