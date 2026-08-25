@@ -18,13 +18,15 @@ import multer from "multer";
 import { downloadCatalogTemplate, bulkUploadCatalog } from "../controllers/adminCatalogBulk.controller.js";
 import { uploadCatalogImage } from "../controllers/adminUpload.controller.js";
 import { listPendingPaymentProofs, verifyPayment, rejectPayment } from "../controllers/paymentVerification.controller.js";
-
+import adminDbRoutes from "./adminDb.routes.js";
 import { downloadFullCatalogTemplate, bulkUploadFullCatalog } from "../controllers/adminCatalogFullBulk.controller.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
 
 
 const router = Router();
+
+router.use(adminDbRoutes);
 
 router.get("/sellers", requireAuth, requireAdmin, listSellers);
 router.get("/sellers/:id", requireAuth, requireAdmin, getSellerDetail);
