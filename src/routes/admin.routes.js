@@ -21,6 +21,10 @@ import { listPendingPaymentProofs, verifyPayment, rejectPayment } from "../contr
 import adminDbRoutes from "./adminDb.routes.js";
 import { downloadFullCatalogTemplate, bulkUploadFullCatalog } from "../controllers/adminCatalogFullBulk.controller.js";
 import productCommissionRoutes from "./productCommission.routes.js";
+// NEW — these two functions already existed in wallet.controller.js but were
+// never imported/mounted here, which is why there was no admin route to
+// verify wallet top-ups. Wiring them in now.
+import { adminListWalletPayments, adminVerifyWalletPayment } from "../controllers/wallet.controller.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
 
@@ -60,6 +64,11 @@ router.post("/catalog/:level", requireAuth, requireAdmin, authWriteLimiter, crea
 router.get("/payment-proofs", requireAuth, requireAdmin, listPendingPaymentProofs);
 router.post("/payment-proofs/:id/verify", requireAuth, requireAdmin, authWriteLimiter, verifyPayment);
 router.post("/payment-proofs/:id/reject", requireAuth, requireAdmin, authWriteLimiter, rejectPayment);
+
+// NEW — wallet top-up (seller credit recharge) verification queue.
+// Mirrors the order payment-proofs routes above, but for wallet_payments.
+router.get("/wallet/payments", requireAuth, requireAdmin, adminListWalletPayments);
+router.post("/wallet/payments/:id/verify", requireAuth, requireAdmin, authWriteLimiter, adminVerifyWalletPayment);
 
 router.get("/catalog-bulk/excel-template", requireAuth, requireAdmin, downloadFullCatalogTemplate);
 router.post("/catalog-bulk/excel-upload", requireAuth, requireAdmin, upload.single("file"), bulkUploadFullCatalog);
