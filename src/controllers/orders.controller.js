@@ -44,6 +44,19 @@ function formatDDMon(date) {
     return `${String(date.getDate()).padStart(2, "0")} ${MONTH_SHORT[date.getMonth()]}`;
 }
 
+// controllers/orders.controller.js — new helper, used before quote & placement
+async function assertSellerAcceptingOrders(sellerId) {
+    const { data, error } = await supabase.rpc("wallet_get_status", { p_seller_id: sellerId }).single();
+    if (error) return null; // fail open on infra error — don't block buyers over a wallet read failure
+    if (data?.is_blocked) {
+        const reason = data.blocked_reason === "monthly_unpaid"
+            ? "This seller has an unpaid monthly platform balance and isn't accepting new orders right now."
+            : "This seller has reached their order limit and isn't accepting new orders right now.";
+        return reason;
+    }
+    return null;
+}
+
 // ---------------------------------------------------------------------
 // Distance-based transit estimate
 // ---------------------------------------------------------------------
@@ -203,6 +216,13 @@ export async function getOrderQuote(req, res) {
     if (!submissionId) return res.status(400).json({ success: false, message: "submissionId is required." });
     if (!(qty > 0)) return res.status(400).json({ success: false, message: "Enter a valid quantity." });
 
+    // inside getOrderQuote, right after fetching `submission`:
+    const { data: sellerRow } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
+    if (sellerRow) {
+        const blockMsg = await assertSellerAcceptingOrders(sellerRow.seller_id);
+        if (blockMsg) return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: blockMsg });
+    }
+
     const isSample = orderType === "sample";
     const allowedBases = isSample ? ["per_unit", "per_pack", "per_master_pack"] : ["per_pack", "per_master_pack"];
     if (!allowedBases.includes(purchaseBasis)) {
@@ -306,6 +326,13 @@ export async function placeOrder(req, res) {
     }
     const safeOrderType = orderType === "sample" ? "sample" : orderType === "credit" ? "credit" : "standard";
 
+
+    const { data: sellerRow } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
+    if (sellerRow) {
+        const blockMsg = await assertSellerAcceptingOrders(sellerRow.seller_id);
+        if (blockMsg) return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: blockMsg });
+    }
+
     const { data, error } = await supabase.rpc("place_order", {
         p_buyer_id: buyerId,
         p_submission_id: submissionId,
@@ -335,6 +362,14 @@ export async function placeOrder(req, res) {
     // skip the gate). Only broadcast the seller's live "orders changed" realtime
     // event for the latter — standard orders' seller broadcast now fires from
     // admin_verify_payment() instead, once payment is actually confirmed.
+    // placeOrder() — move the accrual call INSIDE the existing status check,
+    // instead of firing it unconditionally after the RPC. This means:
+    //   - sample orders: no-op inside wallet_accrue_commission anyway (order_type check)
+    //   - credit orders: accrue immediately — they skip awaiting_payment by design,
+    //     there's no separate "payment verified" moment for credit
+    //   - standard orders: do NOT accrue here — they're sitting in awaiting_payment,
+    //     commission only accrues once admin_verify_payment confirms the UPI payment
+    //     (see paymentVerification.controller.js below)
     if (row.order_status !== "awaiting_payment") {
         const { data: submission } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
         if (submission) {
@@ -343,7 +378,13 @@ export async function placeOrder(req, res) {
                 await notifyUserOrdersChanged(sellerProfile.user_id);
             }
         }
+        // NEW — commission accrual belongs here now, not unconditionally after the RPC
+        await supabase.rpc("wallet_accrue_commission", { p_order_id: row.order_id });
     }
+
+    // NEW — accrue platform commission into the seller's wallet for any order
+    // that isn't a sample (samples carry no fee, checked inside the RPC itself).
+    await supabase.rpc("wallet_accrue_commission", { p_order_id: row.order_id });
 
     res.json({
         success: true,
@@ -394,6 +435,7 @@ export async function getMyOrder(req, res) {
 }
 
 // POST /api/orders/:id/cancel — unchanged (see file header for the notification de-dup note)
+// cancelMyOrder() — add this after notifyOrderChanged, before the seller-notify block
 export async function cancelMyOrder(req, res) {
     const { reason } = req.body || {};
     const { error } = await supabase.rpc("update_order_status", {
@@ -407,6 +449,13 @@ export async function cancelMyOrder(req, res) {
     }
 
     await notifyOrderChanged(req.params.id, { status: "cancelled" });
+
+    // NEW — if this order's commission had already accrued (only possible for
+    // credit orders, since standard orders never accrue before payment is
+    // verified — see above), reverse it. Safe to call even when nothing was
+    // ever accrued; the RPC checks first and no-ops.
+    await supabase.rpc("wallet_reverse_commission", { p_order_id: req.params.id });
+
     const { data: order } = await supabase.from("orders").select("seller_id, order_number").eq("id", req.params.id).maybeSingle();
     if (order) {
         const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", order.seller_id).maybeSingle();

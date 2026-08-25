@@ -41,6 +41,17 @@ export async function removeCartItem(req, res) {
 export async function checkoutCart(req, res) {
     const { shippingAddressId, notes } = req.body || {};
     // console.log(req.user.id)
+
+    // controllers/cart.controller.js — checkoutCart(), before calling place_cart_order
+    const { data: cartItems } = await supabase.rpc("cart_list", { p_buyer_id: req.user.id });
+    const sellerIds = [...new Set((cartItems || []).map((i) => i.seller_id))];
+    for (const sid of sellerIds) {
+        const { data: status } = await supabase.rpc("wallet_get_status", { p_seller_id: sid }).single();
+        if (status?.is_blocked) {
+            return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: "One or more sellers in your cart aren't accepting new orders right now. Please remove their items to continue." });
+        }
+    }
+
     const { data, error } = await supabase.rpc("place_cart_order", {
         p_buyer_id: req.user.id, p_shipping_address_id: shippingAddressId, p_buyer_notes: notes || null,
     }).single();

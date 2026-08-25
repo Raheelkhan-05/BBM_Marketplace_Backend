@@ -74,6 +74,7 @@ export async function listPendingPaymentProofs(req, res) {
 }
 
 // POST /api/admin/payment-proofs/:id/verify
+// POST /api/admin/payment-proofs/:id/verify
 export async function verifyPayment(req, res) {
     const { note } = req.body || {};
     const { error } = await supabase.rpc("admin_verify_payment", {
@@ -86,6 +87,30 @@ export async function verifyPayment(req, res) {
         const mapped = mapVerifyError(error);
         return res.status(mapped.status).json({ success: false, code: error.message, message: mapped.message });
     }
+
+    // NEW — this is the actual "payment confirmed" moment. Commission gets
+    // added to the wallet HERE, not at order placement. Covers both shapes:
+    //   - single-order proof (order_id set)
+    //   - cart/group proof (order_group_id set) — one UTR can cover several
+    //     seller orders at once, so accrue for every sibling order in the group
+    const { data: proof } = await supabase
+        .from("payment_proofs")
+        .select("order_id, order_group_id")
+        .eq("id", req.params.id)
+        .maybeSingle();
+
+    if (proof?.order_id) {
+        await supabase.rpc("wallet_accrue_commission", { p_order_id: proof.order_id });
+    } else if (proof?.order_group_id) {
+        const { data: groupOrders } = await supabase
+            .from("orders")
+            .select("id")
+            .eq("order_group_id", proof.order_group_id);
+        for (const o of groupOrders || []) {
+            await supabase.rpc("wallet_accrue_commission", { p_order_id: o.id });
+        }
+    }
+
     res.json({ success: true, message: "Payment verified. The seller has been notified." });
 }
 

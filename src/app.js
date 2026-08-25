@@ -22,6 +22,7 @@ import listingPolicyOptionsRoutes from "./routes/listingPolicyOptions.routes.js"
 import chatRoutes from "./routes/chat.routes.js";
 import creditRoutes from "./routes/credit.routes.js";
 import cartRoutes from "./routes/cart.routes.js";
+import sellerWalletRoutes from "./routes/wallet.routes.js";
 
 export function createApp() {
   const app = express();
@@ -60,6 +61,7 @@ export function createApp() {
   app.use("/api/auth", authRoutes);
   app.use("/api/seller/catalog", sellerCatalogListingsRouter);
   app.use("/api/seller/orders", sellerOrdersRoutes);
+  app.use("/api/seller/wallet", sellerWalletRoutes);
   app.use("/api/admin/seller-submissions", adminSellerSubmissionsRouter);
   app.use("/api/seller", sellerRoutes);
   app.use("/api/admin", adminRoutes);
@@ -78,6 +80,7 @@ export function createApp() {
   app.use("/api/listing-policy-options", listingPolicyOptionsRoutes);
   app.use("/api/credit", creditRoutes);
   app.use("/api/cart", cartRoutes);
+
 
   app.use((err, req, res, next) => {
     console.error(err);

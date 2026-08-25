@@ -65,6 +65,8 @@ function transitionHandler(newStatus) {
             return res.status(status).json({ success: false, code: error.message, message: status === 400 ? "That status change isn't allowed right now." : "Couldn't update the order." });
         }
 
+        if (newStatus === "rejected") { await supabase.rpc("wallet_reverse_commission", { p_order_id: req.params.id }); }
+
         await notifyOrderChanged(req.params.id, { status: newStatus });
         const { data: order } = await supabase.from("orders").select("buyer_id, order_number").eq("id", req.params.id).maybeSingle();
         if (order) {
