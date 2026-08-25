@@ -55,10 +55,11 @@ export async function listConversations(req, res) {
     const otherUserIds = [...new Set(
         convs.flatMap((c) => (c.is_group ? [] : [c.direct_user_a, c.direct_user_b]).filter((id) => id !== userId))
     )];
-    const { data: otherProfiles } = otherUserIds.length
-        ? await supabase.from("profiles").select("id, name").in("id", otherUserIds)
+    // Shop name only — never fetch/expose the personal profile name here.
+    const { data: otherSellerProfiles } = otherUserIds.length
+        ? await supabase.from("seller_profiles").select("user_id, display_name, logo_url").in("user_id", otherUserIds)
         : { data: [] };
-    const profileById = Object.fromEntries((otherProfiles || []).map((p) => [p.id, p]));
+    const shopById = Object.fromEntries((otherSellerProfiles || []).map((p) => [p.user_id, p]));
 
     const myRowById = Object.fromEntries(myRows.map((r) => [r.conversation_id, r]));
 
@@ -69,7 +70,9 @@ export async function listConversations(req, res) {
         return {
             id: c.id,
             isGroup: c.is_group,
-            title: c.is_group ? c.title : profileById[otherId]?.name || "Unknown user",
+            title: c.is_group ? c.title : undefined,
+            otherShopName: c.is_group ? undefined : (shopById[otherId]?.display_name || "Unknown seller"),
+            otherShopLogo: c.is_group ? undefined : (shopById[otherId]?.logo_url || null),
             otherUserId: otherId,
             lastMessagePreview: c.last_message_preview,
             lastMessageIsMine: c.last_message_sender_id === userId,
@@ -303,34 +306,41 @@ export async function deleteMessage(req, res) {
     res.json({ success: true, scope: "me" });
 }
 
-// ---- search: name OR their shop's name ----
+// ---- search: approved sellers by shop name only ----
 export async function searchChatUsers(req, res) {
     const q = (req.query.q || "").trim();
     const myId = req.user.id;
     if (q.length < 2) return res.json({ success: true, users: [] });
 
-    const [byName, byShop] = await Promise.all([
-        supabase.from("profiles").select("id, name").neq("id", myId).ilike("name", `%${q}%`).limit(10),
-        supabase.from("seller_profiles").select("user_id, display_name, shop_slug").neq("user_id", myId).eq("status", "approved").ilike("display_name", `%${q}%`).limit(10),
-    ]);
+    const { data: byShop, error } = await supabase
+        .from("seller_profiles")
+        .select("user_id, display_name")
+        .eq("status", "approved")
+        .neq("user_id", myId)
+        .ilike("display_name", `%${q}%`)
+        .limit(12);
+    if (error) return res.status(500).json({ success: false, message: error.message });
 
-    const shopUserIds = (byShop.data || []).map((s) => s.user_id);
-    const { data: shopOwnerProfiles } = shopUserIds.length
-        ? await supabase.from("profiles").select("id, name").in("id", shopUserIds)
-        : { data: [] };
-    const nameByUserId = Object.fromEntries((shopOwnerProfiles || []).map((p) => [p.id, p.name]));
-
-    const merged = new Map();
-    (byName.data || []).forEach((u) => merged.set(u.id, { id: u.id, name: u.name, matchedVia: "name" }));
-    (byShop.data || []).forEach((s) => {
-        merged.set(s.user_id, {
-            id: s.user_id,
-            name: nameByUserId[s.user_id] || "Unknown user",
-            shopName: s.display_name,
-            shopSlug: s.shop_slug,
-            matchedVia: "shop",
-        });
+    res.json({
+        success: true,
+        users: (byShop || []).map((s) => ({ id: s.user_id, shopName: s.display_name })),
     });
+}
 
-    res.json({ success: true, users: Array.from(merged.values()).slice(0, 12) });
+// ---- list all approved sellers, for the buyer's "start a chat" sidebar ----
+export async function listApprovedSellers(req, res) {
+    const myId = req.user.id;
+
+    const { data: sellers, error } = await supabase
+        .from("seller_profiles")
+        .select("user_id, display_name, logo_url")
+        .eq("status", "approved")
+        .neq("user_id", myId)
+        .order("display_name", { ascending: true });
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    res.json({
+        success: true,
+        sellers: (sellers || []).map((s) => ({ id: s.user_id, shopName: s.display_name, logoUrl: s.logo_url || null })),
+    });
 }

@@ -50,10 +50,10 @@ export async function submitWalletPayment(req, res) {
         p_seller_id: req.sellerId, p_amount: Number(amount), p_utr: utr || null, p_screenshot_url: screenshotUrl || null,
     });
     if (error) {
-        const map = { NOTHING_DUE: "There's nothing due right now.", INVALID_AMOUNT: "Enter a valid amount, not exceeding your balance due." };
+        const map = { INVALID_AMOUNT: "Enter a valid top-up amount." }; // NOTHING_DUE removed — no longer thrown
         return res.status(400).json({ success: false, code: error.message, message: map[error.message] || "Couldn't submit payment." });
     }
-    res.json({ success: true, paymentId: data, message: "Payment submitted — we'll verify it shortly." });
+    res.json({ success: true, paymentId: data, message: "Credits submitted — we'll verify it shortly." });
 }
 
 // GET /api/seller/wallet/payments — seller's own payment history
