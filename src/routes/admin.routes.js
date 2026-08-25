@@ -20,6 +20,7 @@ import { uploadCatalogImage } from "../controllers/adminUpload.controller.js";
 import { listPendingPaymentProofs, verifyPayment, rejectPayment } from "../controllers/paymentVerification.controller.js";
 import adminDbRoutes from "./adminDb.routes.js";
 import { downloadFullCatalogTemplate, bulkUploadFullCatalog } from "../controllers/adminCatalogFullBulk.controller.js";
+import productCommissionRoutes from "./productCommission.routes.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
 
@@ -27,6 +28,8 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 *
 const router = Router();
 
 router.use(adminDbRoutes);
+
+router.use(productCommissionRoutes);
 
 router.get("/sellers", requireAuth, requireAdmin, listSellers);
 router.get("/sellers/:id", requireAuth, requireAdmin, getSellerDetail);

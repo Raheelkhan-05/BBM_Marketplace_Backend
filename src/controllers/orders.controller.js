@@ -231,7 +231,7 @@ export async function getOrderQuote(req, res) {
 
     const { data: submission, error } = await supabase
         .from("seller_product_submissions")
-        .select("id, price, moq, unit, lead_time, stock_quantity, review_status, price_slabs, quantity_discounts, stock_type, dispatch_time_days, production_lead_time_days, pack_size, units_per_master_pack, dispatch_pincode, dispatch_state, sample_available, sample_quantity, sample_price")
+        .select("id, price, moq, unit, lead_time, stock_quantity, review_status, price_slabs, quantity_discounts, stock_type, dispatch_time_days, production_lead_time_days, pack_size, units_per_master_pack, dispatch_pincode, dispatch_state, sample_available, sample_quantity, sample_price, generic_product_brand_id")
         .eq("id", submissionId).maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!submission || submission.review_status !== "approved") {
@@ -285,8 +285,11 @@ export async function getOrderQuote(req, res) {
     const { percent: discountPercent, tier: discountTier } = resolveDiscountPercent(submission.quantity_discounts, qty);
     const unitPrice = Math.round(slabPrice * (1 - discountPercent / 100) * 100) / 100;
 
-    const { data: settings } = await supabase.from("platform_settings").select("commission_percent").eq("id", true).maybeSingle();
-    const commissionPercent = Number(settings?.commission_percent ?? 5);
+    // const { data: settings } = await supabase.from("platform_settings").select("commission_percent").eq("id", true).maybeSingle();
+    const { data: commissionPercentData } = await supabase
+        .rpc("resolve_commission_percent", { p_generic_product_brand_id: submission.generic_product_brand_id });
+    const commissionPercent = Number(commissionPercentData ?? 0.25);
+
     const subtotal = Math.round(unitPrice * packQty * 100) / 100;
     const platformFee = Math.round((subtotal * commissionPercent / 100) * 100) / 100;
 
