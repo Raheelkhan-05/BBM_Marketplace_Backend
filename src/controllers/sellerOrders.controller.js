@@ -16,7 +16,7 @@
 // listSellerOrders and getSellerOrder are unchanged, reproduced for
 // completeness so this is a drop-in replacement.
 import { supabase } from "../config/supabase.js";
-import { notifyOrderChanged, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
+import { notifyOrderChanged, notifyUserOrdersChanged, notifyUser } from "../services/realtimeBroadcast.js";
 
 // GET /api/seller/orders
 export async function listSellerOrders(req, res) {
@@ -33,7 +33,7 @@ export async function listSellerOrders(req, res) {
       shipping_address_snapshot, buyer_notes, created_at, updated_at,
       items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied, discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )
     `)
-        .eq("seller_id", req.sellerId).order("created_at", { ascending: false });
+        .eq("seller_id", req.sellerId).neq("status", "awaiting_payment").order("created_at", { ascending: false });
     if (status) query = query.eq("status", status);
     if (orderType) query = query.eq("order_type", orderType);
 
@@ -48,7 +48,7 @@ export async function listSellerOrders(req, res) {
 export async function getSellerOrder(req, res) {
     const { data: order, error } = await supabase
         .from("orders").select("*, items:order_items ( * )")
-        .eq("id", req.params.id).eq("seller_id", req.sellerId).maybeSingle();
+        .eq("id", req.params.id).eq("seller_id", req.sellerId).neq("status", "awaiting_payment").maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!order) return res.status(404).json({ success: false, message: "Order not found." });
 
@@ -59,7 +59,7 @@ export async function getSellerOrder(req, res) {
 function transitionHandler(newStatus) {
     return async function (req, res) {
         const { reason } = req.body || {};
-        const { error } = await supabase.rpc("update_order_status", {
+        const { data, error } = await supabase.rpc("update_order_status", {
             p_order_id: req.params.id, p_actor_role: "seller", p_actor_user_id: req.user.id,
             p_new_status: newStatus, p_note: reason || null,
         });
@@ -70,10 +70,17 @@ function transitionHandler(newStatus) {
 
         if (newStatus === "rejected") { await supabase.rpc("wallet_reverse_commission", { p_order_id: req.params.id }); }
 
+        const row = Array.isArray(data) ? data[0] : data;
+
         await notifyOrderChanged(req.params.id, { status: newStatus });
-        const { data: order } = await supabase.from("orders").select("buyer_id, order_number").eq("id", req.params.id).maybeSingle();
-        if (order) {
-            await notifyUserOrdersChanged(order.buyer_id);
+        if (row?.notify_user_id) {
+            await notifyUser(row.notify_user_id, {
+                type: `order_status_${newStatus}`,
+                title: `Order ${row.order_number} ${newStatus.replace("_", " ")}`,
+                body: reason || `Your order status was updated to ${newStatus.replace("_", " ")}.`,
+                link: `/orders/${req.params.id}`,
+            });
+            await notifyUserOrdersChanged(row.notify_user_id);
         }
         res.json({ success: true, message: `Order marked as ${newStatus.replace("_", " ")}.` });
     };

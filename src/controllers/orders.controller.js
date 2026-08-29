@@ -19,7 +19,9 @@
 // same distance -> days formula, so there's only one place day counts are
 // ever computed from.
 import { supabase } from "../config/supabase.js";
-import { notifyOrderChanged, notifyUser, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
+// import { notifyOrderChanged, notifyUser, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
+import { notifyUser, notifyOrderChanged, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
+
 import { getRoadDistanceKm } from "../services/pincodeDistance.js";
 import { purchaseQtyToSaleUnitQty, saleUnitQtyToBaseUnits, getSaleUnit, round2 } from "../../shared/packUnits.js";
 
@@ -365,21 +367,24 @@ export async function placeOrder(req, res) {
         return res.status(500).json({ success: false, message: "Couldn't place the order — please try again." });
     }
 
-
     // row.order_status is 'awaiting_payment' for standard orders (gated on
     // UPI verification) or 'pending_confirmation' for sample/credit (which
-    // skip the gate). Only broadcast the seller's live "orders changed" realtime
-    // event for the latter — standard orders' seller broadcast now fires from
-    // admin_verify_payment() instead, once payment is actually confirmed.
-    // placeOrder() — move the accrual call INSIDE the existing status check,
-    // instead of firing it unconditionally after the RPC. This means:
-    //   - sample orders: no-op inside wallet_accrue_commission anyway (order_type check)
-    //   - credit orders: accrue immediately — they skip awaiting_payment by design,
-    //     there's no separate "payment verified" moment for credit
-    //   - standard orders: do NOT accrue here — they're sitting in awaiting_payment,
-    //     commission only accrues once admin_verify_payment confirms the UPI payment
-    //     (see paymentVerification.controller.js below)
+    // skip the gate). Seller notification, the "orders changed" broadcast,
+    // AND commission accrual all only happen here, for the latter case.
+    // Standard orders get all three of these from admin_verify_payment()
+    // instead, once payment is actually confirmed — see
+    // paymentVerification.controller.js. Until then the seller must not be
+    // notified and must not see the order at all.
     if (row.order_status !== "awaiting_payment") {
+        if (row.seller_user_id) {
+            await notifyUser(row.seller_user_id, {
+                type: "order_placed",
+                title: `New order: ${row.order_number}`,
+                body: "A buyer placed a new order. Check your Sales Orders to confirm it.",
+                link: `/seller/orders/${row.order_id}`,
+            });
+        }
+
         const { data: submission } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
         if (submission) {
             const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", submission.seller_id).maybeSingle();
@@ -387,13 +392,9 @@ export async function placeOrder(req, res) {
                 await notifyUserOrdersChanged(sellerProfile.user_id);
             }
         }
-        // NEW — commission accrual belongs here now, not unconditionally after the RPC
+
         await supabase.rpc("wallet_accrue_commission", { p_order_id: row.order_id });
     }
-
-    // NEW — accrue platform commission into the seller's wallet for any order
-    // that isn't a sample (samples carry no fee, checked inside the RPC itself).
-    await supabase.rpc("wallet_accrue_commission", { p_order_id: row.order_id });
 
     res.json({
         success: true,
@@ -452,7 +453,7 @@ export async function getMyOrder(req, res) {
 // cancelMyOrder() — add this after notifyOrderChanged, before the seller-notify block
 export async function cancelMyOrder(req, res) {
     const { reason } = req.body || {};
-    const { error } = await supabase.rpc("update_order_status", {
+    const { data, error } = await supabase.rpc("update_order_status", {
         p_order_id: req.params.id, p_actor_role: "buyer", p_actor_user_id: req.user.id,
         p_new_status: "cancelled", p_note: reason || "Cancelled by buyer",
     });
@@ -462,20 +463,19 @@ export async function cancelMyOrder(req, res) {
         return res.status(status).json({ success: false, code: error.message, message: status === 400 ? "This order can no longer be cancelled." : "Couldn't cancel the order." });
     }
 
-    await notifyOrderChanged(req.params.id, { status: "cancelled" });
+    const row = Array.isArray(data) ? data[0] : data;
 
-    // NEW — if this order's commission had already accrued (only possible for
-    // credit orders, since standard orders never accrue before payment is
-    // verified — see above), reverse it. Safe to call even when nothing was
-    // ever accrued; the RPC checks first and no-ops.
+    await notifyOrderChanged(req.params.id, { status: "cancelled" });
     await supabase.rpc("wallet_reverse_commission", { p_order_id: req.params.id });
 
-    const { data: order } = await supabase.from("orders").select("seller_id, order_number").eq("id", req.params.id).maybeSingle();
-    if (order) {
-        const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", order.seller_id).maybeSingle();
-        if (sellerProfile) {
-            await notifyUserOrdersChanged(sellerProfile.user_id);
-        }
+    if (row?.notify_user_id) {
+        await notifyUser(row.notify_user_id, {
+            type: "order_status_cancelled",
+            title: `Order ${row.order_number} cancelled`,
+            body: reason || "The buyer cancelled this order.",
+            link: `/seller/orders/${req.params.id}`,
+        });
+        await notifyUserOrdersChanged(row.notify_user_id);
     }
     res.json({ success: true, message: "Order cancelled." });
 }

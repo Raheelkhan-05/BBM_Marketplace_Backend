@@ -9,6 +9,7 @@
 //   router.post("/admin/payment-proofs/:id/verify", requireAdmin, verifyPayment);
 //   router.post("/admin/payment-proofs/:id/reject", requireAdmin, rejectPayment);
 import { supabase } from "../config/supabase.js";
+import { notifyUser, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
 
 const VERIFY_ERROR_MAP = {
     PROOF_NOT_FOUND: { status: 404, message: "Payment proof not found." },
@@ -93,21 +94,45 @@ export async function verifyPayment(req, res) {
     //   - single-order proof (order_id set)
     //   - cart/group proof (order_group_id set) — one UTR can cover several
     //     seller orders at once, so accrue for every sibling order in the group
+    // This is the actual "payment confirmed" moment for standard orders.
+    // It's also the first time the seller is told about the order at all —
+    // placeOrder() deliberately skips notifying the seller while the order
+    // sits in awaiting_payment. Covers both shapes:
+    //   - single-order proof (order_id set)
+    //   - cart/group proof (order_group_id set) — one UTR can cover several
+    //     seller orders at once, so notify + accrue for every sibling order
     const { data: proof } = await supabase
         .from("payment_proofs")
         .select("order_id, order_group_id")
         .eq("id", req.params.id)
         .maybeSingle();
 
+    const orderIds = [];
     if (proof?.order_id) {
-        await supabase.rpc("wallet_accrue_commission", { p_order_id: proof.order_id });
+        orderIds.push(proof.order_id);
     } else if (proof?.order_group_id) {
         const { data: groupOrders } = await supabase
+            .from("orders").select("id").eq("order_group_id", proof.order_group_id);
+        orderIds.push(...(groupOrders || []).map((o) => o.id));
+    }
+
+    for (const orderId of orderIds) {
+        await supabase.rpc("wallet_accrue_commission", { p_order_id: orderId });
+
+        const { data: order } = await supabase
             .from("orders")
-            .select("id")
-            .eq("order_group_id", proof.order_group_id);
-        for (const o of groupOrders || []) {
-            await supabase.rpc("wallet_accrue_commission", { p_order_id: o.id });
+            .select("order_number, seller:seller_profiles ( user_id )")
+            .eq("id", orderId)
+            .maybeSingle();
+        const sellerUserId = order?.seller?.user_id;
+        if (sellerUserId) {
+            await notifyUser(sellerUserId, {
+                type: "order_placed",
+                title: `New order: ${order.order_number}`,
+                body: "Check your Sales Orders to confirm it.",
+                link: `/seller/orders/${orderId}`,
+            });
+            await notifyUserOrdersChanged(sellerUserId);
         }
     }
 

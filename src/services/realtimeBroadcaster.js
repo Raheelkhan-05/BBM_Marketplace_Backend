@@ -1,3 +1,5 @@
+//service/realtimeBroadcaster.js
+
 import { supabaseAdmin } from "../config/supabase.js";
 
 const SUBSCRIBE_TIMEOUT_MS = 4000;
