@@ -604,19 +604,56 @@ export async function createCatalogEntry(req, res) {
 // PATCH /api/admin/catalog/:level/:id   { parentId }
 // Used to re-parent hs_generic_product_brands (level = "brand_item") onto
 // a generic product — this is what "Fix mapping" ultimately writes.
+// PATCH /api/admin/catalog/:level/:id
+// Handles two distinct callers:
+//   1. CreateSimpleCatalogModal's edit flow — sends name/image (any level)
+//      or the full brand_item identity payload (brand_name, manufacturer,
+//      model_no, grade_variant, specifications, images, unit, pack_size,
+//      units_per_master_pack).
+//   2. FixMappingPicker's "Fix mapping" flow — sends only { parentId } for
+//      level: "brand_item", to re-parent onto a different generic product.
+const EDITABLE_FIELDS = {
+    category: ["name", "image"],
+    subcategory: ["name", "image"],
+    generic_product: ["name", "image"],
+    brand_item: [
+        "name", "image", "images", "brand_name",
+        "manufacturer", "model_no", "grade_variant", "specifications",
+        "unit", "pack_size", "units_per_master_pack",
+    ],
+};
+
 export async function updateCatalogEntry(req, res) {
     const { level, id } = req.params;
-    const { parentId } = req.body || {};
-    if (level !== "brand_item") return res.status(400).json({ success: false, message: `Invalid level "${level}".` });
-    if (!parentId) return res.status(400).json({ success: false, message: "Missing parentId." });
+    const cfg = TABLES[level];
+    if (!cfg) return res.status(400).json({ success: false, message: `Invalid level "${level}".` });
 
-    const { data, error } = await supabase
-        .from("hs_generic_product_brands")
-        .update({ generic_product_id: parentId })
-        .eq("id", id)
-        .select("id, generic_product_id")
-        .maybeSingle();
-    if (error) return res.status(500).json({ success: false, message: error.message });
-    if (!data) return res.status(404).json({ success: false, message: "Brand item not found." });
+    const body = req.body || {};
+    const update = {};
+    for (const key of (EDITABLE_FIELDS[level] || [])) {
+        if (body[key] !== undefined) update[key] = body[key];
+    }
+
+    // Keep the single `image` cover column in sync when `images` is sent.
+    if (Array.isArray(update.images)) update.image = update.images[0] || null;
+
+    // Strip blank specification rows before persisting.
+    if (Array.isArray(update.specifications)) {
+        update.specifications = update.specifications.filter((s) => s?.key?.trim());
+    }
+
+    // brand_item re-parenting — this is what "Fix mapping" writes.
+    if (level === "brand_item" && body.parentId) update.generic_product_id = body.parentId;
+
+    if (!Object.keys(update).length) {
+        return res.status(400).json({ success: false, message: "No editable fields provided." });
+    }
+
+    const { data, error } = await supabase.from(cfg.table).update(update).eq("id", id).select().maybeSingle();
+    if (error) {
+        if (error.code === "23505") return res.status(409).json({ success: false, message: "A record with that name already exists here." });
+        return res.status(500).json({ success: false, message: error.message });
+    }
+    if (!data) return res.status(404).json({ success: false, message: "Not found." });
     res.json({ success: true, entry: data });
 }
