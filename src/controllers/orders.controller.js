@@ -410,14 +410,15 @@ export async function placeOrder(req, res) {
     });
 }
 
-// GET /api/orders — unchanged
+// GET /api/orders
 export async function listMyOrders(req, res) {
     const { status, orderType } = req.query;
     let query = supabase
         .from("orders")
         .select(`
       id, order_number, status, order_type, sample_order_id, stock_shortfall,
-      order_group_id, group_number,
+      order_group_id,
+      order_group:order_groups ( group_number ),
       subtotal_amount, total_amount, payment_status, created_at, updated_at,
       seller:seller_profiles ( id, display_name, shop_slug, logo_url, city, state ),
       items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied, discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )
@@ -428,7 +429,11 @@ export async function listMyOrders(req, res) {
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
-    res.json({ success: true, orders: data || [] });
+
+    // flatten order_group.group_number -> group_number so the frontend
+    // (which reads o.group_number directly) doesn't need to change
+    const orders = (data || []).map((o) => ({ ...o, group_number: o.order_group?.group_number || null }));
+    res.json({ success: true, orders });
 }
 
 // GET /api/orders/:id — unchanged
