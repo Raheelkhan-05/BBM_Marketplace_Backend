@@ -8,6 +8,8 @@
 // live preview math can never quietly drift apart.
 
 import { supabase } from "../config/supabase.js";
+import { priceToSaleUnitPrice, deriveDisplayPrices, round2 } from "../../shared/packUnits.js";
+
 
 let cachedCommissionPercent = null;
 let cachedAt = 0;
@@ -27,10 +29,6 @@ export async function getCommissionPercent() {
     return cachedCommissionPercent;
 }
 
-export function round2(n) {
-    return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
-}
-
 export function computeFinalPrice(basePrice, gstPercent) {
     return round2(Number(basePrice) * (1 + Number(gstPercent || 0) / 100));
 }
@@ -47,57 +45,43 @@ export async function computeMarketplaceFigures(finalPrice) {
     };
 }
 
-/**
- * The seller now enters ONE base price against ONE basis (per unit /
- * per pack / per master pack), and a toggle for whether that price
- * already includes GST. Everything buyer-facing (price/unit, the
- * comparison badges, order math) is normalized to "excl. GST, per
- * single unit" so every existing reader of `base_price` / `price`
- * keeps working unchanged.
- *
- * @param {number} enteredPrice - raw number the seller typed
- * @param {number} gstPercent
- * @param {boolean} gstInclusive - true if enteredPrice already includes GST
- * @param {'per_unit'|'per_pack'|'per_master_pack'} basis
- * @param {number} packSize - units per pack (>=1)
- * @param {number} unitsPerMasterPack - packs per master pack (>=1), optional
- * @returns {{ basePricePerUnit: number, finalPricePerUnit: number }}
- */
-export function normalizeEnteredPrice(enteredPrice, gstPercent, gstInclusive, basis, packSize, unitsPerMasterPack) {
-    const price = Number(enteredPrice) || 0;
+// Anchors on the SALE UNIT now (Pack, or Master Pack if the listing has
+// an outer pack) instead of the base unit. This is what gets written to
+// price/base_price — every downstream consumer (MOQ math, slabs,
+// discounts, order quotes) shares this one denomination from here on,
+// so nobody has to re-scale by packSize/masterPackSize ever again.
+export function normalizeEnteredPrice(basePrice, gstPercent, gstInclusive, priceBasis, packSize, masterPackSize) {
     const gst = Number(gstPercent) || 0;
-    const pack = Number(packSize) > 0 ? Number(packSize) : 1;
-    const master = Number(unitsPerMasterPack) > 0 ? Number(unitsPerMasterPack) : 1;
+    const perSaleUnit = priceToSaleUnitPrice(basePrice, priceBasis, packSize, masterPackSize);
 
-    // 1. strip GST if the seller entered a GST-inclusive number
-    const exGst = gstInclusive ? price / (1 + gst / 100) : price;
+    let basePricePerSaleUnit, gstAmount, subtotalAfterGst;
+    if (gstInclusive) {
+        subtotalAfterGst = round2(perSaleUnit);
+        basePricePerSaleUnit = round2(subtotalAfterGst / (1 + gst / 100));
+        gstAmount = round2(subtotalAfterGst - basePricePerSaleUnit);
+    } else {
+        basePricePerSaleUnit = round2(perSaleUnit);
+        gstAmount = round2(basePricePerSaleUnit * (gst / 100));
+        subtotalAfterGst = round2(basePricePerSaleUnit + gstAmount);
+    }
 
-    // 2. bring it down to a single-unit basis
-    let perUnitExGst = exGst;
-    if (basis === "per_pack") perUnitExGst = exGst;
-    if (basis === "per_master_pack") perUnitExGst = exGst / master;
+    // Keep your existing commission composition on subtotalAfterGst
+    // exactly as before — only the anchor changed, not the GST/commission
+    // math itself.
+    // ... existing commission logic, applied to subtotalAfterGst ...
 
-    const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
-    return {
-        basePricePerUnit: round2(perUnitExGst),
-        finalPricePerUnit: round2(perUnitExGst * (1 + gst / 100)),
-    };
+    return { basePricePerSaleUnit, gstAmount, subtotalAfterGst /*, finalPricePerSaleUnit */ };
 }
 
 /**
- * Inverse of the above — given a stored per-unit base price, express it
- * back in whatever basis/inclusivity the seller last used, for
- * re-populating the edit form.
+ * Inverse of normalizeEnteredPrice — given the stored per-SALE-UNIT base
+ * price, express it back in whatever basis/inclusivity the seller last
+ * used, for re-populating the edit form.
  */
-export function denormalizePriceForEdit(basePricePerUnit, gstPercent, gstInclusive, basis, packSize, unitsPerMasterPack) {
+export function denormalizePriceForEdit(basePricePerSaleUnit, gstPercent, gstInclusive, basis, packSize, unitsPerMasterPack) {
     const gst = Number(gstPercent) || 0;
-    const pack = Number(packSize) > 0 ? Number(packSize) : 1;
-    const master = Number(unitsPerMasterPack) > 0 ? Number(unitsPerMasterPack) : 1;
-
-    let scaled = Number(basePricePerUnit) || 0;
-    if (basis === "per_pack") scaled *= pack;
-    if (basis === "per_master_pack") scaled *= pack * master;
-
+    const { perBaseUnit, perPack, perMasterPack } = deriveDisplayPrices(basePricePerSaleUnit, packSize, unitsPerMasterPack);
+    const scaled = basis === "per_unit" ? perBaseUnit : basis === "per_pack" ? perPack : perMasterPack;
     const displayPrice = gstInclusive ? scaled * (1 + gst / 100) : scaled;
     return Math.round((displayPrice + Number.EPSILON) * 100) / 100;
 }

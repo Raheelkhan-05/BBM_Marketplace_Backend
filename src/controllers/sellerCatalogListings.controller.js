@@ -16,7 +16,7 @@ import { notifyAdmins, notifyAdminSubmissionsChanged } from "../services/notific
 import { slugify } from "../services/slugify.js";
 import {
     getCommissionPercent, computeMarketplaceFigures,
-    normalizeEnteredPrice, round2,
+    normalizeEnteredPrice,
 } from "../services/pricing.service.js";
 
 export const ALLOWED_UNITS = [
@@ -176,7 +176,11 @@ function toListingRow(body, brand) {
     const packSize = Number(brand.pack_size);
     const masterPackSize = Number(brand.units_per_master_pack);
 
-    const { basePricePerUnit, finalPricePerUnit } = normalizeEnteredPrice(
+    // price / base_price, moq, stock_quantity, and quantity_discounts
+    // minQty are now ALL denominated in the canonical sale unit (see
+    // shared/packUnits.js). The frontend now sends moq/stock/slab
+    // thresholds already in that unit — no conversion happens here.
+    const { basePricePerSaleUnit, finalPricePerSaleUnit } = normalizeEnteredPrice(
         body.basePrice, body.gstPercent, body.gstInclusive, body.priceBasis,
         packSize, masterPackSize
     );
@@ -189,13 +193,14 @@ function toListingRow(body, brand) {
         product_name: body.productName?.trim() || null,
         brand_name: body.brandNotApplicable ? null : (body.brandName?.trim() || null),
 
-        price: finalPricePerUnit,
-        base_price: basePricePerUnit,
-        moq: Number(body.moq),
+        price: finalPricePerSaleUnit,
+        base_price: basePricePerSaleUnit,
+        moq: Number(body.moq),                    // already sale-unit qty
+        stock_quantity: body.stockType === "ready_stock" && body.stockQuantity !== ""
+            ? Number(body.stockQuantity) : null,   // already sale-unit qty
         unit,                                   // ← from brand item
         lead_time: effectiveLeadTime,
         image: images[0] || null,
-        stock_quantity: body.stockType === "ready_stock" && body.stockQuantity !== "" ? Number(body.stockQuantity) : null,
 
         gst_percent: Number(body.gstPercent),
         price_basis: body.priceBasis,
@@ -210,7 +215,9 @@ function toListingRow(body, brand) {
         sample_unit_basis: body.sampleAvailable ? body.sampleUnitBasis : null,
 
         price_slabs: [],
-        quantity_discounts: Array.isArray(body.priceSlabs) ? body.priceSlabs.filter((s) => s?.minQty && s?.discountPercent) : [],
+        quantity_discounts: Array.isArray(body.priceSlabs)
+            ? body.priceSlabs.filter((s) => s?.minQty && s?.discountPercent) : [],
+
 
         stock_type: body.stockType,
         production_lead_time_days: body.stockType === "made_to_order" ? Number(body.productionLeadTimeDays) : null,

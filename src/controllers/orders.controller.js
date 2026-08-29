@@ -21,6 +21,8 @@
 import { supabase } from "../config/supabase.js";
 import { notifyOrderChanged, notifyUser, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
 import { getRoadDistanceKm } from "../services/pincodeDistance.js";
+import { purchaseQtyToSaleUnitQty, saleUnitQtyToBaseUnits, getSaleUnit, round2 } from "../../shared/packUnits.js";
+
 
 const ERROR_MAP = {
     LISTING_NOT_FOUND: { status: 404, message: "That listing is no longer available." },
@@ -238,7 +240,13 @@ export async function getOrderQuote(req, res) {
         return res.status(404).json({ success: false, message: "Listing not available." });
     }
 
-    const baseQty = toBaseUnits(submission, qty, purchaseBasis); // stock checks only
+    // Buyer's entered qty, in WHATEVER basis they picked, converted to the
+    // seller's canonical sale unit — this is the only quantity used for
+    // price, MOQ, slab, and discount lookups from here down.
+    const saleQty = purchaseQtyToSaleUnitQty(qty, purchaseBasis, submission.pack_size, submission.units_per_master_pack);
+    const baseQty = saleUnitQtyToBaseUnits(saleQty, submission.pack_size, submission.units_per_master_pack); // stock-in-base-units, if you need it elsewhere
+
+
     const packQty = toPackQty(submission, qty, purchaseBasis); // pricing / MOQ / discounts
 
     let addressPincode = null, addressState = null;
@@ -273,41 +281,39 @@ export async function getOrderQuote(req, res) {
     // and subtotal here are expressed against packQty (a Pack count), so
     // scale up to a per-Pack price first — same anchor-then-scale-up fix
     // as BuyNowModal.computeLocalQuote and HomeProductFeed.computePriceBreakdown.
-    const packSize = Number(submission.pack_size) > 0 ? Number(submission.pack_size) : 1;
-    const pricePerPack = Math.round(Number(submission.price) * packSize * 100) / 100;
 
-    const { price: slabPrice, slab: appliedSlab } = resolveSlabUnitPrice(submission.price_slabs, packQty, pricePerPack);
-    // quantity_discounts is set by the seller directly in whatever basis they
-    // sell by (Pack or Master Pack) — resolve against the quantity exactly as
-    // the buyer entered it (qty), never converted to Packs. price_slabs above
-    // stays on packQty — that one is canonically Pack-normalized per
-    // SellerListingForm's convention.
-    const { percent: discountPercent, tier: discountTier } = resolveDiscountPercent(submission.quantity_discounts, qty);
-    const unitPrice = Math.round(slabPrice * (1 - discountPercent / 100) * 100) / 100;
+    // submission.price is now directly per SALE UNIT — no packSize scaling.
+    const pricePerSaleUnit = Number(submission.price);
+
+
+    const { price: slabPrice, slab: appliedSlab } = resolveSlabUnitPrice(submission.price_slabs, saleQty, pricePerSaleUnit);
+    const { percent: discountPercent, tier: discountTier } = resolveDiscountPercent(submission.quantity_discounts, saleQty);
+    const unitPrice = round2(slabPrice * (1 - discountPercent / 100));
 
     // const { data: settings } = await supabase.from("platform_settings").select("commission_percent").eq("id", true).maybeSingle();
     const { data: commissionPercentData } = await supabase
         .rpc("resolve_commission_percent", { p_generic_product_brand_id: submission.generic_product_brand_id });
     const commissionPercent = Number(commissionPercentData ?? 0.25);
 
-    const subtotal = Math.round(unitPrice * packQty * 100) / 100;
-    const platformFee = Math.round((subtotal * commissionPercent / 100) * 100) / 100;
+    const subtotal = round2(unitPrice * saleQty);
+    const platformFee = round2(subtotal * commissionPercent / 100);
 
     const stockShortfall = submission.stock_type === "ready_stock"
         && submission.stock_quantity != null
-        && packQty > Number(submission.stock_quantity);
+        && saleQty > Number(submission.stock_quantity); // stock_quantity now sale-unit qty too
 
     res.json({
         success: true,
         orderType: "standard",
         unitPrice, basePriceApplied: slabPrice, appliedSlab, discountPercent, discountTier,
-        unit: submission.unit, moq: submission.moq,
-        purchaseBasis, quantity: qty, baseQuantity: packQty,
+        unit: submission.unit, moq: submission.moq,       // sale-unit qty
+        saleUnit: getSaleUnit(submission.units_per_master_pack), // NEW — tells the client unambiguously, instead of it re-deriving hasOuterPack itself
+        purchaseBasis, quantity: qty, saleUnitQuantity: saleQty, // renamed from baseQuantity — that name was actively misleading, it was never base units
         estimatedDeliveryDate: delivery.label, leadDays: delivery.leadDays,
         transitDaysMin: delivery.transitDaysMin, transitDaysMax: delivery.transitDaysMax,
         availableStock: submission.stock_quantity, subtotal,
         platformFeePercent: commissionPercent, platformFeeAmount: platformFee, sellerPayoutAmount: subtotal - platformFee,
-        meetsMoq: packQty >= Number(submission.moq),
+        meetsMoq: saleQty >= Number(submission.moq),
         stockShortfall,
     });
 }
