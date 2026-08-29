@@ -12,26 +12,28 @@ const PORT = process.env.PORT || 4000;
 const app = createApp();
 const httpServer = http.createServer(app);
 
+// Was reading CLIENT_ORIGIN (singular) while .env defines CLIENT_ORIGINS
+// (plural) — the mismatch meant this was always undefined, so the
+// allowed-origins list silently fell back to [], rejecting every
+// handshake regardless of where it came from. Also trim each entry:
+// a stray space after a comma in the .env value (e.g. "a, b") produces
+// an origin string that will never match what the browser actually sends.
+const allowedOrigins = (process.env.CLIENT_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
 const io = new SocketIOServer(httpServer, {
-  // Explicit CORS. If CLIENT_ORIGIN is unset this silently blocks every
-  // handshake with no client-visible reason other than connect_error —
-  // fail loudly at boot instead.
   cors: {
-    origin: process.env.CLIENT_ORIGIN?.split(",") || [],
+    origin: allowedOrigins,
     credentials: true,
   },
-  // Allow polling as a fallback transport — some proxies (older Nginx
-  // configs, some free-tier PaaS) don't upgrade to raw WebSocket
-  // cleanly. Forcing transports: ["websocket"] on the SERVER can make
-  // connections fail silently behind such a proxy. Let Socket.IO
-  // negotiate; lock transports down on the CLIENT instead, where it's
-  // safe (see SocketContext.jsx).
   pingInterval: 20000,
   pingTimeout: 10000,
 });
 
-if (!process.env.CLIENT_ORIGIN) {
-  console.error("[server] CLIENT_ORIGIN is not set — all socket connections will be CORS-rejected.");
+if (!allowedOrigins.length) {
+  console.error("[server] CLIENT_ORIGINS is not set — all socket connections will be CORS-rejected.");
 }
 
 io.use((socket, next) => {
