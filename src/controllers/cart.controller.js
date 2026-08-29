@@ -14,8 +14,9 @@ export async function addCartItem(req, res) {
         p_quantity: quantity, p_purchase_basis: purchaseBasis || "per_pack",
     });
     if (error) {
-        const map = { CANNOT_CART_OWN_LISTING: 400, LISTING_NOT_AVAILABLE: 404, INVALID_QUANTITY: 400 };
-        return res.status(map[error.message] || 500).json({ success: false, code: error.message, message: "Couldn't add to cart." });
+        const map = { CANNOT_CART_OWN_LISTING: 400, LISTING_NOT_AVAILABLE: 404, INVALID_QUANTITY: 400, BELOW_MOQ: 400 };
+        const message = error.message === "BELOW_MOQ" ? "Quantity is below the seller's minimum order quantity." : "Couldn't add to cart.";
+        return res.status(map[error.message] || 500).json({ success: false, code: error.message, message });
     }
     res.json({ success: true });
 }
@@ -27,7 +28,11 @@ export async function updateCartItem(req, res) {
         p_buyer_id: req.user.id, p_submission_id: submissionId,
         p_quantity: quantity, p_purchase_basis: purchaseBasis || null,
     });
-    if (error) return res.status(500).json({ success: false, message: error.message });
+    if (error) {
+        const map = { BELOW_MOQ: 400, CART_ITEM_NOT_FOUND: 404 };
+        const message = error.message === "BELOW_MOQ" ? "Quantity is below the seller's minimum order quantity." : "Couldn't update cart.";
+        return res.status(map[error.message] || 500).json({ success: false, code: error.message, message });
+    }
     res.json({ success: true });
 }
 
