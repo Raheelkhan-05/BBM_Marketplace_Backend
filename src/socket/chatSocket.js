@@ -18,17 +18,11 @@ function markOffline(userId, socketId) {
 }
 export function isOnline(userId) { return onlineUsers.has(userId); }
 
-// BUG FIX: this is new. Previously, "delivered" only ever got set at the
-// moment a message was sent (sendMessage checks isOnline(recipient) and
-// marks it delivered right then). If the recipient was offline at send
-// time, their tick stayed stuck on "sent" until they opened that exact
-// conversation thread (which calls markRead, which also bumps
-// last_delivered_at as a side effect) — there was no "delivered" step in
-// between, so reconnecting without opening the thread never updated
-// anything. This walks the user's conversations on connect and marks
-// delivered anywhere they have an unconsumed incoming message, the same
-// way a real client (WhatsApp, etc.) acks delivery as soon as the device
-// comes online, independent of which screen is open.
+// Walks the user's conversations on connect and marks delivered anywhere
+// they have an unconsumed incoming message — same idea as before, but
+// the timestamp now comes from Postgres (mark_participant_delivered_bulk's
+// `now()`) instead of Node's clock, so it's directly comparable against
+// chat_messages.created_at (also Postgres-stamped) on the client.
 async function syncPendingDeliveries(userId) {
     const { data: myRows } = await supabase
         .from("chat_participants")
@@ -50,16 +44,15 @@ async function syncPendingDeliveries(userId) {
         .map((c) => c.id);
     if (!pendingConvIds.length) return;
 
-    const now = new Date().toISOString();
-    await supabase
-        .from("chat_participants")
-        .update({ last_delivered_at: now })
-        .eq("user_id", userId)
-        .in("conversation_id", pendingConvIds);
+    const { data, error } = await supabase
+        .rpc("mark_participant_delivered_bulk", { p_conversation_ids: pendingConvIds, p_user_id: userId })
+        .single();
+    if (error) { console.error("[socket] syncPendingDeliveries bulk update failed:", error.message); return; }
+    const deliveredAt = data.delivered_at;
 
     await Promise.all(
         pendingConvIds.map((conversationId) =>
-            emitToConversation(conversationId, "message:status", { conversationId, deliveredAt: now, byUserIds: [userId] }, { excludeUserId: userId })
+            emitToConversation(conversationId, "message:status", { conversationId, deliveredAt, byUserIds: [userId] }, { excludeUserId: userId })
         )
     );
 }
@@ -68,9 +61,6 @@ export function registerChatSocket(io) {
     io.on("connection", async (socket) => {
         const userId = socket.userId;
 
-        // ONE room, for life. Conversation-scoped delivery is handled by
-        // emitToConversation() looking up participants server-side — the
-        // client never needs to join/leave anything conversation-specific.
         socket.join(`user:${userId}`);
 
         const justCameOnline = markOnline(userId, socket.id);
@@ -80,32 +70,38 @@ export function registerChatSocket(io) {
             syncPendingDeliveries(userId).catch((err) => console.error("[socket] syncPendingDeliveries failed:", err.message));
         }
 
-        // FIX: read receipts for a conversation the recipient already has
-        // open used to go out purely over REST (markConversationRead) —
-        // client HTTP request -> Express -> Supabase write -> response,
-        // and only *then* would the emit back to the sender fire. That's
-        // an extra full request/response hop stacked in front of the two
-        // socket pushes that already have to happen (message reaching the
-        // recipient, status reaching the sender back). For someone
-        // sitting in an already-open thread this hop is pure added
-        // latency for no benefit — the socket connection is right there.
-        // This does the same last_read_at/last_delivered_at update and
-        // status emit, but over the existing socket round trip instead.
-        // The REST endpoint (routes/chat.routes.js -> markRead) stays in
-        // place as the fallback for cases with no live socket (e.g. a
-        // backgrounded mobile client reconciling on resume).
         socket.on("read:ack", async ({ conversationId }) => {
             try {
-                const now = new Date().toISOString();
-                const { error } = await supabase
-                    .from("chat_participants")
-                    .update({ last_read_at: now, last_delivered_at: now })
-                    .eq("conversation_id", conversationId)
-                    .eq("user_id", userId);
+                const { data, error } = await supabase
+                    .rpc("mark_participant_read", { p_conversation_id: conversationId, p_user_id: userId })
+                    .single();
                 if (error) throw error;
-                await emitToConversation(conversationId, "message:status", { conversationId, readAt: now, byUserIds: [userId] }, { excludeUserId: userId });
+                await emitToConversation(conversationId, "message:status",
+                    { conversationId, readAt: data.last_read_at, byUserIds: [userId] },
+                    { excludeUserId: userId });
             } catch (err) {
                 console.error("[socket] read:ack failed:", err.message);
+            }
+        });
+
+        // FIX: was `new Date().toISOString()` (Node clock) written to
+        // last_delivered_at, then compared client-side against
+        // message.created_at (Postgres clock) — any clock skew between
+        // the two hosts makes that comparison silently fail forever for
+        // that message. Now sourced from Postgres via the same RPC
+        // pattern as read:ack, so both sides of every future comparison
+        // are stamped by the same clock.
+        socket.on("delivered:ack", async ({ conversationId }) => {
+            try {
+                const { data, error } = await supabase
+                    .rpc("mark_participant_delivered", { p_conversation_id: conversationId, p_user_id: userId })
+                    .single();
+                if (error) throw error;
+                await emitToConversation(conversationId, "message:status",
+                    { conversationId, deliveredAt: data.last_delivered_at, byUserIds: [userId] },
+                    { excludeUserId: userId });
+            } catch (err) {
+                console.error("[socket] delivered:ack failed:", err.message);
             }
         });
 
@@ -121,7 +117,6 @@ export function registerChatSocket(io) {
         socket.on("presence:query", (targetUserId, cb) => {
             cb?.({ online: isOnline(targetUserId) });
         });
-        // batch variant — ConversationList needs many at once, don't round-trip per row
         socket.on("presence:query_many", (userIds, cb) => {
             cb?.(Object.fromEntries((userIds || []).map((id) => [id, isOnline(id)])));
         });

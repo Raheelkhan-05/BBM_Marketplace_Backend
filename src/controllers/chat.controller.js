@@ -233,9 +233,14 @@ export async function sendMessage(req, res) {
     const { data: recipients } = await supabase.from("chat_participants").select("user_id, is_muted").eq("conversation_id", conversationId).neq("user_id", userId);
     const deliveredTo = (recipients || []).filter((r) => isOnline(r.user_id)).map((r) => r.user_id);
     if (deliveredTo.length) {
-        const nowIso = new Date().toISOString();
-        await supabase.from("chat_participants").update({ last_delivered_at: nowIso }).eq("conversation_id", conversationId).in("user_id", deliveredTo);
-        await emitToConversation(conversationId, "message:status", { conversationId, deliveredAt: nowIso, byUserIds: deliveredTo });
+        const { data: dRow, error: dErr } = await supabase
+            .rpc("mark_participants_delivered_for_conversation", { p_conversation_id: conversationId, p_user_ids: deliveredTo })
+            .single();
+        if (dErr) {
+            console.error("[chat] delivered-on-send update failed:", dErr.message);
+        } else {
+            await emitToConversation(conversationId, "message:status", { conversationId, deliveredAt: dRow.delivered_at, byUserIds: deliveredTo });
+        }
     }
 
     await emitToConversation(conversationId, "conversation:updated", { conversationId }, { excludeUserId: userId });
@@ -256,24 +261,30 @@ export async function sendMessage(req, res) {
 export async function markRead(req, res) {
     const userId = req.user.id;
     const { conversationId } = req.params;
-    const now = new Date().toISOString();
-    const { error } = await supabase.from("chat_participants").update({ last_read_at: now, last_delivered_at: now }).eq("conversation_id", conversationId).eq("user_id", userId);
+
+    const { data, error } = await supabase
+        .rpc("mark_participant_read", { p_conversation_id: conversationId, p_user_id: userId })
+        .single();
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    // reaches the sender no matter what window/device they currently have
-    // open, since emitToConversation targets each participant's personal
-    // room rather than a conversation-scoped room.
-    await emitToConversation(conversationId, "message:status", { conversationId, readAt: now, byUserIds: [userId] }, { excludeUserId: userId });
+    await emitToConversation(conversationId, "message:status",
+        { conversationId, readAt: data.last_read_at, byUserIds: [userId] },
+        { excludeUserId: userId });
     res.json({ success: true });
 }
 
 export async function markDelivered(req, res) {
     const userId = req.user.id;
     const { conversationId } = req.params;
-    const now = new Date().toISOString();
-    const { error } = await supabase.from("chat_participants").update({ last_delivered_at: now }).eq("conversation_id", conversationId).eq("user_id", userId);
+
+    const { data, error } = await supabase
+        .rpc("mark_participant_delivered", { p_conversation_id: conversationId, p_user_id: userId })
+        .single();
     if (error) return res.status(500).json({ success: false, message: error.message });
-    await emitToConversation(conversationId, "message:status", { conversationId, deliveredAt: now, byUserIds: [userId] }, { excludeUserId: userId });
+
+    await emitToConversation(conversationId, "message:status",
+        { conversationId, deliveredAt: data.last_delivered_at, byUserIds: [userId] },
+        { excludeUserId: userId });
     res.json({ success: true });
 }
 
