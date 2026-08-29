@@ -9,6 +9,15 @@ export async function getCart(req, res) {
 
 export async function addCartItem(req, res) {
     const { submissionId, quantity, purchaseBasis } = req.body || {};
+
+    // Any cart edit means the buyer's intent has changed — a previously
+    // "awaiting_payment" snapshot no longer reflects what they actually
+    // want to buy. Cancel it so checkout recomputes fresh instead of
+    // silently resuming a stale total (see place_cart_order's
+    // PENDING_GROUP_EXISTS branch, which otherwise just resumes whatever
+    // was locked in before this edit).
+    await supabase.rpc("cancel_pending_order_group_if_exists", { p_buyer_id: req.user.id });
+
     const { error } = await supabase.rpc("cart_add_item", {
         p_buyer_id: req.user.id, p_submission_id: submissionId,
         p_quantity: quantity, p_purchase_basis: purchaseBasis || "per_pack",
@@ -24,6 +33,9 @@ export async function addCartItem(req, res) {
 export async function updateCartItem(req, res) {
     const { submissionId } = req.params;
     const { quantity, purchaseBasis } = req.body || {};
+
+    await supabase.rpc("cancel_pending_order_group_if_exists", { p_buyer_id: req.user.id });
+
     const { error } = await supabase.rpc("cart_set_quantity", {
         p_buyer_id: req.user.id, p_submission_id: submissionId,
         p_quantity: quantity, p_purchase_basis: purchaseBasis || null,
@@ -38,6 +50,9 @@ export async function updateCartItem(req, res) {
 
 export async function removeCartItem(req, res) {
     const { submissionId } = req.params;
+
+    await supabase.rpc("cancel_pending_order_group_if_exists", { p_buyer_id: req.user.id });
+
     const { error } = await supabase.rpc("cart_remove_item", { p_buyer_id: req.user.id, p_submission_id: submissionId });
     if (error) return res.status(500).json({ success: false, message: error.message });
     res.json({ success: true });
