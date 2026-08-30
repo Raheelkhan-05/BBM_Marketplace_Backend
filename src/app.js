@@ -23,6 +23,7 @@ import chatRoutes from "./routes/chat.routes.js";
 import creditRoutes from "./routes/credit.routes.js";
 import cartRoutes from "./routes/cart.routes.js";
 import sellerWalletRoutes from "./routes/wallet.routes.js";
+import contactsRoutes from "./routes/contacts.routes.js";
 
 export function createApp() {
   const app = express();
@@ -77,6 +78,7 @@ export function createApp() {
   app.use("/api/buyer/addresses", buyerAddressRoutes);
   app.use("/api/catalog", catalogRoutes);
   app.use("/api/geo", geoRoutes);
+  app.use("/api/contacts", contactsRoutes);
   app.use("/api/listing-policy-options", listingPolicyOptionsRoutes);
   app.use("/api/credit", creditRoutes);
   app.use("/api/cart", cartRoutes);
