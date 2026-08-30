@@ -24,6 +24,7 @@ import creditRoutes from "./routes/credit.routes.js";
 import cartRoutes from "./routes/cart.routes.js";
 import sellerWalletRoutes from "./routes/wallet.routes.js";
 import contactsRoutes from "./routes/contacts.routes.js";
+import transportRoutes from "./routes/transport.routes.js";
 
 export function createApp() {
   const app = express();
@@ -82,6 +83,7 @@ export function createApp() {
   app.use("/api/listing-policy-options", listingPolicyOptionsRoutes);
   app.use("/api/credit", creditRoutes);
   app.use("/api/cart", cartRoutes);
+  app.use("/api/transport", transportRoutes);
 
 
   app.use((err, req, res, next) => {

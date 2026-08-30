@@ -1,5 +1,6 @@
 // controllers/orders.controller.js — PATCH: de-duplicate notifications +
-// simplified distance-based delivery estimate.
+// simplified distance-based delivery estimate + buyer-seller transport
+// preference snapshotting.
 //
 // De-dup notification fix (unchanged from before): place_order and
 // update_order_status both INSERT into `notifications` directly as their
@@ -8,18 +9,22 @@
 // notifyUserOrdersChanged are UNCHANGED and kept — those are realtime
 // channel broadcasts (no `notifications` row), not duplicates.
 //
-// NEW: delivery estimate is now a simple distance / speed model instead of
-// banded heuristics. We fetch the road distance (km) between the seller's
-// dispatch pincode and the buyer's pincode, assume a flat transport speed
-// of 15 km/h, and convert that to a day range (floor/ceil of the raw day
-// count). Example: 1000km / 15km/h = 66.67h = 2.78 days -> shown as
-// "+2 to +3 days" on top of the seller's own lead time. When we have no
+// Delivery estimate is a simple distance / speed model: fetch the road
+// distance (km) between the seller's dispatch pincode and the buyer's
+// pincode, assume a flat transport speed of 15 km/h, and convert that to
+// a day range (floor/ceil of the raw day count). When we have no
 // road-distance data for a pincode pair, we fall back to a rough km guess
-// from the same zone heuristic used before, then run THAT through the
-// same distance -> days formula, so there's only one place day counts are
-// ever computed from.
+// from a zone heuristic, then run THAT through the same distance -> days
+// formula, so there's only one place day counts are ever computed from.
+//
+// NEW: placeOrder now accepts transportMode/transportCompany/transportDetails
+// from the client (BuyNowModal reads the buyer-seller pair's confirmed
+// transport preference, if any, and forwards it here) and passes them
+// through to the place_order RPC, which snapshots them onto the order row
+// atomically along with everything else. See place_order's p_transport_*
+// params and the transport_mode/transport_company/transport_details/
+// transport_source columns on `orders`.
 import { supabase } from "../config/supabase.js";
-// import { notifyOrderChanged, notifyUser, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
 import { notifyUser, notifyOrderChanged, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
 
 import { getRoadDistanceKm } from "../services/pincodeDistance.js";
@@ -49,7 +54,6 @@ function formatDDMon(date) {
     return `${String(date.getDate()).padStart(2, "0")} ${MONTH_SHORT[date.getMonth()]}`;
 }
 
-// controllers/orders.controller.js — new helper, used before quote & placement
 async function assertSellerAcceptingOrders(sellerId) {
     const { data, error } = await supabase.rpc("wallet_get_status", { p_seller_id: sellerId }).single();
     if (error) return null; // fail open on infra error — don't block buyers over a wallet read failure
@@ -67,27 +71,16 @@ async function assertSellerAcceptingOrders(sellerId) {
 // ---------------------------------------------------------------------
 const TRANSPORT_SPEED_KMH = 15;
 
-// Converts a km distance into a [min, max] day range by dividing by the
-// flat transport speed and taking floor/ceil of the resulting day count.
-// e.g. 1000km / 15km/h = 66.67h = 2.78 days -> { min: 2, max: 3 }.
 function daysFromDistance(km) {
     const hours = km / TRANSPORT_SPEED_KMH;
     const rawDays = hours / 24;
     const min = Math.floor(rawDays);
     const max = Math.ceil(rawDays);
-    // Collapse to a single value when there's no meaningful fractional part
-    // (e.g. exactly 2 days), or when transit is under a day (0-1 -> just "1").
     return { min: min === max ? min : min, max: max === min ? min : max };
 }
 
-// Rough km guess used only when we have no road-distance data for a
-// pincode pair (missing from geo table). Mirrors the old zone-diff signal
-// (1=Delhi/N, 2=Punjab/Haryana/UP-W, 3=Rajasthan/Gujarat, 4=Maharashtra/MP,
-// 5=AP/Karnataka, 6=TN/Kerala, 7=WB/Odisha/NE, 8=Bihar/Jharkhand, 9=Army PO)
-// but expressed as km so it still flows through the single
-// distance -> days formula above, rather than having its own day logic.
 function estimateFallbackKm(originPincode, originState, destPincode, destState) {
-    if (!originPincode || !destPincode) return 600; // unknown -> conservative middle guess
+    if (!originPincode || !destPincode) return 600;
 
     const originPrefix3 = originPincode.slice(0, 3);
     const destPrefix3 = destPincode.slice(0, 3);
@@ -109,23 +102,13 @@ function estimateFallbackKm(originPincode, originState, destPincode, destState) 
 async function estimateTransitDayRange(originPincode, originState, destPincode, destState) {
     const originPrefix3 = originPincode?.slice(0, 3);
     const destPrefix3 = destPincode?.slice(0, 3);
-    if (originPrefix3 && originPrefix3 === destPrefix3) return { min: 1, max: 1 }; // same local zone, skip distance lookup
+    if (originPrefix3 && originPrefix3 === destPrefix3) return { min: 1, max: 1 };
 
     const km = await getRoadDistanceKm(originPincode, destPincode);
     if (km == null) {
-        // pincode not in our geo table (rare, or missing data) — fall back
-        // to a rough km guess rather than guessing days directly, so the
-        // 15km/h formula is still the single source of truth for days.
         const fallbackKm = estimateFallbackKm(originPincode, originState, destPincode, destState);
         return daysFromDistance(fallbackKm);
     }
-
-    // console.log("originPincode : ", originPincode);
-    // console.log("destPincode : ", destPincode);
-
-    // console.log("Distance : ", km);
-
-
     return daysFromDistance(km);
 }
 
@@ -146,8 +129,6 @@ async function estimateDeliveryDate(submission, buyerPincode, buyerState) {
     const dateMax = new Date();
     dateMax.setDate(dateMax.getDate() + leadDays + transitMax);
 
-    // Single date when min/max transit days collapse to the same value
-    // (e.g. same local zone), otherwise a "23 Aug - 25 Aug" style range.
     const label = transitMin === transitMax
         ? formatDDMon(dateMin)
         : `${formatDDMon(dateMin)} - ${formatDDMon(dateMax)}`;
@@ -158,9 +139,6 @@ async function estimateDeliveryDate(submission, buyerPincode, buyerState) {
     };
 }
 
-// toBaseUnits is no longer used in getOrderQuote (stock is tracked in
-// Packs too, same as pricing/MOQ/discounts) — kept only if some other
-// caller still needs true base-unit counts elsewhere.
 function toBaseUnits(submission, quantity, purchaseBasis) {
     const packSize = Number(submission.pack_size) > 0 ? Number(submission.pack_size) : 1;
     const masterPackSize = Number(submission.units_per_master_pack) > 0 ? Number(submission.units_per_master_pack) : 1;
@@ -169,11 +147,10 @@ function toBaseUnits(submission, quantity, purchaseBasis) {
     return quantity;
 }
 
-// Pack is the atomic unit for pricing, MOQ, discounts, AND stock.
 function toPackQty(submission, quantity, purchaseBasis) {
     const masterPackSize = Number(submission.units_per_master_pack) > 0 ? Number(submission.units_per_master_pack) : 1;
     if (purchaseBasis === "per_master_pack") return quantity * masterPackSize;
-    return quantity; // per_pack — quantity is already a pack count
+    return quantity;
 }
 
 function resolveSlabUnitPrice(priceSlabs, quantity, fallbackPrice) {
@@ -193,7 +170,7 @@ function resolveDiscountPercent(quantityDiscounts, quantity) {
     return { percent: Number(applicable[0].discountPercent) || 0, tier: applicable[0] };
 }
 
-// GET /api/orders/checkout-status — unchanged
+// GET /api/orders/checkout-status
 export async function checkoutStatus(req, res) {
     if (!req.user) return res.json({ success: true, canCheckout: false, reason: "NOT_AUTHENTICATED" });
 
@@ -213,15 +190,13 @@ export async function checkoutStatus(req, res) {
     res.json({ success: true, canCheckout: true, profile, business: business || null });
 }
 
-// GET /api/orders/quote — unchanged shape, delivery fields updated to
-// transitDaysMin/transitDaysMax (see estimateDeliveryDate above).
+// GET /api/orders/quote
 export async function getOrderQuote(req, res) {
     const { submissionId, quantity, purchaseBasis = "per_pack", orderType = "standard", addressId } = req.query;
     const qty = Number(quantity);
     if (!submissionId) return res.status(400).json({ success: false, message: "submissionId is required." });
     if (!(qty > 0)) return res.status(400).json({ success: false, message: "Enter a valid quantity." });
 
-    // inside getOrderQuote, right after fetching `submission`:
     const { data: sellerRow } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
     if (sellerRow) {
         const blockMsg = await assertSellerAcceptingOrders(sellerRow.seller_id);
@@ -243,14 +218,10 @@ export async function getOrderQuote(req, res) {
         return res.status(404).json({ success: false, message: "Listing not available." });
     }
 
-    // Buyer's entered qty, in WHATEVER basis they picked, converted to the
-    // seller's canonical sale unit — this is the only quantity used for
-    // price, MOQ, slab, and discount lookups from here down.
     const saleQty = purchaseQtyToSaleUnitQty(qty, purchaseBasis, submission.pack_size, submission.units_per_master_pack);
-    const baseQty = saleUnitQtyToBaseUnits(saleQty, submission.pack_size, submission.units_per_master_pack); // stock-in-base-units, if you need it elsewhere
+    const baseQty = saleUnitQtyToBaseUnits(saleQty, submission.pack_size, submission.units_per_master_pack);
 
-
-    const packQty = toPackQty(submission, qty, purchaseBasis); // pricing / MOQ / discounts
+    const packQty = toPackQty(submission, qty, purchaseBasis);
 
     let addressPincode = null, addressState = null;
     if (addressId) {
@@ -260,8 +231,6 @@ export async function getOrderQuote(req, res) {
     const delivery = await estimateDeliveryDate(submission, addressPincode, addressState);
 
     if (isSample) {
-        // unchanged — sample_price is genuinely per base-unit, multiplied
-        // against baseQty (also base units), so this was already correct.
         if (!submission.sample_available) return res.status(400).json({ success: false, message: "This seller doesn't offer a sample for this item." });
         const exceedsSample = submission.sample_quantity != null && baseQty > Number(submission.sample_quantity);
         return res.json({
@@ -278,22 +247,12 @@ export async function getOrderQuote(req, res) {
         });
     }
 
-    // submission.price is stored per base UNIT (matches SellerListingForm's
-    // basePrice/priceBasis="per_unit" convention and place_order's own use
-    // of v_submission.price against base units). Slab/discount resolution
-    // and subtotal here are expressed against packQty (a Pack count), so
-    // scale up to a per-Pack price first — same anchor-then-scale-up fix
-    // as BuyNowModal.computeLocalQuote and HomeProductFeed.computePriceBreakdown.
-
-    // submission.price is now directly per SALE UNIT — no packSize scaling.
     const pricePerSaleUnit = Number(submission.price);
-
 
     const { price: slabPrice, slab: appliedSlab } = resolveSlabUnitPrice(submission.price_slabs, saleQty, pricePerSaleUnit);
     const { percent: discountPercent, tier: discountTier } = resolveDiscountPercent(submission.quantity_discounts, saleQty);
     const unitPrice = round2(slabPrice * (1 - discountPercent / 100));
 
-    // const { data: settings } = await supabase.from("platform_settings").select("commission_percent").eq("id", true).maybeSingle();
     const { data: commissionPercentData } = await supabase
         .rpc("resolve_commission_percent", { p_generic_product_brand_id: submission.generic_product_brand_id });
     const commissionPercent = Number(commissionPercentData ?? 0.25);
@@ -303,22 +262,19 @@ export async function getOrderQuote(req, res) {
 
     const stockShortfall = submission.stock_type === "ready_stock"
         && submission.stock_quantity != null
-        && saleQty > Number(submission.stock_quantity); // stock_quantity now sale-unit qty too
+        && saleQty > Number(submission.stock_quantity);
 
-    // NEW — hard out-of-stock: nothing left at all (made_to_order items are
-    // never "out of stock" since they're produced on demand).
     const outOfStock = submission.stock_type === "ready_stock"
         && submission.stock_quantity != null
         && Number(submission.stock_quantity) <= 0;
-
 
     res.json({
         success: true,
         orderType: "standard",
         unitPrice, basePriceApplied: slabPrice, appliedSlab, discountPercent, discountTier,
-        unit: submission.unit, moq: submission.moq,       // sale-unit qty
-        saleUnit: getSaleUnit(submission.units_per_master_pack), // NEW — tells the client unambiguously, instead of it re-deriving hasOuterPack itself
-        purchaseBasis, quantity: qty, saleUnitQuantity: saleQty, // renamed from baseQuantity — that name was actively misleading, it was never base units
+        unit: submission.unit, moq: submission.moq,
+        saleUnit: getSaleUnit(submission.units_per_master_pack),
+        purchaseBasis, quantity: qty, saleUnitQuantity: saleQty,
         estimatedDeliveryDate: delivery.label, leadDays: delivery.leadDays,
         transitDaysMin: delivery.transitDaysMin, transitDaysMax: delivery.transitDaysMax,
         availableStock: submission.stock_quantity, subtotal,
@@ -329,12 +285,13 @@ export async function getOrderQuote(req, res) {
     });
 }
 
-// POST /api/orders — unchanged (see file header for the notification de-dup note)
+// POST /api/orders
 export async function placeOrder(req, res) {
     const buyerId = req.user.id;
     const {
         submissionId, quantity, purchaseBasis = "per_unit", orderType = "standard",
         sampleOrderId, shippingAddressId, notes,
+        transportMode, transportCompany, transportDetails,
     } = req.body || {};
 
     if (!submissionId) return res.status(400).json({ success: false, message: "Missing listing." });
@@ -345,7 +302,6 @@ export async function placeOrder(req, res) {
         return res.status(400).json({ success: false, message: "Invalid purchase basis." });
     }
     const safeOrderType = orderType === "sample" ? "sample" : orderType === "credit" ? "credit" : "standard";
-
 
     const { data: sellerRow } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
     if (sellerRow) {
@@ -374,6 +330,9 @@ export async function placeOrder(req, res) {
         p_purchase_basis: purchaseBasis,
         p_order_type: safeOrderType,
         p_sample_order_id: sampleOrderId || null,
+        p_transport_mode: transportMode || null,
+        p_transport_company: transportCompany || null,
+        p_transport_details: transportDetails || null,
     });
 
     if (error) {
@@ -388,14 +347,6 @@ export async function placeOrder(req, res) {
         return res.status(500).json({ success: false, message: "Couldn't place the order — please try again." });
     }
 
-    // row.order_status is 'awaiting_payment' for standard orders (gated on
-    // UPI verification) or 'pending_confirmation' for sample/credit (which
-    // skip the gate). Seller notification, the "orders changed" broadcast,
-    // AND commission accrual all only happen here, for the latter case.
-    // Standard orders get all three of these from admin_verify_payment()
-    // instead, once payment is actually confirmed — see
-    // paymentVerification.controller.js. Until then the seller must not be
-    // notified and must not see the order at all.
     if (row.order_status !== "awaiting_payment") {
         if (row.seller_user_id) {
             await notifyUser(row.seller_user_id, {
@@ -421,7 +372,7 @@ export async function placeOrder(req, res) {
         success: true,
         orderId: row.order_id,
         orderNumber: row.order_number,
-        orderStatus: row.order_status,       // NEW — "awaiting_payment" | "pending_confirmation"
+        orderStatus: row.order_status,
         estimatedDeliveryDate: row.estimated_delivery_date,
         stockShortfall: row.stock_shortfall,
         paymentMethod: row.payment_method,
@@ -442,6 +393,7 @@ export async function listMyOrders(req, res) {
       order_group_id,
       order_group:order_groups ( group_number ),
       subtotal_amount, total_amount, payment_status, created_at, updated_at,
+      transport_mode, transport_company, transport_details, transport_source,
       seller:seller_profiles ( id, display_name, shop_slug, logo_url, city, state ),
       items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied, discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )
     `)
@@ -452,13 +404,11 @@ export async function listMyOrders(req, res) {
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    // flatten order_group.group_number -> group_number so the frontend
-    // (which reads o.group_number directly) doesn't need to change
     const orders = (data || []).map((o) => ({ ...o, group_number: o.order_group?.group_number || null }));
     res.json({ success: true, orders });
 }
 
-// GET /api/orders/:id — unchanged
+// GET /api/orders/:id
 export async function getMyOrder(req, res) {
     const { data: order, error } = await supabase
         .from("orders").select("*, seller:seller_profiles ( id, display_name, shop_slug, logo_url, city, state ), items:order_items ( * )")
@@ -470,8 +420,7 @@ export async function getMyOrder(req, res) {
     res.json({ success: true, order, events: events || [] });
 }
 
-// POST /api/orders/:id/cancel — unchanged (see file header for the notification de-dup note)
-// cancelMyOrder() — add this after notifyOrderChanged, before the seller-notify block
+// POST /api/orders/:id/cancel
 export async function cancelMyOrder(req, res) {
     const { reason } = req.body || {};
     const { data, error } = await supabase.rpc("update_order_status", {
