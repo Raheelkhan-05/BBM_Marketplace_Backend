@@ -38,6 +38,7 @@ const ERROR_MAP = {
     BUYER_NOT_VERIFIED: { status: 403, message: "Please verify your email or phone before placing an order." },
     ADDRESS_NOT_FOUND: { status: 400, message: "Please select a valid shipping address." },
     INVALID_QUANTITY: { status: 400, message: "Please enter a valid quantity." },
+    OUT_OF_STOCK: { status: 400, message: "This item is currently out of stock." },
 };
 function mapRpcError(error) {
     return ERROR_MAP[(error?.message || "").trim()] || { status: 500, message: "Couldn't place the order. Please try again." };
@@ -304,6 +305,13 @@ export async function getOrderQuote(req, res) {
         && submission.stock_quantity != null
         && saleQty > Number(submission.stock_quantity); // stock_quantity now sale-unit qty too
 
+    // NEW — hard out-of-stock: nothing left at all (made_to_order items are
+    // never "out of stock" since they're produced on demand).
+    const outOfStock = submission.stock_type === "ready_stock"
+        && submission.stock_quantity != null
+        && Number(submission.stock_quantity) <= 0;
+
+
     res.json({
         success: true,
         orderType: "standard",
@@ -317,6 +325,7 @@ export async function getOrderQuote(req, res) {
         platformFeePercent: commissionPercent, platformFeeAmount: platformFee, sellerPayoutAmount: subtotal - platformFee,
         meetsMoq: saleQty >= Number(submission.moq),
         stockShortfall,
+        outOfStock,
     });
 }
 
@@ -342,6 +351,18 @@ export async function placeOrder(req, res) {
     if (sellerRow) {
         const blockMsg = await assertSellerAcceptingOrders(sellerRow.seller_id);
         if (blockMsg) return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: blockMsg });
+    }
+
+    if (safeOrderType !== "sample") {
+        const { data: submission } = await supabase
+            .from("seller_product_submissions")
+            .select("stock_type, stock_quantity")
+            .eq("id", submissionId)
+            .maybeSingle();
+
+        if (submission?.stock_type === "ready_stock" && Number(submission.stock_quantity) <= 0) {
+            return res.status(400).json({ success: false, code: "OUT_OF_STOCK", message: "This item is currently out of stock." });
+        }
     }
 
     const { data, error } = await supabase.rpc("place_order", {
