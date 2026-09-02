@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
+import compression from "compression";
 import authRoutes from "./routes/auth.routes.js";
 import sellerRoutes from "./routes/seller.routes.js";
 import adminRoutes from "./routes/admin.routes.js";
@@ -30,6 +31,15 @@ export function createApp() {
   const app = express();
 
   app.use(helmet());
+
+  // Gzip/brotli-compresses every response body (JSON, HTML, etc) before it
+  // goes over the wire. Your catalog/feed responses are JSON — plain text —
+  // which typically compresses 70-80%, so a 200KB response becomes roughly
+  // 40-50KB actually transferred. Every modern browser sends
+  // "Accept-Encoding: gzip, br" automatically and decompresses on arrival
+  // for free, so this is pure savings with no client-side change needed.
+  // Placed early, before routes, so it wraps every response this app sends.
+  app.use(compression());
 
   const allowedOrigins = (
     process.env.CLIENT_ORIGINS ||
