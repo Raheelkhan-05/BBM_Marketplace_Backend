@@ -11,6 +11,18 @@
 // point at the same place — /admin/listings — which already has
 // inline hierarchy mapping and refuses to approve until that mapping
 // exists, so one visit is enough.
+//
+// PERFORMANCE FIX (this pass): SUBMISSION_LIST_COLUMNS was missing
+// pack_size and units_per_master_pack. Since the frontend list page needs
+// those two fields to label MOQ/price/stock correctly ("Pack" vs "Master
+// Pack"), and the light list endpoint didn't return them, the frontend
+// was firing a SEPARATE full-detail request for every single listing on
+// the page just to fill in two fields — turning "load my listings" into
+// "load my listings, then N more full-detail round trips" (N = however
+// many products that seller has). Both fields already live directly on
+// this table (see toListingRow below, which writes them onto the row at
+// creation time) — there was never a reason to fetch them separately.
+// Adding them here removes the need for that entire enrichment pass.
 import { supabase } from "../config/supabase.js";
 import { notifyAdmins, notifyAdminSubmissionsChanged } from "../services/notifications.service.js";
 import { slugify } from "../services/slugify.js";
@@ -57,10 +69,13 @@ async function autoSaveSellerDefaults(sellerId, body) {
     }
 }
 
+// pack_size and units_per_master_pack ADDED — see PERFORMANCE FIX note
+// above. This is the entire fix for the N+1 enrichment problem.
 const SUBMISSION_LIST_COLUMNS = `
     id, created_at, updated_at, review_status, rejection_reason,
     reviewed_at, is_active, generic_product_brand_id,
     product_name, brand_name, image, price, base_price, moq, unit,
+    pack_size, units_per_master_pack,
     stock_type, stock_quantity, production_lead_time_days,
     hs_generic_product_brands ( id, name, brand_name, image, images )
 `;
