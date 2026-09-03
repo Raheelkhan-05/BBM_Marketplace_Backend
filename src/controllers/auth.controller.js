@@ -5,24 +5,45 @@ import { channelTokenFor } from "../services/channelToken.js";
 import { sendWelcomeEmail, sendBusinessVerifiedEmail } from "../services/mail.service.js";
 
 // GET /api/auth/me
+//
+// PERFORMANCE FIX: this now runs the seller_profiles and business_profiles
+// lookups IN PARALLEL instead of one after the other. Neither of those two
+// queries depends on the profile row or on each other — both only need
+// req.user.id, which is already known from the verified JWT before this
+// handler even starts. The original version awaited profile, then
+// (sequentially) seller, then (sequentially) businessProfile — three
+// stacked round trips. Since AuthContext now calls this endpoint
+// immediately on every app load for any signed-in visitor (as part of the
+// auth-speed fix), this endpoint's own latency directly affects how fast
+// the whole app feels — cutting it from three sequential round trips to
+// two (profile first, since its result decides the 401; then seller +
+// businessProfile together) is a real, repeated win, not a one-off.
 export async function getMe(req, res) {
-  // console.log("[getMe] looking up id:", req.user.id);
   const { data: profile, error } = await supabaseAdmin
     .from("profiles")
     .select("id, phone, phone_verified, email, email_verified, name, onboarding_step, created_at, role")
     .eq("id", req.user.id)
     .maybeSingle();
-  // console.log("[getMe] result:", { profile, error });
+
   if (error || !profile) {
     return res.status(401).json({ success: false, message: "Session out of date — please log in again." });
   }
 
-  // inside getMe, alongside the existing profile fetch
-  const { data: seller } = await supabase.from("seller_profiles").select("status, shop_slug").eq("user_id", req.user.id).maybeSingle();
+  // These two queries are independent of each other and of the profile
+  // row above — run them concurrently instead of one after another.
+  const [{ data: seller }, { data: businessProfile }] = await Promise.all([
+    supabase.from("seller_profiles").select("status, shop_slug").eq("user_id", req.user.id).maybeSingle(),
+    supabaseAdmin.from("business_profiles").select("*").eq("user_id", req.user.id).maybeSingle(),
+  ]);
 
-  const { data: businessProfile } = await supabaseAdmin
-    .from("business_profiles").select("*").eq("user_id", req.user.id).maybeSingle();
-  return res.json({ success: true, profile, businessProfile: businessProfile || null, notificationChannel: channelTokenFor(req.user.id), shop_slug: seller?.shop_slug ?? null, seller_status: seller?.status ?? null });
+  return res.json({
+    success: true,
+    profile,
+    businessProfile: businessProfile || null,
+    notificationChannel: channelTokenFor(req.user.id),
+    shop_slug: seller?.shop_slug ?? null,
+    seller_status: seller?.status ?? null,
+  });
 }
 
 // POST /api/auth/gst-lookup  { gstin }
