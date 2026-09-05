@@ -23,6 +23,17 @@
 // this table (see toListingRow below, which writes them onto the row at
 // creation time) — there was never a reason to fetch them separately.
 // Adding them here removes the need for that entire enrichment pass.
+//
+// COMMENT FIX (this pass): the note above the MOQ check in
+// validateListingPayload() used to claim "moq is expressed in PACKS" —
+// that was stale and directly contradicted toListingRow()'s own comment
+// a few dozen lines down ("already sale-unit qty"), which is what's
+// actually true and what the frontend list/detail/quick-update views all
+// assume. That stale comment is exactly what led the frontend's edit
+// form to wrongly re-divide an already-correct MOQ by masterPackSize on
+// load (fixed in SellerListingForm.jsx). No behavior changes here — the
+// check itself never converted anything — just the comment, corrected so
+// it can't mislead anyone again.
 import { supabase } from "../config/supabase.js";
 import { notifyAdmins, notifyAdminSubmissionsChanged } from "../services/notifications.service.js";
 import { slugify } from "../services/slugify.js";
@@ -152,10 +163,13 @@ function validateListingPayload(body) {
     if (!body.brandNotApplicable && !body.brandName?.trim()) missing.push("Brand");
     if (!(Array.isArray(body.images) && body.images.length)) missing.push("Product image");
 
-    // NOTE: moq is now expressed in PACKS, not base units (see place_order()
-    // in Postgres — it compares against pack-quantity, converting master-pack
-    // orders up to packs first). Never multiply/divide this by pack_size when
-    // storing it — it's stored exactly as the seller entered it.
+    // NOTE: moq (like stock_quantity) is expressed in the listing's
+    // canonical SALE UNIT — Master Pack when the listing has an outer
+    // pack (units_per_master_pack >= 2), Pack otherwise — not always
+    // literal Packs. See toListingRow() below and shared/packUnits.js.
+    // Never multiply/divide this by pack_size or units_per_master_pack
+    // when storing it — it's stored exactly as the seller/frontend sends
+    // it.
     if (!(Number(body.moq) > 0)) missing.push("MOQ");
     // if (!body.hsnCode?.trim()) missing.push("HSN Code");
     if (body.gstPercent === undefined || body.gstPercent === null || Number(body.gstPercent) < 0) missing.push("GST %");
