@@ -13,8 +13,14 @@
 // removal). notifyOrderChanged and notifyUserOrdersChanged are KEPT: both
 // are realtime channel broadcasts, not notifications-table rows.
 //
-// listSellerOrders and getSellerOrder are unchanged, reproduced for
-// completeness so this is a drop-in replacement.
+// NEW (this pass): listSellerOrders was missing transport_mode/
+// transport_company/transport_details/transport_source — the seller's
+// order list/detail views had no way to show the transport preference
+// that was agreed with the buyer, even though it's already snapshotted
+// onto every order row. getSellerOrder already had it via `select("*")`.
+//
+// listSellerOrders and getSellerOrder are otherwise unchanged, reproduced
+// for completeness so this is a drop-in replacement.
 import { supabase } from "../config/supabase.js";
 import { notifyOrderChanged, notifyUserOrdersChanged, notifyUser } from "../services/realtimeBroadcast.js";
 
@@ -31,6 +37,7 @@ export async function listSellerOrders(req, res) {
       payment_status, buyer_contact_name, buyer_contact_phone, buyer_contact_email,
       buyer_gstin, buyer_business_name, buyer_gst_verified,
       shipping_address_snapshot, buyer_notes, created_at, updated_at,
+      transport_mode, transport_company, transport_details, transport_source,
       items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied, discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )
     `)
         .eq("seller_id", req.sellerId).neq("status", "awaiting_payment").order("created_at", { ascending: false });
