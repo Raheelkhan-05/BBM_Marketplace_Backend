@@ -8,6 +8,7 @@ import {
     searchHierarchyV2,
     smartSearchV2,
     searchAutocompleteV2,
+    searchProductsMergedV2,
 } from "../controllers/catalogHierarchySearch.controller.js";
 import { browseCatalog, browseGenericProducts } from "../controllers/catalogBrowse.controller.js";
 import { optionalAuthListing } from "../middleware/optionalAuthListing.middleware.js";
@@ -31,6 +32,7 @@ router.get("/hierarchy", searchHierarchyV2);
 router.get("/browse", optionalAuthListing, browseCatalog);
 router.get("/smart", smartSearchV2);
 router.get("/autocomplete", searchAutocompleteV2);
+router.get("/products-merged", searchProductsMergedV2);
 
 router.get("/browse-products", optionalAuthListing, browseGenericProducts);
 router.get("/generic-product-sellers", listGenericProductSellers);

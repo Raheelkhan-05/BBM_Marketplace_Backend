@@ -422,3 +422,210 @@ export async function searchAutocompleteV2(req, res) {
 
     res.json({ success: true, suggestions: deduped });
 }
+
+// GET /api/catalog-search/products-fallback?q=&limit=&offset=
+// Tiered product search for the results page: tries a direct product
+// (brand item) match first. If nothing matches at that level, widens to
+// sibling products under a matching SUBCATEGORY name. If that's also
+// empty, widens further to every product under a matching CATEGORY
+// name. Always responds 200 with `matchLevel` telling the frontend which
+// tier produced the results ("product" | "subcategory" | "category" |
+// "none") — the page stays put and shows "results from <matchedOn>"
+// instead of ever having a reason to navigate elsewhere, even on zero
+// results.
+// GET /api/catalog-search/products-merged?q=&limit=&offset=
+// Single merged, tiered result: direct product/brand-name matches first,
+// then products under a matching subcategory (excluding anything already
+// listed), then products under a matching category (excluding tiers 1+2).
+// Always runs all three tiers and concatenates — no "try product first,
+// only widen if empty" branching.
+//
+// CAVEAT: pagination across tiers is approximate, not a single true
+// cross-tier offset query. Each tier is fetched up to `offset + limit + 1`
+// rows, concatenated in priority order, then sliced to the requested
+// page. This is exact for page 1 and close enough for typical scrolling,
+// but a very deep offset that straddles a tier boundary can shift
+// slightly — flagging this rather than presenting it as precise.
+export async function searchProductsMergedV2(req, res) {
+    const { q = "", limit, offset } = req.query;
+    const term = q.trim();
+    const lim = clampLimit(limit);
+    const off = clampOffset(offset);
+
+    if (!term) {
+        return res.json({ success: true, items: [], hasMore: false, nextOffset: 0 });
+    }
+
+    const pattern = ilikePattern(term);
+    const orPattern = orIlikePattern(term);
+    const fetchCap = off + lim + 1;
+
+    // Every tier selects the same hierarchy join so category_name /
+    // subcategory_name reach the frontend exactly like the normal feed —
+    // ProductRow otherwise renders that line blank for search results.
+    const BRAND_ITEM_SELECT = `
+    id, generic_product_id, name, brand_name, slug, image, images, brand_image,
+    generic_product:hs_generic_products (
+        name,
+        subcategory:hs_subcategories ( name,
+            category:hs_categories ( name )
+        )
+    )
+`;
+
+    const seenIds = new Set();
+    const tiered = [];
+
+    // Tier 1 — direct product/brand-name match.
+    const { data: directRows, error: directErr } = await supabase
+        .from("hs_generic_product_brands")
+        .select(BRAND_ITEM_SELECT)
+        .eq("review_status", "approved")
+        .or(`name.ilike.${orPattern},brand_name.ilike.${orPattern}`)
+        .order("name")
+        .limit(fetchCap);
+    if (directErr) return res.status(500).json({ success: false, message: directErr.message });
+
+    for (const row of directRows || []) {
+        if (seenIds.has(row.id)) continue;
+        seenIds.add(row.id);
+        tiered.push({ ...row, matchTier: "product" });
+    }
+
+    // Tier 2 — products under a matching subcategory.
+    if (tiered.length < fetchCap) {
+        const { data: subMatches, error: subErr } = await supabase
+            .from("hs_subcategories")
+            .select("id, name")
+            .eq("review_status", "approved")
+            .ilike("name", pattern)
+            .limit(1);
+        if (subErr) return res.status(500).json({ success: false, message: subErr.message });
+
+        if (subMatches?.length) {
+            const sub = subMatches[0];
+            const { data: gpRows, error: gpErr } = await supabase
+                .from("hs_generic_products")
+                .select("id")
+                .eq("subcategory_id", sub.id)
+                .eq("review_status", "approved");
+            if (gpErr) return res.status(500).json({ success: false, message: gpErr.message });
+
+            const gpIds = (gpRows || []).map((g) => g.id);
+            if (gpIds.length) {
+                const { data: subItems, error: subItemsErr } = await supabase
+                    .from("hs_generic_product_brands")
+                    .select(BRAND_ITEM_SELECT)
+                    .in("generic_product_id", gpIds)
+                    .eq("review_status", "approved")
+                    .order("name")
+                    .limit(fetchCap);
+                if (subItemsErr) return res.status(500).json({ success: false, message: subItemsErr.message });
+
+                for (const row of subItems || []) {
+                    if (seenIds.has(row.id)) continue;
+                    seenIds.add(row.id);
+                    tiered.push({ ...row, matchTier: "subcategory" });
+                }
+            }
+        }
+    }
+
+    // Tier 3 — products under a matching category.
+    if (tiered.length < fetchCap) {
+        const { data: catMatches, error: catErr } = await supabase
+            .from("hs_categories")
+            .select("id, name")
+            .eq("review_status", "approved")
+            .ilike("name", pattern)
+            .limit(1);
+        if (catErr) return res.status(500).json({ success: false, message: catErr.message });
+
+        if (catMatches?.length) {
+            const cat = catMatches[0];
+            const { data: subIdRows, error: subIdErr } = await supabase
+                .from("hs_subcategories")
+                .select("id")
+                .eq("category_id", cat.id)
+                .eq("review_status", "approved");
+            if (subIdErr) return res.status(500).json({ success: false, message: subIdErr.message });
+
+            const subcategoryIds = (subIdRows || []).map((s) => s.id);
+            if (subcategoryIds.length) {
+                const { data: gpRows2, error: gpErr2 } = await supabase
+                    .from("hs_generic_products")
+                    .select("id")
+                    .in("subcategory_id", subcategoryIds)
+                    .eq("review_status", "approved");
+                if (gpErr2) return res.status(500).json({ success: false, message: gpErr2.message });
+
+                const gpIds2 = (gpRows2 || []).map((g) => g.id);
+                if (gpIds2.length) {
+                    const { data: catItems, error: catItemsErr } = await supabase
+                        .from("hs_generic_product_brands")
+                        .select(BRAND_ITEM_SELECT)
+                        .in("generic_product_id", gpIds2)
+                        .eq("review_status", "approved")
+                        .order("name")
+                        .limit(fetchCap);
+                    if (catItemsErr) return res.status(500).json({ success: false, message: catItemsErr.message });
+
+                    for (const row of catItems || []) {
+                        if (seenIds.has(row.id)) continue;
+                        seenIds.add(row.id);
+                        tiered.push({ ...row, matchTier: "category" });
+                    }
+                }
+            }
+        }
+    }
+
+    const page = tiered.slice(off, off + lim);
+    const hasMore = tiered.length > off + lim;
+
+    if (!page.length) {
+        return res.json({ success: true, items: [], hasMore: false, nextOffset: off });
+    }
+
+    const ids = page.map((b) => b.id);
+    const { data: listings, error: listErr } = await supabase
+        .from("seller_product_submissions")
+        .select("generic_product_brand_id, price, unit, pack_size, units_per_master_pack, gst_percent, stock_type, stock_quantity")
+        .in("generic_product_brand_id", ids)
+        .eq("review_status", "approved")
+        .eq("is_active", true);
+    if (listErr) return res.status(500).json({ success: false, message: listErr.message });
+
+    const lowestByBrand = {};
+    for (const row of listings || []) {
+        const current = lowestByBrand[row.generic_product_brand_id];
+        if (!current || Number(row.price) < Number(current.price)) {
+            lowestByBrand[row.generic_product_brand_id] = row;
+        }
+    }
+
+    // Flatten the nested join into the same flat field names ProductRow
+    // already expects from the normal feed (category_name/subcategory_name),
+    // and drop the raw nested `generic_product` object from the response.
+    const items = page.map((b) => {
+        const l = lowestByBrand[b.id];
+        const gp = b.generic_product;
+        const sc = gp?.subcategory;
+        const cat = sc?.category;
+        const { generic_product, ...rest } = b;
+        return {
+            ...rest, // includes brand_image now that it's selected
+            category_name: cat?.name ?? null,
+            subcategory_name: sc?.name ?? null,
+            lowest_price: l?.price ?? null,
+            lowest_price_unit: l?.unit ?? null,
+            lowest_price_pack_size: l?.pack_size ?? null,
+            lowest_price_master_pack_size: l?.units_per_master_pack ?? null,
+            lowest_price_gst_percent: l?.gst_percent ?? null,
+            lowest_price_stock_type: l?.stock_type ?? null,
+            lowest_price_available_stock: l?.stock_quantity ?? null,
+        };
+    });
+
+    res.json({ success: true, items, hasMore, nextOffset: off + items.length });
+}
