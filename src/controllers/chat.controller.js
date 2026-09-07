@@ -246,15 +246,26 @@ export async function sendMessage(req, res) {
     await emitToConversation(conversationId, "conversation:updated", { conversationId }, { excludeUserId: userId });
 
     const toNotify = (recipients || []).filter((r) => !r.is_muted);
-    const { data: senderProfile } = await supabase.from("profiles").select("name").eq("id", userId).single();
+    // BUG FIX: notification title used the sender's PERSONAL name (profiles.name)
+    // unconditionally, instead of preferring their shop name — inconsistent with
+    // listConversations, which already deliberately shows shop name only (see its
+    // own comment: "Shop name only — never fetch/expose the personal profile
+    // name here"). This now prefers the shop name (sellers messaging buyers),
+    // falling back to the personal name only when the sender has no seller
+    // profile (e.g. a buyer messaging a seller).
+    const [{ data: senderShop }, { data: senderProfile }] = await Promise.all([
+        supabase.from("seller_profiles").select("display_name").eq("user_id", userId).maybeSingle(),
+        supabase.from("profiles").select("name").eq("id", userId).single(),
+    ]);
+    const notificationTitle = senderShop?.display_name || senderProfile?.name || "New message";
+
     if (toNotify.length) {
         const { data: inserted } = await supabase.from("notifications").insert(
-            toNotify.map((r) => ({ user_id: r.user_id, type: "message", title: senderProfile?.name || "New message", body: preview, link: `/chat/${conversationId}`, read: false }))
+            toNotify.map((r) => ({ user_id: r.user_id, type: "message", title: notificationTitle, body: preview, link: `/chat/${conversationId}`, read: false }))
         ).select("id, user_id, title, body, link, created_at");
         const io = getIO();
         (inserted || []).forEach((n) => io.to(`user:${n.user_id}`).emit("notification:new", n));
     }
-
     res.json({ success: true, message: payload });
 }
 
