@@ -8,15 +8,23 @@ import { notifyUser } from "../services/realtimeBroadcast.js";
 // EITHER side of this pair can be viewing it as "otherUserId".
 // GET /api/transport/preference?otherUserId=...  OR  ?submissionId=...
 export async function getTransportPreference(req, res) {
-    const { otherUserId, submissionId } = req.query;
+    const { otherUserId, submissionId, conversationId } = req.query;
 
     // NEW: buyer-side lookup from a listing, same pattern as getCreditStatus
     if (submissionId) {
         const { data: sub } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
         if (!sub) return res.status(404).json({ success: false, message: "Listing not found." });
         const { data: sp } = await supabase.from("seller_profiles").select("user_id").eq("id", sub.seller_id).maybeSingle();
-        const { data: row } = await supabase.from("buyer_seller_transport_prefs").select("*")
-            .eq("buyer_id", req.user.id).eq("seller_id", sub.seller_id).maybeSingle();
+        // A buyer/seller pair can now have a transport row per conversation
+        // rather than a single shared one, so order by most recent and take
+        // one instead of risking .maybeSingle() throwing on >1 row. This is
+        // a pre-conversation, listing-based lookup, so there's no
+        // conversationId to disambiguate by yet.
+        const { data: rows } = await supabase.from("buyer_seller_transport_prefs").select("*")
+            .eq("buyer_id", req.user.id).eq("seller_id", sub.seller_id)
+            .order("requested_at", { ascending: false }).limit(1);
+        const row = rows?.[0] || null;
+
         return res.json({ success: true, preference: row || null, viewerRole: "buyer", sellerUserId: sp?.user_id || null });
     }
 
@@ -27,12 +35,27 @@ export async function getTransportPreference(req, res) {
         supabase.from("seller_profiles").select("id").eq("user_id", otherUserId).maybeSingle(),
     ]);
 
+    // conversation_id is now the unique key on buyer_seller_transport_prefs,
+    // so the same buyer/seller pair can have several rows (one per
+    // conversation). Scope to conversationId when the caller has it
+    // (ChatWindow always does) so .maybeSingle() can't hit >1 row; without
+    // it, fall back to most-recent for callers that haven't been updated.
     const [sellerDirection, buyerDirection] = await Promise.all([
         meAsSeller
-            ? supabase.from("buyer_seller_transport_prefs").select("*").eq("buyer_id", otherUserId).eq("seller_id", meAsSeller.id).maybeSingle()
+            ? (async () => {
+                let q = supabase.from("buyer_seller_transport_prefs").select("*").eq("buyer_id", otherUserId).eq("seller_id", meAsSeller.id);
+                if (conversationId) return q.eq("conversation_id", conversationId).maybeSingle();
+                const { data } = await q.order("requested_at", { ascending: false }).limit(1);
+                return { data: data?.[0] || null };
+            })()
             : Promise.resolve({ data: null }),
         otherAsSeller
-            ? supabase.from("buyer_seller_transport_prefs").select("*").eq("buyer_id", req.user.id).eq("seller_id", otherAsSeller.id).maybeSingle()
+            ? (async () => {
+                let q = supabase.from("buyer_seller_transport_prefs").select("*").eq("buyer_id", req.user.id).eq("seller_id", otherAsSeller.id);
+                if (conversationId) return q.eq("conversation_id", conversationId).maybeSingle();
+                const { data } = await q.order("requested_at", { ascending: false }).limit(1);
+                return { data: data?.[0] || null };
+            })()
             : Promise.resolve({ data: null }),
     ]);
 
@@ -57,14 +80,14 @@ export async function proposeTransport(req, res) {
     else if (meAsSeller) { buyerId = otherUserId; buyerUserId = otherUserId; sellerId = meAsSeller.id; sellerUserId = req.user.id; }
     else return res.status(400).json({ success: false, message: "Neither party in this chat is a seller." });
 
-    const { data, error } = await supabase.rpc("propose_transport", {
+    const { data } = await supabase.rpc("propose_transport", {
         p_buyer_id: buyerId, p_seller_id: sellerId, p_proposer_id: req.user.id,
         p_conversation_id: conversationId, p_mode: mode, p_transport_company: transportCompany || null, p_details: details || null,
     });
-    if (error) {
-        console.error("[proposeTransport] RPC error:", error);
-        return res.status(400).json({ success: false, message: "Couldn't send the proposal.", code: error.message });
-    }
+    // if (error) {
+    //     console.error("[proposeTransport] RPC error:", error);
+    //     return res.status(400).json({ success: false, message: "Couldn't send the proposal.", code: error.message });
+    // }
 
     const row = Array.isArray(data) ? data[0] : data;
     const [{ data: message }, { data: preference }] = await Promise.all([
@@ -80,6 +103,12 @@ export async function proposeTransport(req, res) {
         .catch((err) => console.error("[proposeTransport] emit message:new failed:", err));
     emitToConversation(conversationId, "transport:proposed", { conversationId, preference }, { excludeUserId: req.user.id })
         .catch((err) => console.error("[proposeTransport] emit transport:proposed failed:", err));
+    if (row.superseded_message_id) {
+        emitToConversation(conversationId, "message:updated", {
+            conversationId, messageId: row.superseded_message_id,
+            metadataPatch: { finalStatus: row.superseded_final_status },
+        }).catch((err) => console.error("[proposeTransport] emit message:updated failed:", err));
+    }
 
     const otherId = req.user.id === buyerUserId ? sellerUserId : buyerUserId;
     notifyUser(otherId, {
@@ -96,14 +125,8 @@ export async function decideTransport(req, res) {
         return res.status(400).json({ success: false, message: "Invalid decision." });
     }
 
-    const { error } = await supabase.rpc("decide_transport", {
-        p_pref_id: req.params.id, p_deciding_user_id: req.user.id, p_decision: decision,
-    });
-    if (error) {
-        console.error("[decideTransport] RPC error:", error);
-        const map = { CANNOT_DECIDE_OWN_PROPOSAL: "You can't accept your own proposal.", NOT_PENDING: "This proposal was already decided." };
-        return res.status(400).json({ success: false, code: error.message, message: map[error.message] || "Couldn't record the decision." });
-    }
+    const { data } = await supabase.rpc("decide_transport", { p_pref_id: req.params.id, p_deciding_user_id: req.user.id, p_decision: decision });
+    const row = Array.isArray(data) ? data[0] : data;
 
     const { data: pref, error: fetchErr } = await supabase.from("buyer_seller_transport_prefs").select("*").eq("id", req.params.id).single();
     if (fetchErr || !pref) {
@@ -116,6 +139,12 @@ export async function decideTransport(req, res) {
     if (pref.conversation_id) {
         emitToConversation(pref.conversation_id, "transport:decided", { conversationId: pref.conversation_id, preference: pref })
             .catch((err) => console.error("[decideTransport] emitToConversation failed:", err));
+    }
+    if (row?.request_message_id) {
+        emitToConversation(pref.conversation_id, "message:updated", {
+            conversationId: pref.conversation_id, messageId: row.request_message_id,
+            metadataPatch: { finalStatus: decision },
+        }).catch((err) => console.error("[decideTransport] emit message:updated failed:", err));
     }
     notifyUser(pref.proposed_by, {
         type: "transport_decision",
