@@ -91,7 +91,59 @@ export async function listSellerSubmissions(req, res) {
         );
     }
 
+    // Attach a suggested manufacturer to every item missing one, resolved
+    // in a single extra query rather than one per row.
+    const missingManufacturerBrands = items.filter((it) => !it.manufacturer?.trim()).map((it) => it.brand_name);
+    if (missingManufacturerBrands.length) {
+        const suggestions = await resolveManufacturersForBrands(missingManufacturerBrands);
+        items = items.map((it) => {
+            if (it.manufacturer?.trim()) return it;
+            const suggestion = it.brand_name ? suggestions.get(it.brand_name.trim().toLowerCase()) : null;
+            return suggestion ? { ...it, suggested_manufacturer: suggestion } : it;
+        });
+    }
+
     res.json({ success: true, items });
+}
+
+// "Mostly one manufacturer per brand" — resolves a suggested manufacturer
+// for a set of brand names in ONE query, grouped in JS, instead of one
+// round trip per listing. Picks whichever manufacturer value is recorded
+// most often for that brand elsewhere in the catalog (not just the first
+// match), so a rare mismatched entry doesn't skew the suggestion.
+//
+// CAVEAT: matches brand_name by exact case (.in()), not case-insensitive —
+// fine as long as brand names stay consistent (BrandCombobox already
+// dedupes/reuses existing brand entries on the seller side), but flagging
+// it: a brand entered with different casing elsewhere won't be found here.
+async function resolveManufacturersForBrands(brandNames) {
+    const uniqueTerms = [...new Set(brandNames.filter(Boolean).map((n) => n.trim()).filter(Boolean))];
+    if (!uniqueTerms.length) return new Map();
+
+    const { data, error } = await supabase
+        .from("hs_generic_product_brands")
+        .select("brand_name, manufacturer")
+        .in("brand_name", uniqueTerms)
+        .not("manufacturer", "is", null);
+    if (error || !data?.length) return new Map();
+
+    const tally = new Map(); // brand_name(lower) -> Map(manufacturer -> count)
+    for (const row of data) {
+        const brand = row.brand_name?.trim();
+        const manu = row.manufacturer?.trim();
+        if (!brand || !manu) continue;
+        const key = brand.toLowerCase();
+        if (!tally.has(key)) tally.set(key, new Map());
+        const counts = tally.get(key);
+        counts.set(manu, (counts.get(manu) || 0) + 1);
+    }
+
+    const result = new Map();
+    for (const [key, counts] of tally.entries()) {
+        const [best] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0];
+        result.set(key, best);
+    }
+    return result;
 }
 
 // GET /api/admin/seller-submissions/:id
@@ -105,7 +157,13 @@ export async function getSellerSubmission(req, res) {
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!data) return res.status(404).json({ success: false, message: "Not found." });
 
-    const normalized = normalizeSubmission(data);
+    let normalized = normalizeSubmission(data);
+    if (!normalized.manufacturer?.trim() && normalized.brand_name?.trim()) {
+        const suggestions = await resolveManufacturersForBrands([normalized.brand_name]);
+        const suggestion = suggestions.get(normalized.brand_name.trim().toLowerCase());
+        if (suggestion) normalized = { ...normalized, suggested_manufacturer: suggestion };
+    }
+
     const marketplace = await computeMarketplaceFigures(normalized.price);
     res.json({ success: true, submission: normalized, marketplace });
 }
