@@ -1,5 +1,6 @@
 import { supabase } from "../config/supabase.js";
 import { notifyUser } from "../utils/notify.js";
+import { notifySellerProfileChanged } from "../services/notifications.service.js";
 
 // Same allowlist used by the seller-facing save endpoint — admin can touch
 // any of these too, but never status/shop_slug/user_id directly (those go
@@ -90,7 +91,6 @@ export async function approveSeller(req, res) {
   const { data: updated, error } = await supabase.from("seller_profiles").update(update).eq("id", id).select("*, profiles:user_id(email, phone, name)").single();
   if (error) return res.status(500).json({ success: false, message: error.message });
 
-  // Clear pending flags on photos/certs together with the profile
   await Promise.all([
     supabase.from("seller_photos").update({ pending: false }).eq("seller_id", id).eq("pending", true),
     supabase.from("seller_certifications").update({ pending: false }).eq("seller_id", id).eq("pending", true),
@@ -106,6 +106,11 @@ export async function approveSeller(req, res) {
     emailSubject: wasFirstApproval ? "Your BBM seller shop is now live" : "Your BBM shop updates are approved",
     emailHtml: `<p>Hi ${updated.profiles?.name || "there"},</p><p>${wasFirstApproval ? `Your shop <strong>${updated.display_name}</strong> has been approved and is now live to buyers.` : "The changes you made to your shop are now approved and visible to buyers."}</p><p><a href="${process.env.APP_BASE_URL}/shop/${updated.shop_slug}">View your shop</a></p>`,
   }).catch((e) => console.error("[approveSeller] notify failed", e));
+
+  // Pushes a live "your status changed" ping to the seller's open tab(s),
+  // if any — separate from the notification row/email above, which the
+  // seller may not check immediately.
+  notifySellerProfileChanged(updated.user_id);
 
   res.json({ success: true, seller: updated });
 }
@@ -130,7 +135,6 @@ export async function rejectSeller(req, res) {
   } else if (seller.status === "approved" && seller.has_pending_changes) {
     update = { ...update, pending_changes: null, has_pending_changes: false };
     shopStaysLive = true;
-    // discard staged photos/certs too
     await Promise.all([
       supabase.from("seller_photos").delete().eq("seller_id", id).eq("pending", true),
       supabase.from("seller_certifications").delete().eq("seller_id", id).eq("pending", true),
@@ -151,6 +155,8 @@ export async function rejectSeller(req, res) {
     emailSubject: shopStaysLive ? "Update to your BBM shop wasn't approved" : "Update needed on your BBM seller application",
     emailHtml: `<p>Hi ${updated.profiles?.name || "there"},</p><p>${shopStaysLive ? "We reviewed the recent changes to your live shop and need a few adjustments before they can go live:" : `We reviewed your seller application for <strong>${updated.display_name}</strong> and need a few changes before approving it:`}</p><blockquote>${reason.trim()}</blockquote>`,
   }).catch((e) => console.error("[rejectSeller] notify failed", e));
+
+  notifySellerProfileChanged(updated.user_id);
 
   res.json({ success: true, seller: updated });
 }

@@ -66,3 +66,15 @@ export async function notifyAdminSubmissionsChanged() {
     try { getIO().to("admin-submissions").emit("submissions_changed", {}); }
     catch (err) { console.error("[notifications] admin submissions_changed emit failed:", err.message); }
 }
+
+// Distinct from notifySellerSubmissionsChanged (product listings) — this
+// is for the seller's own shop profile status changing (approve/reject/
+// pending_changes cleared). Kept as its own event name so a listener on
+// the onboarding/dashboard page can react specifically to "your shop
+// status changed" without also firing on every unrelated product-listing
+// update this seller happens to have.
+export async function notifySellerProfileChanged(userId) {
+    if (!userId) return;
+    try { getIO().to(`user:${userId}`).emit("seller_profile_changed", {}); }
+    catch (err) { console.error("[notifications] seller_profile_changed emit failed:", err.message); }
+}

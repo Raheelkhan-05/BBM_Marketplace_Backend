@@ -118,6 +118,35 @@ export async function saveSellerOnboarding(req, res) {
   const update = {};
   for (const key of WRITABLE_FIELDS) if (body[key] !== undefined) update[key] = body[key];
 
+  const { data: existingSeller } = await supabase
+    .from("seller_profiles")
+    .select("id, status, pending_changes")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  // Guard: once a shop is approved, a draft-save must NEVER overwrite
+  // status back to "draft" — the upsert below used to do exactly that
+  // unconditionally, so a seller with a stale onboarding tab still open
+  // (or an autosave firing right after an admin approved them) could
+  // silently knock an approved shop back into draft. Route it through
+  // the same staged pending_changes path updateSellerProfile already
+  // uses for a live shop instead.
+  if (existingSeller?.status === "approved") {
+    const gatedUpdate = {};
+    for (const key of GATED_FIELDS) if (body[key] !== undefined) gatedUpdate[key] = body[key];
+    if (!Object.keys(gatedUpdate).length) {
+      return res.json({ success: true, seller: existingSeller, staged: false });
+    }
+    const merged = { ...(existingSeller.pending_changes || {}), ...gatedUpdate };
+    const { data, error } = await supabase
+      .from("seller_profiles")
+      .update({ pending_changes: merged, has_pending_changes: true })
+      .eq("id", existingSeller.id)
+      .select().single();
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    return res.json({ success: true, seller: data, staged: true });
+  }
+
   const { data: business } = await supabase.from("business_profiles").select("id").eq("user_id", userId).maybeSingle();
 
   const { data, error } = await supabase
@@ -142,6 +171,39 @@ export async function submitSellerOnboarding(req, res) {
     return res.status(400).json({ success: false, message: "Please verify your WhatsApp number before submitting." });
   }
 
+  const { data: existingSeller } = await supabase
+    .from("seller_profiles")
+    .select("id, status, pending_changes, display_name")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  // Same guard as saveSellerOnboarding, for the full "submit" path — an
+  // already-approved shop resubmitting the onboarding form must stage as
+  // an edit, never revert status to "pending_review" and pull the shop
+  // back off the live buyer-facing site.
+  if (existingSeller?.status === "approved") {
+    const gatedUpdate = {};
+    for (const key of GATED_FIELDS) if (body[key] !== undefined) gatedUpdate[key] = body[key];
+    const merged = { ...(existingSeller.pending_changes || {}), ...gatedUpdate };
+    const { data, error } = await supabase
+      .from("seller_profiles")
+      .update({ pending_changes: merged, has_pending_changes: true })
+      .eq("id", existingSeller.id)
+      .select().single();
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    notifyAdmins({
+      type: "seller_edit_submitted",
+      title: "Shop update pending review",
+      body: `${existingSeller.display_name} updated their shop details — changes are staged, not yet live.`,
+      link: `/admin/sellers/${existingSeller.id}`,
+      emailSubject: `Shop update pending review: ${existingSeller.display_name}`,
+      emailHtml: `<p><strong>${existingSeller.display_name}</strong> edited their live shop. Changes are staged pending your review.</p><p><a href="${process.env.APP_BASE_URL}/admin/sellers/${existingSeller.id}">Review changes</a></p>`,
+    }).catch((e) => console.error("[submitSellerOnboarding] notify admins failed", e));
+
+    return res.json({ success: true, seller: data, staged: true });
+  }
+
   const { data: business } = await supabase.from("business_profiles").select("id, nature_of_business").eq("user_id", userId).maybeSingle();
   update.manufacturing_facility = Array.isArray(business?.nature_of_business)
     && business.nature_of_business.some((n) => /factory|manufactur/i.test(n));
@@ -152,9 +214,8 @@ export async function submitSellerOnboarding(req, res) {
     return v === undefined || v === null || v === "" || (Array.isArray(v) && v.length === 0);
   });
   if (missing.length) {
-    const { data: existing } = await supabase.from("seller_profiles").select("*").eq("user_id", userId).maybeSingle();
     const stillMissing = missing.filter((f) => {
-      const v = existing?.[f];
+      const v = existingSeller?.[f];
       return v === undefined || v === null || v === "" || (Array.isArray(v) && v.length === 0);
     });
     if (stillMissing.length) {
@@ -162,9 +223,8 @@ export async function submitSellerOnboarding(req, res) {
     }
   }
 
-  const { data: existing } = await supabase.from("seller_profiles").select("id, shop_slug, display_name").eq("user_id", userId).maybeSingle();
-  const displayName = merged.display_name || existing?.display_name;
-  const shopSlug = existing?.shop_slug || await generateUniqueSlug(displayName);
+  const displayName = merged.display_name || existingSeller?.display_name;
+  const shopSlug = existingSeller?.shop_slug || await generateUniqueSlug(displayName);
 
   const { data, error } = await supabase
     .from("seller_profiles")
