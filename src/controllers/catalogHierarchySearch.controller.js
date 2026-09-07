@@ -447,7 +447,7 @@ export async function searchAutocompleteV2(req, res) {
 // but a very deep offset that straddles a tier boundary can shift
 // slightly — flagging this rather than presenting it as precise.
 export async function searchProductsMergedV2(req, res) {
-    const { q = "", limit, offset } = req.query;
+    const { q = "", limit, offset, categoryId } = req.query;
     const term = q.trim();
     const lim = clampLimit(limit);
     const off = clampOffset(offset);
@@ -460,30 +460,63 @@ export async function searchProductsMergedV2(req, res) {
     const orPattern = orIlikePattern(term);
     const fetchCap = off + lim + 1;
 
-    // Every tier selects the same hierarchy join so category_name /
-    // subcategory_name reach the frontend exactly like the normal feed —
-    // ProductRow otherwise renders that line blank for search results.
     const BRAND_ITEM_SELECT = `
-    id, generic_product_id, name, brand_name, slug, image, images, brand_image,
-    generic_product:hs_generic_products (
-        name,
-        subcategory:hs_subcategories ( name,
-            category:hs_categories ( name )
+        id, generic_product_id, name, brand_name, slug, image, images, brand_image,
+        generic_product:hs_generic_products (
+            name,
+            subcategory:hs_subcategories ( name,
+                category:hs_categories ( name )
+            )
         )
-    )
-`;
+    `;
+
+    // When a category is selected, every tier stays scoped to it — a
+    // search performed while browsing "Lubricants" should only ever
+    // surface Lubricants results, the same way it already does for the
+    // non-search browse feed.
+    let allowedGenericProductIds = null;
+    if (categoryId) {
+        const { data: subIdRows, error: subIdErr } = await supabase
+            .from("hs_subcategories")
+            .select("id")
+            .eq("category_id", categoryId)
+            .eq("review_status", "approved");
+        if (subIdErr) return res.status(500).json({ success: false, message: subIdErr.message });
+
+        const subcategoryIds = (subIdRows || []).map((s) => s.id);
+        if (subcategoryIds.length) {
+            const { data: gpRows, error: gpErr } = await supabase
+                .from("hs_generic_products")
+                .select("id")
+                .in("subcategory_id", subcategoryIds)
+                .eq("review_status", "approved");
+            if (gpErr) return res.status(500).json({ success: false, message: gpErr.message });
+            allowedGenericProductIds = (gpRows || []).map((g) => g.id);
+        } else {
+            allowedGenericProductIds = [];
+        }
+    }
+
+    // Category selected but it has no approved products at all — nothing
+    // to search, skip straight to an empty (not error) response.
+    if (categoryId && allowedGenericProductIds.length === 0) {
+        return res.json({ success: true, items: [], hasMore: false, nextOffset: off });
+    }
 
     const seenIds = new Set();
     const tiered = [];
 
-    // Tier 1 — direct product/brand-name match.
-    const { data: directRows, error: directErr } = await supabase
+    // Tier 1 — direct product/brand-name match, scoped to the category if set.
+    let directQuery = supabase
         .from("hs_generic_product_brands")
         .select(BRAND_ITEM_SELECT)
         .eq("review_status", "approved")
         .or(`name.ilike.${orPattern},brand_name.ilike.${orPattern}`)
         .order("name")
         .limit(fetchCap);
+    if (allowedGenericProductIds) directQuery = directQuery.in("generic_product_id", allowedGenericProductIds);
+
+    const { data: directRows, error: directErr } = await directQuery;
     if (directErr) return res.status(500).json({ success: false, message: directErr.message });
 
     for (const row of directRows || []) {
@@ -492,14 +525,18 @@ export async function searchProductsMergedV2(req, res) {
         tiered.push({ ...row, matchTier: "product" });
     }
 
-    // Tier 2 — products under a matching subcategory.
+    // Tier 2 — products under a matching subcategory, itself restricted to
+    // the selected category when one is set.
     if (tiered.length < fetchCap) {
-        const { data: subMatches, error: subErr } = await supabase
+        let subQuery = supabase
             .from("hs_subcategories")
             .select("id, name")
             .eq("review_status", "approved")
             .ilike("name", pattern)
             .limit(1);
+        if (categoryId) subQuery = subQuery.eq("category_id", categoryId);
+
+        const { data: subMatches, error: subErr } = await subQuery;
         if (subErr) return res.status(500).json({ success: false, message: subErr.message });
 
         if (subMatches?.length) {
@@ -531,8 +568,11 @@ export async function searchProductsMergedV2(req, res) {
         }
     }
 
-    // Tier 3 — products under a matching category.
-    if (tiered.length < fetchCap) {
+    // Tier 3 — products under a matching CATEGORY name. Skipped entirely
+    // when a category is already selected: the user has explicitly picked
+    // one, so widening to a differently-named category would be surprising,
+    // not helpful.
+    if (!categoryId && tiered.length < fetchCap) {
         const { data: catMatches, error: catErr } = await supabase
             .from("hs_categories")
             .select("id, name")
@@ -543,19 +583,19 @@ export async function searchProductsMergedV2(req, res) {
 
         if (catMatches?.length) {
             const cat = catMatches[0];
-            const { data: subIdRows, error: subIdErr } = await supabase
+            const { data: subIdRows2, error: subIdErr2 } = await supabase
                 .from("hs_subcategories")
                 .select("id")
                 .eq("category_id", cat.id)
                 .eq("review_status", "approved");
-            if (subIdErr) return res.status(500).json({ success: false, message: subIdErr.message });
+            if (subIdErr2) return res.status(500).json({ success: false, message: subIdErr2.message });
 
-            const subcategoryIds = (subIdRows || []).map((s) => s.id);
-            if (subcategoryIds.length) {
+            const subcategoryIds2 = (subIdRows2 || []).map((s) => s.id);
+            if (subcategoryIds2.length) {
                 const { data: gpRows2, error: gpErr2 } = await supabase
                     .from("hs_generic_products")
                     .select("id")
-                    .in("subcategory_id", subcategoryIds)
+                    .in("subcategory_id", subcategoryIds2)
                     .eq("review_status", "approved");
                 if (gpErr2) return res.status(500).json({ success: false, message: gpErr2.message });
 
@@ -604,9 +644,6 @@ export async function searchProductsMergedV2(req, res) {
         }
     }
 
-    // Flatten the nested join into the same flat field names ProductRow
-    // already expects from the normal feed (category_name/subcategory_name),
-    // and drop the raw nested `generic_product` object from the response.
     const items = page.map((b) => {
         const l = lowestByBrand[b.id];
         const gp = b.generic_product;
@@ -614,7 +651,7 @@ export async function searchProductsMergedV2(req, res) {
         const cat = sc?.category;
         const { generic_product, ...rest } = b;
         return {
-            ...rest, // includes brand_image now that it's selected
+            ...rest,
             category_name: cat?.name ?? null,
             subcategory_name: sc?.name ?? null,
             lowest_price: l?.price ?? null,
