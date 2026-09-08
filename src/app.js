@@ -26,6 +26,7 @@ import cartRoutes from "./routes/cart.routes.js";
 import sellerWalletRoutes from "./routes/wallet.routes.js";
 import contactsRoutes from "./routes/contacts.routes.js";
 import transportRoutes from "./routes/transport.routes.js";
+import buyerBusinessProfileRoutes from "./routes/buyerBusinessProfile.routes.js";
 
 export function createApp() {
   const app = express();
@@ -87,6 +88,7 @@ export function createApp() {
   app.use("/api/whatsapp", whatsappRoutes);
   app.use("/api/orders", ordersRoutes);
   app.use("/api/buyer/addresses", buyerAddressRoutes);
+  app.use("/api/buyer/business-profile", buyerBusinessProfileRoutes);
   app.use("/api/catalog", catalogRoutes);
   app.use("/api/geo", geoRoutes);
   app.use("/api/contacts", contactsRoutes);
