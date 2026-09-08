@@ -15,6 +15,19 @@
 //      images, manufacturer, model/part no., grade/variant, specifications,
 //      description, manufacturing_details) — on the linked brand item
 //      (hs_generic_product_brands), shared across every seller listing it.
+//
+// PRODUCT-LEVEL AUTO-APPROVAL (this pass): approveSellerSubmission used to
+// only ever touch the ONE submission row it was called for. That's fine
+// the very first time a brand-new product gets approved — but if a second
+// seller had already submitted the same (still-unmapped) brand item before
+// admin got to it, their row sat pending forever, needing a second manual
+// approval for a product that's now already live. approveSellerSubmission
+// now also auto-approves any other still-pending submissions for the same
+// brand item in the same request, and notifies each of those sellers the
+// same way. Going forward, sellerCatalogListings.controller.js's
+// createSubmission / createListingForExistingBrand already skip the queue
+// entirely for an already-approved brand item, so this bulk step only ever
+// has anything to do at the moment a product is first approved.
 
 import { supabase } from "../config/supabase.js";
 import { notifyUser, notifySellerSubmissionsChanged, notifyAdminSubmissionsChanged } from "../services/notifications.service.js";
@@ -314,6 +327,45 @@ export async function updateSellerSubmission(req, res) {
     res.json({ success: true, submission: normalized, marketplace });
 }
 
+// Auto-approves every OTHER still-pending submission for the same brand
+// item (other sellers listing the same product) and notifies each seller,
+// once admin has just approved the "first" one for this brand item. Best-
+// effort: a failure here doesn't undo the approval that already succeeded
+// above, it just means those siblings stay pending for a manual approval
+// like before.
+async function autoApproveSiblingSubmissions({ brandItemId, excludeSubmissionId, adminId, brandDisplayName }) {
+    if (!brandItemId) return;
+
+    const { data: siblings, error: siblingsErr } = await supabase
+        .from("seller_product_submissions")
+        .select("id, product_name, seller:seller_profiles(user_id)")
+        .eq("generic_product_brand_id", brandItemId)
+        .eq("review_status", "pending_review")
+        .neq("id", excludeSubmissionId);
+    if (siblingsErr || !siblings?.length) return;
+
+    const now = new Date().toISOString();
+    const siblingIds = siblings.map((s) => s.id);
+    const { error: bulkErr } = await supabase
+        .from("seller_product_submissions")
+        .update({ review_status: "approved", reviewed_at: now, reviewed_by: adminId, rejection_reason: null })
+        .in("id", siblingIds);
+    if (bulkErr) return;
+
+    for (const s of siblings) {
+        const sellerId = s.seller?.user_id;
+        if (!sellerId) continue;
+        const displayName = s.product_name || brandDisplayName || "Your product";
+        await notifyUser(sellerId, {
+            type: "listing_approved",
+            title: "Your product listing was approved",
+            message: `"${displayName}" is now live on your shop.`,
+            link: `/home?highlight=${s.id}`,
+        });
+        await notifySellerSubmissionsChanged(sellerId);
+    }
+}
+
 // POST /api/admin/seller-submissions/:id/approve
 export async function approveSellerSubmission(req, res) {
     const { id } = req.params;
@@ -385,6 +437,18 @@ export async function approveSellerSubmission(req, res) {
         });
         await notifySellerSubmissionsChanged(existing.seller.user_id);
     }
+
+    // Product-level approval: any other seller already sitting in the
+    // queue for this exact brand item is approved right along with this
+    // one — nobody should need a second manual click for a product
+    // that's now live.
+    await autoApproveSiblingSubmissions({
+        brandItemId: existing.generic_product_brand_id,
+        excludeSubmissionId: id,
+        adminId: req.user.id,
+        brandDisplayName: existing.brand?.name,
+    });
+
     await notifyAdminSubmissionsChanged();
     res.json({ success: true, submission: normalizeSubmission(data) });
 }

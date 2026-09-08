@@ -34,8 +34,27 @@
 // load (fixed in SellerListingForm.jsx). No behavior changes here — the
 // check itself never converted anything — just the comment, corrected so
 // it can't mislead anyone again.
+//
+// PRODUCT-LEVEL AUTO-APPROVAL (this pass): approval used to be scoped to
+// each seller_product_submissions ROW — every seller selling the same
+// already-approved product still had to sit in the admin queue and get
+// individually approved, and every edit to an already-approved listing
+// bounced it back into "pending_review" for no reason (nothing about the
+// PRODUCT changed, just this seller's price/stock/etc.). Approval is now
+// effectively scoped to the brand item ("product"), not the row:
+//   - createSubmission / createListingForExistingBrand: if the resolved
+//     brand item is already approved, a brand-new submission for it goes
+//     straight to review_status "approved" — no admin notification, the
+//     seller is told it's live immediately instead.
+//   - updateSubmission: editing a submission that's already "approved"
+//     keeps it "approved" and saves the change directly — no bounce back
+//     to pending_review, no admin notification.
+// A submission that was explicitly REJECTED still goes back through
+// review on resubmit even if the brand item is approved — that rejection
+// was about this seller's specific listing (pricing, terms, etc.), not
+// the product itself, so it deserves a fresh look regardless.
 import { supabase } from "../config/supabase.js";
-import { notifyAdmins, notifyAdminSubmissionsChanged } from "../services/notifications.service.js";
+import { notifyAdmins, notifyAdminSubmissionsChanged, notifyUser, notifySellerSubmissionsChanged } from "../services/notifications.service.js";
 import { slugify } from "../services/slugify.js";
 import {
     getCommissionPercent, computeMarketplaceFigures,
@@ -80,6 +99,23 @@ async function autoSaveSellerDefaults(sellerId, body) {
     }
 }
 
+// Tells a seller their listing is live immediately, without waiting on
+// admin — the product-level counterpart of the "listing_approved"
+// notification admin's approveSellerSubmission fires manually. Same
+// notification type so the frontend doesn't need to special-case it, and
+// the same real-time channel (notifySellerSubmissionsChanged) used
+// everywhere else for live seller-side sync.
+async function notifySellerListingLive(sellerId, submissionId, displayName) {
+    if (!sellerId) return;
+    await notifyUser(sellerId, {
+        type: "listing_approved",
+        title: "Your product listing is live",
+        message: `"${displayName}" is an already-approved product on the marketplace, so your listing for it is live immediately.`,
+        link: `/home?highlight=${submissionId}`,
+    });
+    await notifySellerSubmissionsChanged(sellerId);
+}
+
 // pack_size and units_per_master_pack ADDED — see PERFORMANCE FIX note
 // above. This is the entire fix for the N+1 enrichment problem.
 const SUBMISSION_LIST_COLUMNS = `
@@ -102,11 +138,16 @@ const SUBMISSION_DETAIL_COLUMNS = `*, hs_generic_product_brands ( id, name, bran
 
 const BRAND_PACKAGING_COLS = "unit, pack_size, units_per_master_pack";
 
+// review_status ADDED to both queries below — this is what lets
+// createSubmission / createListingForExistingBrand tell whether the
+// product itself has already cleared admin review, which is now the
+// signal that decides whether a brand-new submission needs to sit in the
+// review queue at all.
 async function findExistingBrandItem({ productName, brandName, brandNotApplicable }) {
     const trimmedProduct = productName.trim();
     let query = supabase
         .from("hs_generic_product_brands")
-        .select(`id, name, brand_name, ${BRAND_PACKAGING_COLS}`)
+        .select(`id, name, brand_name, review_status, ${BRAND_PACKAGING_COLS}`)
         .ilike("name", trimmedProduct);
     query = brandNotApplicable ? query.is("brand_name", null) : query.ilike("brand_name", brandName.trim());
     const { data } = await query.maybeSingle();
@@ -142,7 +183,7 @@ async function createBrandItem({ productName, brandName, brandImage, brandNotApp
     const { data: created, error } = await supabase
         .from("hs_generic_product_brands")
         .insert(insertRow)
-        .select(`id, name, brand_name, ${BRAND_PACKAGING_COLS}`)
+        .select(`id, name, brand_name, review_status, ${BRAND_PACKAGING_COLS}`)
         .single();
 
     if (!error) return created;
@@ -310,7 +351,6 @@ export async function createSubmission(req, res) {
         return res.status(500).json({ success: false, message: err.message });
     }
 
-    const isNewBrand = !brand.pack_size && !brand.unit ? false : true; // brand always has packaging by this point
     const { data: existingRow } = await supabase
         .from("seller_product_submissions")
         .select("id, review_status")
@@ -320,6 +360,17 @@ export async function createSubmission(req, res) {
         return res.status(409).json({ success: false, message: "You're already listing this item." });
     }
 
+    // A brand item that's ALREADY approved means the product itself has
+    // already cleared the admin's mapping/approval step (via some seller's
+    // earlier submission). Another seller selling that same already-
+    // approved product doesn't need a second manual approval — only a
+    // brand-new/still-pending product does. existingRow, when present here,
+    // is always "rejected" (the conflict check above already ruled out any
+    // other status) — that resubmission still goes through review even if
+    // the brand is approved, since admin flagged something about THIS
+    // seller's specific listing.
+    const autoApprove = brand.review_status === "approved" && !existingRow;
+
     const row = toListingRow(body, brand);
     const [returnText, warrantyText] = await Promise.all([
         resolvePolicyText("return_policy", body.returnPolicyKey),
@@ -328,16 +379,20 @@ export async function createSubmission(req, res) {
     row.return_policy = returnText;
     row.warranty = warrantyText;
 
+    const statusPatch = autoApprove
+        ? { review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: null, rejection_reason: null }
+        : { review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null };
+
     let inserted, error;
     if (existingRow) {
         ({ data: inserted, error } = await supabase
             .from("seller_product_submissions")
-            .update({ ...row, review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null })
+            .update({ ...row, ...statusPatch })
             .eq("id", existingRow.id).select("id, created_at, price").single());
     } else {
         ({ data: inserted, error } = await supabase
             .from("seller_product_submissions")
-            .insert({ seller_id: sellerId, generic_product_brand_id: brand.id, ...row })
+            .insert({ seller_id: sellerId, generic_product_brand_id: brand.id, ...row, ...statusPatch })
             .select("id, created_at, price").single());
     }
     if (error) {
@@ -346,37 +401,35 @@ export async function createSubmission(req, res) {
     }
 
     await autoSaveSellerDefaults(sellerId, body);
-    await notifyAdmins({
-        type: "seller_submission",
-        title: existingRow ? "Listing resubmitted for review" : "New listing submitted",
-        message: `${brand.brand_name || "(No brand)"} — ${brand.name} ${existingRow ? "was resubmitted after rejection" : "is a brand-new product — map it to a category before approving"}.`,
-        link: `/admin/listings?highlight=${inserted.id}`,
-    });
-    await notifyAdminSubmissionsChanged();
+
+    if (autoApprove) {
+        // Product already approved — nothing here needs admin's attention.
+        await notifySellerListingLive(sellerId, inserted.id, brand.name);
+    } else {
+        await notifyAdmins({
+            type: "seller_submission",
+            title: existingRow ? "Listing resubmitted for review" : "New listing submitted",
+            message: `${brand.brand_name || "(No brand)"} — ${brand.name} ${existingRow ? "was resubmitted after rejection" : "is a brand-new product — map it to a category before approving"}.`,
+            link: `/admin/listings?highlight=${inserted.id}`,
+        });
+        await notifyAdminSubmissionsChanged();
+    }
 
     const marketplace = await computeMarketplaceFigures(inserted.price);
-    res.json({ success: true, submission: inserted, marketplace, message: "Submitted for review. We'll notify you once it's approved." });
+    res.json({
+        success: true,
+        submission: inserted,
+        marketplace,
+        message: autoApprove
+            ? "You're now listing this product — it's live immediately."
+            : "Submitted for review. We'll notify you once it's approved.",
+    });
 }
 
-async function autoSaveDeliveryDefaults(sellerId, body) {
-    const keys = GROUP_FIELD_MAP.delivery;
-    const data = Object.fromEntries(keys.map((k) => [k, body[k]]));
-    const hasValue = Object.values(data).some((v) => v !== "" && v != null && !(Array.isArray(v) && v.length === 0));
-    if (!hasValue) return;
-    try {
-        const { data: existingTpl } = await supabase
-            .from("seller_listing_templates")
-            .select("id").eq("seller_id", sellerId).eq("group_type", "delivery").eq("is_default", true)
-            .maybeSingle();
-        if (existingTpl) {
-            await supabase.from("seller_listing_templates").update({ data }).eq("id", existingTpl.id);
-        } else {
-            await supabase.from("seller_listing_templates").insert({ seller_id: sellerId, group_type: "delivery", name: "Default", data, is_default: true });
-        }
-    } catch { /* best-effort */ }
-}
-
-/* ------------------------- brand resolution ------------------------- */
+/* ------------------------- brand resolution (legacy helper, unused) ------------------------- */
+// Not called anywhere in this file (or exported) — findExistingBrandItem
+// + createBrandItem replaced it. Left in place untouched since it's out
+// of scope for this change and nothing depends on it.
 
 async function resolveOrCreateBrandItem({ productName, brandName, brandImage, brandNotApplicable, images }) {
     const trimmedProduct = productName.trim();
@@ -494,6 +547,14 @@ export async function createListingForExistingBrand(req, res) {
         return res.status(409).json({ success: false, message: "You're already listing this item." });
     }
 
+    // effectiveBrand.review_status is guaranteed "approved" at this point
+    // (checked above, and the packaging backfill doesn't touch it) — this
+    // endpoint only ever lists an already-approved product, so a brand-new
+    // submission through here always goes live immediately. A rejected
+    // existingRow still goes back through review on resubmit — same
+    // reasoning as createSubmission above.
+    const autoApprove = !existingRow;
+
     const row = toListingRow(merged, effectiveBrand);   // ← was `brand`, now `effectiveBrand`
     const [returnText, warrantyText] = await Promise.all([
         resolvePolicyText("return_policy", body.returnPolicyKey),
@@ -502,14 +563,18 @@ export async function createListingForExistingBrand(req, res) {
     row.return_policy = returnText;
     row.warranty = warrantyText;
 
+    const statusPatch = autoApprove
+        ? { review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: null, rejection_reason: null }
+        : { review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null };
+
     let result, error;
     if (existingRow) {
         ({ data: result, error } = await supabase.from("seller_product_submissions")
-            .update({ ...row, review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null })
+            .update({ ...row, ...statusPatch })
             .eq("id", existingRow.id).select("id, created_at, price").single());
     } else {
         ({ data: result, error } = await supabase.from("seller_product_submissions")
-            .insert({ seller_id: sellerId, generic_product_brand_id: effectiveBrand.id, ...row })
+            .insert({ seller_id: sellerId, generic_product_brand_id: effectiveBrand.id, ...row, ...statusPatch })
             .select("id, created_at, price").single());
     }
     if (error) {
@@ -518,16 +583,28 @@ export async function createListingForExistingBrand(req, res) {
     }
 
     await autoSaveSellerDefaults(sellerId, body);
-    await notifyAdmins({
-        type: "seller_submission",
-        title: existingRow ? "Listing resubmitted for review" : "New listing submitted",
-        message: existingRow ? `A seller resubmitted "${effectiveBrand.name}" after rejection.` : `A seller wants to list "${effectiveBrand.name}".`,
-        link: `/admin/listings?highlight=${result.id}`,
-    });
-    await notifyAdminSubmissionsChanged();
+
+    if (autoApprove) {
+        await notifySellerListingLive(sellerId, result.id, effectiveBrand.name);
+    } else {
+        await notifyAdmins({
+            type: "seller_submission",
+            title: "Listing resubmitted for review",
+            message: `A seller resubmitted "${effectiveBrand.name}" after rejection.`,
+            link: `/admin/listings?highlight=${result.id}`,
+        });
+        await notifyAdminSubmissionsChanged();
+    }
 
     const marketplace = await computeMarketplaceFigures(result.price);
-    res.json({ success: true, submission: result, marketplace, message: `You're now listing "${effectiveBrand.name}"${existingRow ? " again" : ""}. We'll notify you once it's approved.` });
+    res.json({
+        success: true,
+        submission: result,
+        marketplace,
+        message: autoApprove
+            ? `You're now listing "${effectiveBrand.name}" — it's live immediately.`
+            : `You're now listing "${effectiveBrand.name}" again. We'll notify you once it's approved.`,
+    });
 }
 
 /* ------------------------- list / detail / update / active ------------------------- */
@@ -659,24 +736,46 @@ export async function updateSubmission(req, res) {
     row.return_policy = returnText;
     row.warranty = warrantyText;
 
+    // A listing that's already "approved" is the seller keeping their own
+    // live listing up to date — nothing about the underlying PRODUCT
+    // changed, so this should never bounce back into the admin review
+    // queue. Only a listing still "pending_review", or "rejected" (admin
+    // flagged something about it specifically), goes through review again
+    // on edit — same as before this change.
+    const staysApproved = existing.review_status === "approved";
+    const statusPatch = staysApproved
+        ? {}
+        : { review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null };
+
     const { data: updated, error } = await supabase
         .from("seller_product_submissions")
-        .update({ ...row, review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null })
+        .update({ ...row, ...statusPatch })
         .eq("id", id).eq("seller_id", sellerId)
         .select("id, created_at, price").single();
     if (error) return res.status(500).json({ success: false, message: error.message });
 
     await autoSaveSellerDefaults(sellerId, body);
-    await notifyAdmins({
-        type: "seller_submission",
-        title: "Listing edited and resubmitted for review",
-        message: `${existing.brand_name || "(No brand)"} — ${existing.product_name} was edited and needs review.`,
-        link: `/admin/listings?highlight=${updated.id}`,
-    });
-    await notifyAdminSubmissionsChanged();
+
+    if (!staysApproved) {
+        await notifyAdmins({
+            type: "seller_submission",
+            title: "Listing edited and resubmitted for review",
+            message: `${existing.brand_name || "(No brand)"} — ${existing.product_name} was edited and needs review.`,
+            link: `/admin/listings?highlight=${updated.id}`,
+        });
+        await notifyAdminSubmissionsChanged();
+    }
+    // staysApproved: nothing to notify admin about — the change is already
+    // saved and live, and the response below carries it straight back to
+    // the seller's own account.
 
     const marketplace = await computeMarketplaceFigures(updated.price);
-    res.json({ success: true, submission: updated, marketplace, message: "Changes submitted for review." });
+    res.json({
+        success: true,
+        submission: updated,
+        marketplace,
+        message: staysApproved ? "Changes saved — your listing is still live." : "Changes submitted for review.",
+    });
 }
 
 export async function setSubmissionActive(req, res) {
@@ -713,4 +812,4 @@ export async function deleteSubmission(req, res) {
 
     await notifyAdminSubmissionsChanged();
     res.json({ success: true, message: "Listing deleted." });
-}
+}   
