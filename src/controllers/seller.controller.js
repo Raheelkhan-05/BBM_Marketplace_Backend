@@ -273,8 +273,18 @@ export async function submitSellerOnboarding(req, res) {
     }
   }
 
-  const { data: bank } = await supabase.from("seller_bank_details").select("id").eq("seller_id", existingSeller?.id).maybeSingle();
+  const { data: bank, error: bankErr } = await supabase
+    .from("seller_bank_details")
+    .select("id")
+    .eq("seller_id", existingSeller?.id)
+    .maybeSingle();
+
+  if (bankErr) {
+    console.error("submitSellerOnboarding: bank lookup failed", bankErr, { sellerId: existingSeller?.id });
+    return res.status(500).json({ success: false, message: "Couldn't verify your bank details. Please try again." });
+  }
   if (!bank) {
+    console.warn("submitSellerOnboarding: no bank row found", { sellerId: existingSeller?.id });
     return res.status(400).json({ success: false, message: "Please add your bank details before submitting.", missing: ["bank details"] });
   }
 
