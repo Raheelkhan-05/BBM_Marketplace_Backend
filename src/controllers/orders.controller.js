@@ -1,34 +1,9 @@
-// controllers/orders.controller.js — PATCH: de-duplicate notifications +
-// simplified distance-based delivery estimate + buyer-seller transport
-// preference snapshotting.
-//
-// De-dup notification fix (unchanged from before): place_order and
-// update_order_status both INSERT into `notifications` directly as their
-// last step. The controller no longer calls notifyUser(...) after those
-// RPCs for events the RPC already covers. notifyOrderChanged /
-// notifyUserOrdersChanged are UNCHANGED and kept — those are realtime
-// channel broadcasts (no `notifications` row), not duplicates.
-//
-// Delivery estimate is a simple distance / speed model: fetch the road
-// distance (km) between the seller's dispatch pincode and the buyer's
-// pincode, assume a flat transport speed of 15 km/h, and convert that to
-// a day range (floor/ceil of the raw day count). When we have no
-// road-distance data for a pincode pair, we fall back to a rough km guess
-// from a zone heuristic, then run THAT through the same distance -> days
-// formula, so there's only one place day counts are ever computed from.
-//
-// NEW: placeOrder now accepts transportMode/transportCompany/transportDetails
-// from the client (BuyNowModal reads the buyer-seller pair's confirmed
-// transport preference, if any, and forwards it here) and passes them
-// through to the place_order RPC, which snapshots them onto the order row
-// atomically along with everything else. See place_order's p_transport_*
-// params and the transport_mode/transport_company/transport_details/
-// transport_source columns on `orders`.
+// controllers/orders.controller.js
 import { supabase } from "../config/supabase.js";
 import { notifyUser, notifyOrderChanged, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
 
 import { getRoadDistanceKm } from "../services/pincodeDistance.js";
-import { purchaseQtyToSaleUnitQty, saleUnitQtyToBaseUnits, getSaleUnit, round2 } from "../../shared/packUnits.js";
+import { purchaseQtyToSaleUnitQty, saleUnitQtyToBaseUnits, getSaleUnit, saleUnitLabel, round2 } from "../../shared/packUnits.js";
 
 
 const ERROR_MAP = {
@@ -38,6 +13,7 @@ const ERROR_MAP = {
     BELOW_MOQ: { status: 400, message: "Quantity is below the seller's minimum order quantity." },
     SAMPLE_NOT_AVAILABLE: { status: 400, message: "This seller doesn't offer a sample for this item." },
     EXCEEDS_SAMPLE_QUANTITY: { status: 400, message: "Requested quantity exceeds the sample limit for this item." },
+    EXCEEDS_AVAILABLE_STOCK: { status: 400, message: "That quantity isn't available from this seller." },
     CREDIT_NOT_APPROVED: { status: 403, message: "You don't have approved credit with this seller." },
     BUYER_NOT_FOUND: { status: 401, message: "Please sign in again." },
     BUYER_NOT_VERIFIED: { status: 403, message: "Please verify your email or phone before placing an order." },
@@ -170,6 +146,17 @@ function resolveDiscountPercent(quantityDiscounts, quantity) {
     return { percent: Number(applicable[0].discountPercent) || 0, tier: applicable[0] };
 }
 
+// Shared stock-limit check — used by both the quote endpoint (to warn/
+// disable in the UI) and placeOrder (to actually block the order).
+// Returns { exceedsStock, availableStock } — exceedsStock is only ever
+// true for ready_stock listings with a known stock_quantity; made_to_order
+// listings and listings with no stock cap set have nothing to exceed.
+function checkStockLimit(submission, saleQty) {
+    const availableStock = submission.stock_type === "ready_stock" ? submission.stock_quantity : null;
+    const exceedsStock = availableStock != null && saleQty > Number(availableStock);
+    return { exceedsStock, availableStock };
+}
+
 // GET /api/orders/checkout-status
 export async function checkoutStatus(req, res) {
     if (!req.user) return res.json({ success: true, canCheckout: false, reason: "NOT_AUTHENTICATED" });
@@ -260,10 +247,11 @@ export async function getOrderQuote(req, res) {
     const subtotal = round2(unitPrice * saleQty);
     const platformFee = round2(subtotal * commissionPercent / 100);
 
-    const stockShortfall = submission.stock_type === "ready_stock"
-        && submission.stock_quantity != null
-        && saleQty > Number(submission.stock_quantity);
-
+    // Stock is now a hard cap, not just a warning: exceedsStock means the
+    // buyer literally cannot place this order at this quantity. The
+    // frontend uses this (together with availableStock) to disable the
+    // submit buttons and show "Only N available" — see BuyNowModal.
+    const { exceedsStock, availableStock } = checkStockLimit(submission, saleQty);
     const outOfStock = submission.stock_type === "ready_stock"
         && submission.stock_quantity != null
         && Number(submission.stock_quantity) <= 0;
@@ -274,13 +262,14 @@ export async function getOrderQuote(req, res) {
         unitPrice, basePriceApplied: slabPrice, appliedSlab, discountPercent, discountTier,
         unit: submission.unit, moq: submission.moq,
         saleUnit: getSaleUnit(submission.units_per_master_pack),
+        saleUnitLabel: saleUnitLabel(submission.units_per_master_pack),
         purchaseBasis, quantity: qty, saleUnitQuantity: saleQty,
         estimatedDeliveryDate: delivery.label, leadDays: delivery.leadDays,
         transitDaysMin: delivery.transitDaysMin, transitDaysMax: delivery.transitDaysMax,
-        availableStock: submission.stock_quantity, subtotal,
+        availableStock, subtotal,
         platformFeePercent: commissionPercent, platformFeeAmount: platformFee, sellerPayoutAmount: subtotal - platformFee,
         meetsMoq: saleQty >= Number(submission.moq),
-        stockShortfall,
+        exceedsStock,
         outOfStock,
     });
 }
@@ -312,12 +301,27 @@ export async function placeOrder(req, res) {
     if (safeOrderType !== "sample") {
         const { data: submission } = await supabase
             .from("seller_product_submissions")
-            .select("stock_type, stock_quantity")
+            .select("stock_type, stock_quantity, pack_size, units_per_master_pack")
             .eq("id", submissionId)
             .maybeSingle();
 
-        if (submission?.stock_type === "ready_stock" && Number(submission.stock_quantity) <= 0) {
-            return res.status(400).json({ success: false, code: "OUT_OF_STOCK", message: "This item is currently out of stock." });
+        if (submission) {
+            if (submission.stock_type === "ready_stock" && Number(submission.stock_quantity) <= 0) {
+                return res.status(400).json({ success: false, code: "OUT_OF_STOCK", message: "This item is currently out of stock." });
+            }
+
+            // Hard cap: the buyer can order at most what this seller has in
+            // stock. This used to only set a "stockShortfall" flag and let
+            // the order through anyway — now it blocks, same as MOQ.
+            const saleQty = purchaseQtyToSaleUnitQty(qty, purchaseBasis, submission.pack_size, submission.units_per_master_pack);
+            const { exceedsStock, availableStock } = checkStockLimit(submission, saleQty);
+            if (exceedsStock) {
+                const label = saleUnitLabel(submission.units_per_master_pack);
+                return res.status(400).json({
+                    success: false, code: "EXCEEDS_AVAILABLE_STOCK",
+                    message: `You can order at most ${availableStock} ${label}${Number(availableStock) === 1 ? "" : "s"} from this seller.`,
+                });
+            }
         }
     }
 
