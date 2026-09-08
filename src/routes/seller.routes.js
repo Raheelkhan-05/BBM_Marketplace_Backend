@@ -1,7 +1,7 @@
 import { Router } from "express";
 import multer from "multer";
-import { requireAuth } from "../middleware/auth.middleware.js";
-import { authWriteLimiter, anonUploadLimiter } from "../middleware/rateLimiter.js";
+import { requireAuth, optionalAuth } from "../middleware/auth.middleware.js";
+import { authWriteLimiter, anonUploadLimiter, } from "../middleware/rateLimiter.js";
 import {
   getSellerOnboarding,
   saveSellerOnboarding,
@@ -30,7 +30,8 @@ router.get("/onboarding", requireAuth, getSellerOnboarding);
 router.post("/onboarding/save", requireAuth, authWriteLimiter, saveSellerOnboarding);
 router.post("/onboarding/submit", requireAuth, authWriteLimiter, submitSellerOnboarding);
 // router.post("/upload", requireAuth, authWriteLimiter, upload.single("file"), uploadSellerFile);
-router.post("/upload", anonUploadLimiter, upload.single("file"), uploadSellerFile);
+
+router.post("/upload", optionalAuth, anonUploadLimiter, upload.single("file"), uploadSellerFile);
 router.post(
   "/onboarding/anonymous-upload",
   anonUploadLimiter,
