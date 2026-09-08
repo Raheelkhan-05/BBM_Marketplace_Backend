@@ -118,7 +118,7 @@ export async function deleteRow(req, res) {
     const { pk = "id", cascade } = req.query;
 
     if (cascade === "true") {
-        const { data, error } = await supabase.rpc("admin_cascade_delete", {
+        const { data, error } = await supabase.rpc("admin_smart_delete", {   // was admin_cascade_delete
             p_table: table, p_pk_column: pk, p_pk_value: String(id),
         });
         if (error) return res.status(500).json({ success: false, message: error.message });

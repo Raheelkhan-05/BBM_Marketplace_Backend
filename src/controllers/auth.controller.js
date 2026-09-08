@@ -23,11 +23,13 @@ export async function getMe(req, res) {
     .from("profiles")
     .select("id, phone, phone_verified, email, email_verified, name, onboarding_step, created_at, role")
     .eq("id", req.user.id)
+    .is("deleted_at", null)   // <-- added: a soft-deleted profile no longer resolves here
     .maybeSingle();
 
   if (error || !profile) {
     return res.status(401).json({ success: false, message: "Session out of date — please log in again." });
   }
+
 
   // These two queries are independent of each other and of the profile
   // row above — run them concurrently instead of one after another.
@@ -47,12 +49,17 @@ export async function getMe(req, res) {
 }
 
 // POST /api/auth/gst-lookup  { gstin }
+// auth.controller.js — lookupGstin
 export async function lookupGstin(req, res) {
   const check = validateGSTIN(req.body?.gstin);
   if (!check.valid) return res.status(400).json({ success: false, message: check.reason });
 
   const { data: existing } = await supabaseAdmin
-    .from("business_profiles").select("user_id").eq("gstin", check.gstin).maybeSingle();
+    .from("business_profiles")
+    .select("user_id, profiles!inner(deleted_at)")
+    .eq("gstin", check.gstin)
+    .is("profiles.deleted_at", null)   // <-- only counts as "taken" if the owning profile is still active
+    .maybeSingle();
   if (existing && existing.user_id !== req.user.id) {
     return res.status(409).json({ success: false, message: "This GSTIN is already registered to another account." });
   }
@@ -84,7 +91,11 @@ export async function completeProfile(req, res) {
   }
 
   const { data: existing } = await supabaseAdmin
-    .from("business_profiles").select("user_id").eq("gstin", gstCheck.gstin).maybeSingle();
+    .from("business_profiles")
+    .select("user_id, profiles!inner(deleted_at)")
+    .eq("gstin", gstCheck.gstin)
+    .is("profiles.deleted_at", null)
+    .maybeSingle();
   if (existing && existing.user_id !== req.user.id) {
     return res.status(409).json({ success: false, message: "This GSTIN is already registered to another account." });
   }

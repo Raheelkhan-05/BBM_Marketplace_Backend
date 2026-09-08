@@ -382,19 +382,81 @@ export async function updateSellerTheme(req, res) {
 }
 
 // ---------- Uploads ----------
+// controllers/seller.controller.js
 
 export async function uploadSellerFile(req, res) {
-  const userId = req.user.id;
   const { folder = "misc", bucket = "seller-assets" } = req.body;
   const file = req.file;
   if (!file) return res.status(400).json({ success: false, message: "No file provided." });
 
+  // Logged-in sellers upload under their own userId, exactly as before.
+  // A not-yet-logged-in visitor filling the form uploads under a random
+  // client-generated id instead — same bucket, same public URL shape,
+  // just no real account behind the folder yet. Once they do sign up and
+  // submit for real, the URL is already sitting in the form draft as-is,
+  // nothing needs to be moved.
+  const ownerId = req.user?.id || req.body.anonId;
+  if (!ownerId || !/^[a-zA-Z0-9_-]{6,64}$/.test(ownerId)) {
+    return res.status(400).json({ success: false, message: "Missing or invalid uploader id." });
+  }
+  const prefix = req.user?.id ? ownerId : `anon-${ownerId}`;
+
   const ext = (file.originalname.split(".").pop() || "bin").toLowerCase();
-  const path = `${userId}/${folder}/${Date.now()}.${ext}`;
+  const path = `${prefix}/${folder}/${Date.now()}.${ext}`;
   const { error } = await supabase.storage.from(bucket).upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
   if (error) return res.status(500).json({ success: false, message: error.message });
 
   const { data } = supabase.storage.from(bucket).getPublicUrl(path);
+  res.json({ success: true, url: data.publicUrl, path });
+}
+
+// controllers/seller.controller.js
+
+// POST /api/seller/onboarding/anonymous-upload  (no auth)
+// Body: multipart form with `file`, plus `draftId` and `folder` fields.
+export async function uploadAnonymousSellerFile(req, res) {
+  const { draftId, folder = "misc" } = req.body || {};
+  const file = req.file;
+
+  if (!file) return res.status(400).json({ success: false, message: "No file provided." });
+  if (!/^[a-f0-9-]{36}$/i.test(draftId || "")) {
+    return res.status(400).json({ success: false, message: "Invalid draft id." });
+  }
+
+  const ALLOWED = ["image/jpeg", "image/png", "image/webp", "application/pdf"];
+  if (!ALLOWED.includes(file.mimetype)) {
+    return res.status(400).json({ success: false, message: "Unsupported file type." });
+  }
+
+  // Cap how much any one draft can accumulate before it's ever claimed by
+  // a real account — stops a single anonymous visitor from farming
+  // unlimited free storage under one draftId.
+  const { count } = await supabase
+    .from("seller_onboarding_drafts_uploads")
+    .select("id", { count: "exact", head: true })
+    .eq("draft_id", draftId);
+  if ((count || 0) >= 20) {
+    return res.status(429).json({ success: false, message: "Too many files for this session." });
+  }
+
+  const ext = (file.originalname.split(".").pop() || "bin").toLowerCase();
+  const path = `anon/${draftId}/${folder}/${Date.now()}.${ext}`;
+
+  const { error } = await supabase.storage
+    .from("seller-assets-temp") // separate bucket, see note below
+    .upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
+  if (error) return res.status(500).json({ success: false, message: error.message });
+
+  const { data } = supabase.storage.from("seller-assets-temp").getPublicUrl(path);
+
+  // Track it so we can (a) enforce the cap above and (b) sweep it up if
+  // it's never claimed.
+  await supabase.from("seller_onboarding_drafts_uploads").insert({
+    draft_id: draftId,
+    path,
+    created_at: new Date().toISOString(),
+  });
+
   res.json({ success: true, url: data.publicUrl, path });
 }
 

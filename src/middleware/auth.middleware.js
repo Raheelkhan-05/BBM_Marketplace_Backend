@@ -1,22 +1,18 @@
 // src/middleware/auth.middleware.js
 import jwt from "jsonwebtoken";
+import { supabaseAdmin } from "../config/supabase.js";
 
 const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET;
 
-// Single source of truth for turning a raw token string into a user
-// object. Both requireAuth (HTTP) and the Socket.IO handshake call this
-// — one secret, one payload shape, defined once.
 export function verifyAuthToken(token) {
   if (!token || token === "undefined" || token === "null") {
     throw new Error("No token provided");
   }
   if (!AUTH_JWT_SECRET) {
-    // fail loud at startup-adjacent time rather than quietly minting
-    // sessions nobody can verify
     throw new Error("AUTH_JWT_SECRET is not set");
   }
-  const payload = jwt.verify(token, AUTH_JWT_SECRET); // throws if invalid/expired
-  return { id: payload.sub }; // normalize once, here — everything downstream just reads .id
+  const payload = jwt.verify(token, AUTH_JWT_SECRET);
+  return { id: payload.sub };
 }
 
 export async function requireAuth(req, res, next) {
@@ -25,6 +21,22 @@ export async function requireAuth(req, res, next) {
 
   try {
     const user = verifyAuthToken(token);
+
+    // JWT signature/expiry alone doesn't reflect account status — a
+    // soft-deleted profile's token stays valid until it expires. This
+    // check ensures a deleted account is locked out of every protected
+    // route immediately, not just /auth/me.
+    const { data: profile } = await supabaseAdmin
+      .from("profiles")
+      .select("id")
+      .eq("id", user.id)
+      .is("deleted_at", null)
+      .maybeSingle();
+
+    if (!profile) {
+      return res.status(401).json({ success: false, message: "Invalid or expired session." });
+    }
+
     req.user = user;
     req.token = token;
     return next();

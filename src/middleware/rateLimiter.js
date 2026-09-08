@@ -22,3 +22,12 @@ export const otpLimiter = rateLimit({
   legacyHeaders: false,
   message: { success: false, message: "Too many requests. Please try again shortly." },
 });
+
+// middleware/rateLimiter.js — add this alongside the others
+export const anonUploadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 30, // per IP — generous for one real onboarding session, tight for abuse
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many uploads. Please try again later." },
+});

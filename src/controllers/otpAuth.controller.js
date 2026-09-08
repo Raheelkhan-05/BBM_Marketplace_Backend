@@ -16,15 +16,12 @@ async function findOrCreateProfile(channel, value) {
   const { data: profile } = await supabaseAdmin
     .from("profiles").select("*")
     .or(`phone.eq.${value},email.eq.${value}`)
+    .is("deleted_at", null)   // <-- added: a soft-deleted profile is never "found" — treat as a brand new signup
     .maybeSingle();
 
   if (profile) {
     const column = channel === "phone" ? "phone" : "email";
     const verifiedColumn = channel === "phone" ? "phone_verified" : "email_verified";
-    // Backfill this channel if the existing profile didn't have it yet
-    // (e.g. they verified phone last time, now they're logging in by email
-    // that was never actually attached — shouldn't normally happen since
-    // findOrCreate matched on it, but keeps state consistent either way).
     if (!profile[column]) {
       await supabaseAdmin.from("profiles").update({ [column]: value, [verifiedColumn]: true }).eq("id", profile.id);
       profile[column] = value;
@@ -37,8 +34,11 @@ async function findOrCreateProfile(channel, value) {
   const { data: created, error } = await supabaseAdmin.from("profiles").insert(insertPatch).select("*").single();
   if (error) {
     if (error.code === "23505") {
+      // Same race, same fix: only re-fetch if an ACTIVE profile now exists
+      // with this value (another concurrent signup) — a deleted one racing
+      // in should never be returned here either.
       const { data: existing } = await supabaseAdmin.from("profiles").select("*")
-        .or(`phone.eq.${value},email.eq.${value}`).maybeSingle();
+        .or(`phone.eq.${value},email.eq.${value}`).is("deleted_at", null).maybeSingle();
       if (existing) return { profile: existing, isNewUser: existing.onboarding_step !== "done" };
     }
     throw error;
