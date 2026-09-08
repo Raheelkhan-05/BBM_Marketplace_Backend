@@ -120,7 +120,7 @@ export async function saveSellerOnboarding(req, res) {
 
   const { data: existingSeller } = await supabase
     .from("seller_profiles")
-    .select("id, status, pending_changes")
+    .select("id, status, pending_changes, rejected_by_admin")
     .eq("user_id", userId)
     .maybeSingle();
 
@@ -137,6 +137,20 @@ export async function saveSellerOnboarding(req, res) {
     if (!Object.keys(gatedUpdate).length) {
       return res.json({ success: true, seller: existingSeller, staged: false });
     }
+
+    // Trusted seller (never flagged by admin) — apply straight through,
+    // same as updateSellerProfile.
+    if (!existingSeller.rejected_by_admin) {
+      const { data, error } = await supabase
+        .from("seller_profiles")
+        .update(gatedUpdate)
+        .eq("id", existingSeller.id)
+        .select().single();
+      if (error) return res.status(500).json({ success: false, message: error.message });
+      return res.json({ success: true, seller: data, staged: false });
+    }
+
+    // Flagged seller — stage for review as before.
     const merged = { ...(existingSeller.pending_changes || {}), ...gatedUpdate };
     const { data, error } = await supabase
       .from("seller_profiles")
@@ -173,7 +187,7 @@ export async function submitSellerOnboarding(req, res) {
 
   const { data: existingSeller } = await supabase
     .from("seller_profiles")
-    .select("id, status, pending_changes, display_name")
+    .select("id, status, pending_changes, display_name, rejected_by_admin")
     .eq("user_id", userId)
     .maybeSingle();
 
@@ -184,6 +198,19 @@ export async function submitSellerOnboarding(req, res) {
   if (existingSeller?.status === "approved") {
     const gatedUpdate = {};
     for (const key of GATED_FIELDS) if (body[key] !== undefined) gatedUpdate[key] = body[key];
+
+    // Trusted seller — apply straight through, no admin notification.
+    if (!existingSeller.rejected_by_admin) {
+      const { data, error } = await supabase
+        .from("seller_profiles")
+        .update(gatedUpdate)
+        .eq("id", existingSeller.id)
+        .select().single();
+      if (error) return res.status(500).json({ success: false, message: error.message });
+      return res.json({ success: true, seller: data, staged: false });
+    }
+
+    // Flagged seller — stage for review and notify admin, as before.
     const merged = { ...(existingSeller.pending_changes || {}), ...gatedUpdate };
     const { data, error } = await supabase
       .from("seller_profiles")
@@ -228,19 +255,28 @@ export async function submitSellerOnboarding(req, res) {
 
   const { data, error } = await supabase
     .from("seller_profiles")
-    .upsert({ user_id: userId, business_profile_id: business?.id ?? null, ...update, shop_slug: shopSlug, status: "pending_review", submitted_at: new Date().toISOString() }, { onConflict: "user_id" })
+    .upsert(
+      {
+        user_id: userId,
+        business_profile_id: business?.id ?? null,
+        ...update,
+        shop_slug: shopSlug,
+        // Auto-approved on submit — no admin review needed to start
+        // selling. Admin can still flip status back (e.g. "rejected" or
+        // a "suspended"-style value, whatever your admin tooling uses)
+        // from the backend at any time if a shop needs to be pulled.
+        status: "approved",
+        submitted_at: new Date().toISOString(),
+        reviewed_at: new Date().toISOString(),
+      },
+      { onConflict: "user_id" }
+    )
     .select().single();
 
   if (error) return res.status(500).json({ success: false, message: error.message });
 
-  notifyAdmins({
-    type: "seller_submitted",
-    title: "New seller application",
-    body: `${data.display_name} submitted their shop for review.`,
-    link: `/admin/sellers/${data.id}`,
-    emailSubject: `New seller application: ${data.display_name}`,
-    emailHtml: `<p>A new seller application was submitted.</p><p><strong>${data.display_name}</strong> (${data.business_type || "—"}, ${data.city || "—"})</p><p><a href="${process.env.APP_BASE_URL}/admin/sellers/${data.id}">Review application</a></p>`,
-  }).catch((e) => console.error("[submitSellerOnboarding] notify admins failed", e));
+  // Intentionally no notifyAdmins(...) call here anymore — sellers go
+  // live immediately, so there's nothing for admin to review at this step.
 
   res.json({ success: true, seller: data });
 }
@@ -302,25 +338,33 @@ export async function updateSellerProfile(req, res) {
     return res.json({ success: true, seller: data, staged: false });
   }
 
-  // Already live: stage the edit
-  const merged = { ...(seller.pending_changes || {}), ...gatedUpdate };
-  const { data, error } = await supabase
-    .from("seller_profiles")
-    .update({ pending_changes: merged, has_pending_changes: true })
-    .eq("id", seller.id)
-    .select().single();
+  // Live shop: edits apply immediately UNLESS admin has manually rejected
+  // this seller before — that's the one signal that this seller's edits
+  // need a human look before going out, instead of every edit needing one.
+  if (seller.rejected_by_admin) {
+    const merged = { ...(seller.pending_changes || {}), ...gatedUpdate };
+    const { data, error } = await supabase
+      .from("seller_profiles")
+      .update({ pending_changes: merged, has_pending_changes: true })
+      .eq("id", seller.id)
+      .select().single();
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    notifyAdmins({
+      type: "seller_edit_submitted",
+      title: "Shop update pending review",
+      body: `${seller.display_name} updated their shop details — changes are staged, not yet live.`,
+      link: `/admin/sellers/${seller.id}`,
+      emailSubject: `Shop update pending review: ${seller.display_name}`,
+      emailHtml: `<p><strong>${seller.display_name}</strong> edited their live shop. Changes are staged pending your review.</p><p><a href="${process.env.APP_BASE_URL}/admin/sellers/${seller.id}">Review changes</a></p>`,
+    }).catch((e) => console.error("[updateSellerProfile] notify admins failed", e));
+
+    return res.json({ success: true, seller: data, staged: true });
+  }
+
+  const { data, error } = await supabase.from("seller_profiles").update(gatedUpdate).eq("id", seller.id).select().single();
   if (error) return res.status(500).json({ success: false, message: error.message });
-
-  notifyAdmins({
-    type: "seller_edit_submitted",
-    title: "Shop update pending review",
-    body: `${seller.display_name} updated their shop details — changes are staged, not yet live.`,
-    link: `/admin/sellers/${seller.id}`,
-    emailSubject: `Shop update pending review: ${seller.display_name}`,
-    emailHtml: `<p><strong>${seller.display_name}</strong> edited their live shop. Changes are staged pending your review.</p><p><a href="${process.env.APP_BASE_URL}/admin/sellers/${seller.id}">Review changes</a></p>`,
-  }).catch((e) => console.error("[updateSellerProfile] notify admins failed", e));
-
-  res.json({ success: true, seller: data, staged: true });
+  res.json({ success: true, seller: data, staged: false });
 }
 
 // PATCH /api/seller/theme — always live immediately, no review
