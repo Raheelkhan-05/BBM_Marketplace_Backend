@@ -20,7 +20,9 @@ import {
   updateSellerProduct,
   requestSellerWhatsappOtp,
   verifySellerWhatsappOtp,
-  uploadAnonymousSellerFile
+  uploadAnonymousSellerFile,
+  getSellerBankDetails,
+  saveSellerBankDetails,
 } from "../controllers/seller.controller.js";
 
 const router = Router();
@@ -32,6 +34,8 @@ router.post("/onboarding/submit", requireAuth, authWriteLimiter, submitSellerOnb
 // router.post("/upload", requireAuth, authWriteLimiter, upload.single("file"), uploadSellerFile);
 
 router.post("/upload", optionalAuth, anonUploadLimiter, upload.single("file"), uploadSellerFile);
+router.get("/bank-details", requireAuth, getSellerBankDetails);
+router.post("/bank-details", requireAuth, authWriteLimiter, saveSellerBankDetails);
 router.post(
   "/onboarding/anonymous-upload",
   anonUploadLimiter,

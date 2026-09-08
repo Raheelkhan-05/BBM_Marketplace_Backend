@@ -181,8 +181,31 @@ export async function submitSellerOnboarding(req, res) {
   const update = {};
   for (const key of WRITABLE_FIELDS) if (body[key] !== undefined) update[key] = body[key];
 
+  // Basics/Contact/Address steps were removed from the onboarding flow —
+  // these fields are now derived automatically instead of asked for, so
+  // submission never blocks on them being "missing" from a page that no
+  // longer exists.
+  const [{ data: profile }, { data: business }] = await Promise.all([
+    supabase.from("profiles").select("name, phone, phone_verified").eq("id", userId).maybeSingle(),
+    supabase.from("business_profiles").select("trade_name, legal_name, registered_address, pincode, district, state, nature_of_business").eq("user_id", userId).maybeSingle(),
+  ]);
+
+  update.display_name = update.display_name || business?.trade_name || business?.legal_name || profile?.name || "My Shop";
+  update.business_type = update.business_type || "Retailer"; // sensible default; adjustable later from the dashboard
+  update.contact_person = update.contact_person || profile?.name || "";
+  update.whatsapp_number = update.whatsapp_number || profile?.phone || "";
+  update.whatsapp_verified = !!profile?.phone_verified; // trust the account's own verified phone; no separate OTP step anymore
+  update.address = update.address || business?.registered_address || "";
+  update.pincode = update.pincode || business?.pincode || "";
+  update.city = update.city || business?.district || "";
+  update.state = update.state || business?.state || "";
+
   if (!update.whatsapp_verified) {
-    return res.status(400).json({ success: false, message: "Please verify your WhatsApp number before submitting." });
+    return res.status(400).json({
+      success: false,
+      message: "Your account's phone number needs to be verified before you can start selling. Please verify it from your profile settings.",
+      code: "PHONE_NOT_VERIFIED",
+    });
   }
 
   const { data: existingSeller } = await supabase
@@ -231,7 +254,7 @@ export async function submitSellerOnboarding(req, res) {
     return res.json({ success: true, seller: data, staged: true });
   }
 
-  const { data: business } = await supabase.from("business_profiles").select("id, nature_of_business").eq("user_id", userId).maybeSingle();
+  // const { data: business } = await supabase.from("business_profiles").select("id, nature_of_business").eq("user_id", userId).maybeSingle();
   update.manufacturing_facility = Array.isArray(business?.nature_of_business)
     && business.nature_of_business.some((n) => /factory|manufactur/i.test(n));
 
@@ -248,6 +271,11 @@ export async function submitSellerOnboarding(req, res) {
     if (stillMissing.length) {
       return res.status(400).json({ success: false, message: "Please complete all required fields.", missing: stillMissing });
     }
+  }
+
+  const { data: bank } = await supabase.from("seller_bank_details").select("id").eq("seller_id", existingSeller?.id).maybeSingle();
+  if (!bank) {
+    return res.status(400).json({ success: false, message: "Please add your bank details before submitting.", missing: ["bank details"] });
   }
 
   const displayName = merged.display_name || existingSeller?.display_name;
@@ -571,4 +599,44 @@ export async function deleteSellerProduct(req, res) {
   const { error } = await supabase.from("seller_products").delete().eq("id", req.params.id).eq("seller_id", seller.id);
   if (error) return res.status(500).json({ success: false, message: error.message });
   res.json({ success: true });
+}
+
+// GET /api/seller/bank-details
+export async function getSellerBankDetails(req, res) {
+  const seller = await getOwnedSeller(req.user.id);
+  if (!seller) return res.status(404).json({ success: false, message: "No shop found." });
+  const { data, error } = await supabase
+    .from("seller_bank_details")
+    .select("*")
+    .eq("seller_id", seller.id)
+    .maybeSingle();
+  if (error) return res.status(500).json({ success: false, message: error.message });
+  res.json({ success: true, bank: data });
+}
+
+// POST /api/seller/bank-details  (upsert — one record per seller)
+export async function saveSellerBankDetails(req, res) {
+  const seller = await getOwnedSeller(req.user.id);
+  if (!seller) return res.status(404).json({ success: false, message: "No shop found." });
+
+  const { account_number, ifsc_code } = req.body || {};
+  if (!account_number?.trim() || !ifsc_code?.trim()) {
+    return res.status(400).json({ success: false, message: "Please fill all required bank fields." });
+  }
+  if (!/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc_code.trim().toUpperCase())) {
+    return res.status(400).json({ success: false, message: "That doesn't look like a valid IFSC code." });
+  }
+
+  const { data, error } = await supabase
+    .from("seller_bank_details")
+    .upsert({
+      seller_id: seller.id,
+      account_number: account_number.trim(),
+      ifsc_code: ifsc_code.trim().toUpperCase(),
+      is_verified: false,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "seller_id" })
+    .select().single();
+  if (error) return res.status(500).json({ success: false, message: error.message });
+  res.json({ success: true, bank: data });
 }
