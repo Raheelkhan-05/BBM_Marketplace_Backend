@@ -22,6 +22,11 @@ function emitNotification(userId, notification) {
 }
 
 export async function notifyUser({ userId, type, title, body, link, email, emailSubject, emailHtml }) {
+    if (!userId) {
+        console.warn("[notifyUser] skipped — no userId provided", type);
+        return;
+    }
+
     const { data, error } = await supabase
         .from("notifications")
         .insert({ user_id: userId, type, title, body, link })

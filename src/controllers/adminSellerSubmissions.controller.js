@@ -159,6 +159,14 @@ async function resolveManufacturersForBrands(brandNames) {
     return result;
 }
 
+// Supabase/PostgREST embeds a to-one relation as an object when it can
+// infer a single FK, but falls back to an array if the relationship is
+// ambiguous. Rather than depend on that inference always going the "right"
+// way, normalize defensively everywhere we pull seller.user_id out.
+function firstOrSelf(x) {
+    return Array.isArray(x) ? x[0] : x;
+}
+
 // GET /api/admin/seller-submissions/:id
 export async function getSellerSubmission(req, res) {
     const { id } = req.params;
@@ -204,6 +212,8 @@ export async function updateSellerSubmission(req, res) {
         .maybeSingle();
     if (fetchErr) return res.status(500).json({ success: false, message: fetchErr.message });
     if (!existing) return res.status(404).json({ success: false, message: "Not found." });
+
+    const sellerRow = firstOrSelf(existing.seller);
 
     const submissionUpdate = {};
 
@@ -320,7 +330,7 @@ export async function updateSellerSubmission(req, res) {
     if (error) return res.status(500).json({ success: false, message: error.message });
 
     await notifyAdminSubmissionsChanged();
-    if (existing.seller?.user_id) await notifySellerSubmissionsChanged(existing.seller.user_id);
+    if (sellerRow?.user_id) await notifySellerSubmissionsChanged(sellerRow.user_id);
 
     const normalized = normalizeSubmission(data);
     const marketplace = await computeMarketplaceFigures(normalized.price);
@@ -353,14 +363,16 @@ async function autoApproveSiblingSubmissions({ brandItemId, excludeSubmissionId,
     if (bulkErr) return;
 
     for (const s of siblings) {
-        const sellerId = s.seller?.user_id;
+        const sellerRow = firstOrSelf(s.seller);
+        const sellerId = sellerRow?.user_id;
         if (!sellerId) continue;
         const displayName = s.product_name || brandDisplayName || "Your product";
-        await notifyUser(sellerId, {
+        await notifyUser({
+            userId: sellerId,
             type: "listing_approved",
             title: "Your product listing was approved",
-            message: `"${displayName}" is now live on your shop.`,
-            link: `/home?highlight=${s.id}`,
+            body: `"${displayName}" is now live on your shop.`,
+            link: `/seller/listings?highlight=${s.id}`,
         });
         await notifySellerSubmissionsChanged(sellerId);
     }
@@ -426,16 +438,19 @@ export async function approveSellerSubmission(req, res) {
         if (brandErr) return res.status(500).json({ success: false, message: brandErr.message });
     }
 
+    const sellerRow = firstOrSelf(existing.seller);
+
     const displayName = existing.product_name || existing.brand?.name || "Your product";
 
-    if (existing.seller?.user_id) {
-        await notifyUser(existing.seller.user_id, {
+    if (sellerRow?.user_id) {
+        await notifyUser({
+            userId: sellerRow.user_id,
             type: "listing_approved",
             title: "Your product listing was approved",
-            message: `"${displayName}" is now live on your shop.`,
-            link: `/home?highlight=${id}`,
+            body: `"${displayName}" is now live on your shop.`,
+            link: `/seller/listings?highlight=${id}`,
         });
-        await notifySellerSubmissionsChanged(existing.seller.user_id);
+        await notifySellerSubmissionsChanged(sellerRow.user_id);
     }
 
     // Product-level approval: any other seller already sitting in the
@@ -475,17 +490,22 @@ export async function rejectSellerSubmission(req, res) {
         .single();
     if (error) return res.status(500).json({ success: false, message: error.message });
 
+    const sellerRow = firstOrSelf(existing.seller);
+
     const displayName = existing.product_name || existing.brand?.name || "Your product";
 
-    if (existing.seller?.user_id) {
-        await notifyUser(existing.seller.user_id, {
+    // rejectSellerSubmission
+    if (sellerRow?.user_id) {
+        await notifyUser({
+            userId: sellerRow.user_id,
             type: "listing_rejected",
             title: "Your product listing needs changes",
-            message: `"${displayName}" wasn't approved: ${reason.trim()}`,
-            link: "/seller/status",
+            body: `"${displayName}" wasn't approved: ${reason.trim()}`,
+            link: "/seller/listings",
         });
-        await notifySellerSubmissionsChanged(existing.seller.user_id);
+        await notifySellerSubmissionsChanged(sellerRow.user_id);
     }
+
     await notifyAdminSubmissionsChanged();
     res.json({ success: true, submission: normalizeSubmission(data) });
 }
