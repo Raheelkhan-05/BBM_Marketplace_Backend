@@ -277,6 +277,7 @@ export async function getOrderQuote(req, res) {
 }
 
 // POST /api/orders
+// POST /api/orders
 export async function placeOrder(req, res) {
     const buyerId = req.user.id;
     const {
@@ -339,9 +340,6 @@ export async function placeOrder(req, res) {
                 return res.status(400).json({ success: false, code: "OUT_OF_STOCK", message: "This item is currently out of stock." });
             }
 
-            // Hard cap: the buyer can order at most what this seller has in
-            // stock. This used to only set a "stockShortfall" flag and let
-            // the order through anyway — now it blocks, same as MOQ.
             const saleQty = purchaseQtyToSaleUnitQty(qty, purchaseBasis, submission.pack_size, submission.units_per_master_pack);
             const { exceedsStock, availableStock } = checkStockLimit(submission, saleQty);
             if (exceedsStock) {
@@ -350,6 +348,45 @@ export async function placeOrder(req, res) {
                     success: false, code: "EXCEEDS_AVAILABLE_STOCK",
                     message: `You can order at most ${availableStock} ${label}${Number(availableStock) === 1 ? "" : "s"} from this seller.`,
                 });
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // NEW: compute the authoritative delivery estimate ONCE, here, using
+    // the exact same OSRM-backed estimateDeliveryDate() that powers the
+    // Buy Now quote screen — and pass it straight into the RPC instead of
+    // letting the RPC compute its own (haversine-based, different) date.
+    // This guarantees the date the buyer saw on the quote matches the
+    // date stored on the confirmed order.
+    // ---------------------------------------------------------------
+    let estDeliveryDateISO = null;
+    let estDeliveryDateMaxISO = null;
+    {
+        const { data: submissionForDelivery } = await supabase
+            .from("seller_product_submissions")
+            .select("stock_type, production_lead_time_days, dispatch_time_days, lead_time, dispatch_pincode, dispatch_state")
+            .eq("id", submissionId)
+            .maybeSingle();
+
+        const { data: shippingAddress } = await supabase
+            .from("buyer_addresses")
+            .select("pincode, state")
+            .eq("id", shippingAddressId)
+            .maybeSingle();
+
+        if (submissionForDelivery && shippingAddress) {
+            try {
+                const delivery = await estimateDeliveryDate(submissionForDelivery, shippingAddress.pincode, shippingAddress.state);
+                // dateMin is the earlier end of whatever range the quote
+                // screen showed — using it means the stored date is never
+                // later than what the buyer saw before confirming.
+                estDeliveryDateISO = delivery.dateMin.toISOString().slice(0, 10);
+                estDeliveryDateMaxISO = delivery.dateMax.toISOString().slice(0, 10);
+            } catch (err) {
+                // Don't let a routing/estimation failure block order placement —
+                // the RPC has its own +3-day fallback if this stays null.
+                console.error("estimateDeliveryDate failed during placeOrder:", err?.message || err);
             }
         }
     }
@@ -366,6 +403,8 @@ export async function placeOrder(req, res) {
         p_transport_mode: transportMode || null,
         p_transport_company: transportCompany || null,
         p_transport_details: transportDetails || null,
+        p_estimated_delivery_date: estDeliveryDateISO, // NEW
+        p_estimated_delivery_date_max: estDeliveryDateMaxISO,
     });
 
     if (error) {
