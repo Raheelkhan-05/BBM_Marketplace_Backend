@@ -117,8 +117,28 @@ export async function deleteRow(req, res) {
     try { assertTableAllowed(table); } catch (e) { return handleGuard(res, e); }
     const { pk = "id", cascade } = req.query;
 
+    // If this table has a `deleted_at` column, soft-delete instead of a hard
+    // DELETE — avoids FK violations on tables still referenced elsewhere
+    // (e.g. seller_profiles <- orders.seller_id) and matches how `profiles`
+    // already handles deletion.
+    const { data: columns, error: colErr } = await supabase.rpc("admin_table_columns", { p_table: table });
+    if (colErr) return res.status(500).json({ success: false, message: colErr.message });
+    const hasSoftDelete = (columns || []).some((c) => c.column_name === "deleted_at");
+
+    if (hasSoftDelete) {
+        const { data, error } = await supabase
+            .from(table)
+            .update({ deleted_at: new Date().toISOString() })
+            .eq(pk, id)
+            .select()
+            .maybeSingle();
+        if (error) return res.status(400).json({ success: false, message: error.message });
+        if (!data) return res.status(404).json({ success: false, message: "Row not found." });
+        return res.json({ success: true, softDeleted: true, row: data });
+    }
+
     if (cascade === "true") {
-        const { data, error } = await supabase.rpc("admin_smart_delete", {   // was admin_cascade_delete
+        const { data, error } = await supabase.rpc("admin_smart_delete", {
             p_table: table, p_pk_column: pk, p_pk_value: String(id),
         });
         if (error) return res.status(500).json({ success: false, message: error.message });
@@ -127,9 +147,6 @@ export async function deleteRow(req, res) {
 
     const { error } = await supabase.from(table).delete().eq(pk, id);
     if (error) {
-        // Postgres FK-violation code — this row is still referenced somewhere
-        // with a NO ACTION/RESTRICT rule. Hand the frontend the dependents list
-        // so it can offer a "force cascade delete" instead of a raw DB error.
         if (error.code === "23503") {
             const { data: dependents } = await supabase.rpc("admin_row_dependents", { p_table: table, p_pk_value: String(id) });
             return res.status(409).json({
