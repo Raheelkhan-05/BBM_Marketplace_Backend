@@ -499,6 +499,10 @@ export async function createListingForExistingBrand(req, res) {
     const sellerId = req.sellerId;
     const body = req.body || {};
     const { genericProductBrandId } = body;
+    console.log("sellerId", sellerId);
+    console.log("body", body);
+    console.log("genericProductBrandId", genericProductBrandId);
+
     if (!genericProductBrandId) return res.status(400).json({ success: false, message: "Missing brand item." });
 
     const { data: brand, error: brandErr } = await supabase
