@@ -77,6 +77,15 @@ const GROUP_FIELD_MAP = {
     commercial_terms: ["priceBasis"],
 };
 
+async function getSellerDispatchInfo(sellerId) {
+    const { data } = await supabase
+        .from("seller_profiles")
+        .select("dispatch_pincode, dispatch_district, dispatch_state")
+        .eq("id", sellerId)
+        .maybeSingle();
+    return data || {};
+}
+
 // Replaces autoSaveDeliveryDefaults — same call sites (createSubmission,
 // createListingForExistingBrand, updateSubmission), just saves across all
 // three groups instead of only delivery.

@@ -1,6 +1,7 @@
 // controllers/cart.controller.js
 import { supabase } from "../config/supabase.js";
 import { purchaseQtyToSaleUnitQty, saleUnitLabel } from "../../shared/packUnits.js";
+import { checkOrderWindow, checkLocationServiceable } from "../../shared/orderConstraints.js";
 
 // Fetches just enough from seller_product_submissions to validate a
 // requested quantity against available stock. Shared by addCartItem,
@@ -159,6 +160,42 @@ export async function checkoutCart(req, res) {
                 return res.status(400).json({
                     success: false, code: "EXCEEDS_AVAILABLE_STOCK",
                     message: `${item.product_name || "One item"} in your cart: ${stockError}`,
+                });
+            }
+        }
+    }
+
+    // Same order-window + serviceability re-check as placeOrder(), just
+    // applied per seller (window) and per item (location) since a cart
+    // can span multiple sellers.
+    const uniqueSellerIds = [...new Set((cartItems || []).map((i) => i.seller_id))];
+    if (uniqueSellerIds.length) {
+        const { data: sellerProfiles } = await supabase
+            .from("seller_profiles")
+            .select("id, working_days, order_acceptance_start, order_acceptance_end, holidays")
+            .in("id", uniqueSellerIds);
+        const profileById = new Map((sellerProfiles || []).map((p) => [p.id, p]));
+        for (const sid of uniqueSellerIds) {
+            const windowCheck = checkOrderWindow(profileById.get(sid));
+            if (!windowCheck.open) {
+                return res.status(400).json({ success: false, code: windowCheck.reason, message: windowCheck.message });
+            }
+        }
+    }
+
+    if (submissionIds.length) {
+        const { data: address } = await supabase.from("buyer_addresses").select("state, city").eq("id", shippingAddressId).maybeSingle();
+        const { data: locationRows } = await supabase
+            .from("seller_product_submissions")
+            .select("id, dispatching_locations")
+            .in("id", submissionIds);
+        const locationById = new Map((locationRows || []).map((r) => [r.id, r.dispatching_locations]));
+        for (const item of cartItems || []) {
+            const locationCheck = checkLocationServiceable(locationById.get(item.submission_id), address);
+            if (!locationCheck.serviceable) {
+                return res.status(400).json({
+                    success: false, code: locationCheck.reason,
+                    message: `${item.product_name || "One item"} in your cart: ${locationCheck.message}`,
                 });
             }
         }

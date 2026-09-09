@@ -5,6 +5,8 @@ import { notifyUser, notifyOrderChanged, notifyUserOrdersChanged } from "../serv
 import { getRoadDistanceKm } from "../services/pincodeDistance.js";
 import { purchaseQtyToSaleUnitQty, saleUnitQtyToBaseUnits, getSaleUnit, saleUnitLabel, round2 } from "../../shared/packUnits.js";
 
+import { checkOrderWindow, checkLocationServiceable } from "../../shared/orderConstraints.js";
+
 
 const ERROR_MAP = {
     LISTING_NOT_FOUND: { status: 404, message: "That listing is no longer available." },
@@ -298,6 +300,33 @@ export async function placeOrder(req, res) {
         if (blockMsg) return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: blockMsg });
     }
 
+    // Hard re-check of order window + delivery serviceability — the UI
+    // already disables the buttons for this; this is the last line of
+    // defense against client clock skew, a stale page, or a direct API call.
+    const { data: constraintRow } = await supabase
+        .from("seller_product_submissions")
+        .select("dispatching_locations, seller:seller_profiles!seller_product_submissions_seller_id_fkey ( working_days, order_acceptance_start, order_acceptance_end, holidays )")
+        .eq("id", submissionId)
+        .maybeSingle();
+
+    if (constraintRow) {
+        const windowCheck = checkOrderWindow({
+            workingDays: constraintRow.seller?.working_days,
+            orderAcceptanceStart: constraintRow.seller?.order_acceptance_start,
+            orderAcceptanceEnd: constraintRow.seller?.order_acceptance_end,
+            holidays: constraintRow.seller?.holidays,
+        });
+        if (!windowCheck.open) {
+            return res.status(400).json({ success: false, code: windowCheck.reason, message: windowCheck.message });
+        }
+
+        const { data: address } = await supabase.from("buyer_addresses").select("state, city").eq("id", shippingAddressId).maybeSingle();
+        const locationCheck = checkLocationServiceable(constraintRow.dispatching_locations, address);
+        if (!locationCheck.serviceable) {
+            return res.status(400).json({ success: false, code: locationCheck.reason, message: locationCheck.message });
+        }
+    }
+
     if (safeOrderType !== "sample") {
         const { data: submission } = await supabase
             .from("seller_product_submissions")
@@ -452,4 +481,33 @@ export async function cancelMyOrder(req, res) {
         await notifyUserOrdersChanged(row.notify_user_id);
     }
     res.json({ success: true, message: "Order cancelled." });
+}
+
+
+// GET /api/orders/order-constraints?submissionId=...
+// Powers BuyNowModal's instant "seller not accepting orders right now" /
+// "not deliverable to your address" checks. placeOrder() below re-checks
+// both with the server's own clock before actually creating the order —
+// this endpoint is only for fast UI feedback, never the source of truth.
+export async function getOrderConstraints(req, res) {
+    const { submissionId } = req.query;
+    if (!submissionId) return res.status(400).json({ success: false, message: "submissionId is required." });
+
+    const { data, error } = await supabase
+        .from("seller_product_submissions")
+        .select("dispatching_locations, seller:seller_profiles!seller_product_submissions_seller_id_fkey ( working_days, order_acceptance_start, order_acceptance_end, holidays )")
+        .eq("id", submissionId)
+        .maybeSingle();
+
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    if (!data) return res.status(404).json({ success: false, message: "Listing not available." });
+
+    res.json({
+        success: true,
+        dispatchingLocations: data.dispatching_locations || [],
+        workingDays: data.seller?.working_days || [],
+        orderAcceptanceStart: data.seller?.order_acceptance_start || null,
+        orderAcceptanceEnd: data.seller?.order_acceptance_end || null,
+        holidays: data.seller?.holidays || [],
+    });
 }
