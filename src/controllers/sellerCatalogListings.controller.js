@@ -229,7 +229,7 @@ function validateListingPayload(body) {
     if (body.stockType === "ready_stock" && !(Number(body.stockQuantity) >= 0)) missing.push("Available stock");
     if (body.stockType === "made_to_order" && !(Number(body.productionLeadTimeDays) >= 0)) missing.push("Lead time");
 
-    if (!body.dispatchPincode?.trim()) missing.push("Dispatch pincode");
+    // if (!body.dispatchPincode?.trim()) missing.push("Dispatch pincode");
     if (!(Array.isArray(body.dispatchingLocations) && body.dispatchingLocations.length)) missing.push("Dispatching locations");
 
     if (!body.returnPolicyKey?.trim()) missing.push("Return / replacement policy");
@@ -241,15 +241,16 @@ function validateListingPayload(body) {
 // `brand` supplies the fixed packaging identity (unit/pack_size/
 // units_per_master_pack) — always sourced from hs_generic_product_brands,
 // never from the seller's own submission.
-function toListingRow(body, brand) {
+// toListingRow now takes the seller's dispatch info as a third argument,
+// sourced from seller_profiles — no longer read from the per-listing
+// form body. Dispatch location is a one-time seller-level fact set during
+// onboarding (see SellerOnboardingForm's Operations step), not something
+// re-entered per listing.
+function toListingRow(body, brand, sellerDispatch) {
     const unit = brand.unit;
     const packSize = Number(brand.pack_size);
     const masterPackSize = Number(brand.units_per_master_pack);
 
-    // price / base_price, moq, stock_quantity, and quantity_discounts
-    // minQty are now ALL denominated in the canonical sale unit (see
-    // shared/packUnits.js). The frontend now sends moq/stock/slab
-    // thresholds already in that unit — no conversion happens here.
     const { basePricePerSaleUnit, finalPricePerSaleUnit } = normalizeEnteredPrice(
         body.basePrice, body.gstPercent, body.gstInclusive, body.priceBasis,
         packSize, masterPackSize
@@ -265,10 +266,10 @@ function toListingRow(body, brand) {
 
         price: finalPricePerSaleUnit,
         base_price: basePricePerSaleUnit,
-        moq: Number(body.moq),                    // already sale-unit qty
+        moq: Number(body.moq),
         stock_quantity: body.stockType === "ready_stock" && body.stockQuantity !== ""
-            ? Number(body.stockQuantity) : null,   // already sale-unit qty
-        unit,                                   // ← from brand item
+            ? Number(body.stockQuantity) : null,
+        unit,
         lead_time: effectiveLeadTime,
         image: images[0] || null,
 
@@ -277,8 +278,8 @@ function toListingRow(body, brand) {
         gst_inclusive_input: Boolean(body.gstInclusive),
         freight_included: Boolean(body.freightIncluded),
 
-        pack_size: packSize,                    // ← from brand item
-        units_per_master_pack: masterPackSize,   // ← from brand item
+        pack_size: packSize,
+        units_per_master_pack: masterPackSize,
 
         sample_available: Boolean(body.sampleAvailable),
         sample_quantity: body.sampleAvailable ? Number(body.sampleQuantity) : null,
@@ -288,16 +289,16 @@ function toListingRow(body, brand) {
         quantity_discounts: Array.isArray(body.priceSlabs)
             ? body.priceSlabs.filter((s) => s?.minQty && s?.discountPercent) : [],
 
-
         stock_type: body.stockType,
         production_lead_time_days: body.stockType === "made_to_order" ? Number(body.productionLeadTimeDays) : null,
 
-        dispatch_district: body.dispatchDistrict?.trim() || null,
-        dispatch_state: body.dispatchState?.trim() || null,
-        dispatch_pincode: body.dispatchPincode?.trim() || null,
+        // NEW — sourced from the seller's own profile (set once during
+        // onboarding), not from this listing's body.
+        dispatch_district: sellerDispatch?.dispatch_district || null,
+        dispatch_state: sellerDispatch?.dispatch_state || null,
+        dispatch_pincode: sellerDispatch?.dispatch_pincode || null,
         dispatching_locations: Array.isArray(body.dispatchingLocations) ? body.dispatchingLocations : [],
 
-        // hsn_code: body.hsnCode?.trim() || null,
         return_policy_key: body.returnPolicyKey,
         warranty_key: body.warrantyKey,
         note_to_admin: body.noteToAdmin?.trim() || null,
@@ -371,7 +372,8 @@ export async function createSubmission(req, res) {
     // seller's specific listing.
     const autoApprove = brand.review_status === "approved" && !existingRow;
 
-    const row = toListingRow(body, brand);
+    const sellerDispatch = await getSellerDispatchInfo(sellerId);
+    const row = toListingRow(body, brand, sellerDispatch);
     const [returnText, warrantyText] = await Promise.all([
         resolvePolicyText("return_policy", body.returnPolicyKey),
         resolvePolicyText("warranty", body.warrantyKey),
@@ -559,7 +561,8 @@ export async function createListingForExistingBrand(req, res) {
     // reasoning as createSubmission above.
     const autoApprove = !existingRow;
 
-    const row = toListingRow(merged, effectiveBrand);   // ← was `brand`, now `effectiveBrand`
+    const sellerDispatch = await getSellerDispatchInfo(sellerId);
+    const row = toListingRow(merged, effectiveBrand, sellerDispatch);
     const [returnText, warrantyText] = await Promise.all([
         resolvePolicyText("return_policy", body.returnPolicyKey),
         resolvePolicyText("warranty", body.warrantyKey),
@@ -717,9 +720,9 @@ export async function updateSubmission(req, res) {
         productionLeadTimeDays: body.productionLeadTimeDays ?? existing.production_lead_time_days,
         dispatchTimeDays: body.dispatchTimeDays ?? existing.dispatch_time_days,
 
-        dispatchPincode: body.dispatchPincode ?? existing.dispatch_pincode,
-        dispatchDistrict: body.dispatchDistrict ?? existing.dispatch_district,
-        dispatchState: body.dispatchState ?? existing.dispatch_state,
+        // dispatchPincode: body.dispatchPincode ?? existing.dispatch_pincode,
+        // dispatchDistrict: body.dispatchDistrict ?? existing.dispatch_district,
+        // dispatchState: body.dispatchState ?? existing.dispatch_state,
         dispatchingLocations: body.dispatchingLocations ?? existing.dispatching_locations,
 
         returnPolicyKey: body.returnPolicyKey ?? existing.return_policy_key,
@@ -732,7 +735,8 @@ export async function updateSubmission(req, res) {
     const missing = validateListingPayload(merged);
     if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.`, missing });
 
-    const row = toListingRow(merged, brandPackaging);
+    const sellerDispatch = await getSellerDispatchInfo(sellerId);
+    const row = toListingRow(merged, brandPackaging, sellerDispatch);
     const [returnText, warrantyText] = await Promise.all([
         resolvePolicyText("return_policy", merged.returnPolicyKey),
         resolvePolicyText("warranty", merged.warrantyKey),

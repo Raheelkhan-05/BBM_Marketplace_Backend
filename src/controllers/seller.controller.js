@@ -23,6 +23,7 @@ const REQUIRED_FIELDS = [
   "contact_person", "whatsapp_number",
   "logo_url",
   "order_acceptance_start", "order_acceptance_end",
+  "dispatch_pincode",
 ];
 
 const GATED_FIELDS = [
@@ -31,6 +32,7 @@ const GATED_FIELDS = [
   "logo_url", "primary_color", "secondary_color",
   "pan",
   "working_days", "order_acceptance_start", "order_acceptance_end",
+  "dispatch_pincode", "dispatch_district", "dispatch_state",
 ];
 
 const THEME_FIELDS = ["primary_color", "secondary_color"];
