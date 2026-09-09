@@ -1,6 +1,8 @@
 // controllers/admin/paymentVerification.controller.js
 //
-// Admin review queue for UPI payment proofs. Gate all these routes behind
+// Admin review queue for payment proofs (UPI QR and NEFT/RTGS bank
+// transfers alike — they land in the same `payment_proofs` table, just
+// tagged with a different `payment_method`). Gate all these routes behind
 // your existing admin-auth middleware (profiles.role = 'admin'), same as
 // your other admin/review endpoints for hs_categories etc.
 //
@@ -27,7 +29,7 @@ export async function listPendingPaymentProofs(req, res) {
     const { data, error } = await supabase
         .from("payment_proofs")
         .select(`
-            id, utr_number, screenshot_url, amount_claimed, status, admin_note, created_at, reviewed_at,
+            id, utr_number, screenshot_url, amount_claimed, payment_method, status, admin_note, created_at, reviewed_at,
             order_id, order_group_id,
             order:orders (
                 id, order_number, total_amount, status, buyer_contact_name, buyer_contact_phone,
@@ -75,7 +77,6 @@ export async function listPendingPaymentProofs(req, res) {
 }
 
 // POST /api/admin/payment-proofs/:id/verify
-// POST /api/admin/payment-proofs/:id/verify
 export async function verifyPayment(req, res) {
     const { note } = req.body || {};
     const { error } = await supabase.rpc("admin_verify_payment", {
@@ -89,15 +90,12 @@ export async function verifyPayment(req, res) {
         return res.status(mapped.status).json({ success: false, code: error.message, message: mapped.message });
     }
 
-    // NEW — this is the actual "payment confirmed" moment. Commission gets
-    // added to the wallet HERE, not at order placement. Covers both shapes:
-    //   - single-order proof (order_id set)
-    //   - cart/group proof (order_group_id set) — one UTR can cover several
-    //     seller orders at once, so accrue for every sibling order in the group
-    // This is the actual "payment confirmed" moment for standard orders.
-    // It's also the first time the seller is told about the order at all —
-    // placeOrder() deliberately skips notifying the seller while the order
-    // sits in awaiting_payment. Covers both shapes:
+    // This is the actual "payment confirmed" moment. Commission gets added
+    // to the wallet HERE, not at order placement. It's also the first time
+    // the seller is told about the order at all — placeOrder() deliberately
+    // skips notifying the seller while the order sits in awaiting_payment.
+    // Applies identically regardless of which payment_method the proof was
+    // submitted under (UPI, NEFT, RTGS). Covers both shapes:
     //   - single-order proof (order_id set)
     //   - cart/group proof (order_group_id set) — one UTR can cover several
     //     seller orders at once, so notify + accrue for every sibling order
