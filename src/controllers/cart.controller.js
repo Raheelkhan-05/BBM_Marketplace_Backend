@@ -2,6 +2,7 @@
 import { supabase } from "../config/supabase.js";
 import { purchaseQtyToSaleUnitQty, saleUnitLabel } from "../../shared/packUnits.js";
 import { checkOrderWindow, checkLocationServiceable } from "../../shared/orderConstraints.js";
+import { notifyAdmins, notifyAdminPaymentsChanged } from "../services/notifications.service.js";
 
 // Fetches just enough from seller_product_submissions to validate a
 // requested quantity against available stock. Shared by addCartItem,
@@ -252,5 +253,20 @@ export async function submitGroupPaymentProof(req, res) {
         p_group_id: groupId, p_buyer_id: req.user.id, p_utr: utr, p_screenshot_url: screenshotUrl,
     });
     if (error) return res.status(400).json({ success: false, code: error.message, message: "Couldn't submit payment proof." });
+
+    const { data: groupRow } = await supabase
+        .from("order_groups")
+        .select("group_number")
+        .eq("id", groupId)
+        .maybeSingle();
+
+    await notifyAdmins({
+        type: "payment_proof_submitted",
+        title: `Payment proof submitted: Group ${groupRow?.group_number || groupId}`,
+        body: "Buyer submitted a payment reference covering this cart's orders — needs review.",
+        link: `/admin/payments?queue=orders&status=pending&highlight=${data}`,
+    });
+    await notifyAdminPaymentsChanged();
+
     res.json({ success: true, proofId: data });
 }

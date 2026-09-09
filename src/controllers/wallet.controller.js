@@ -1,5 +1,6 @@
 // controllers/wallet.controller.js
 import { supabase } from "../config/supabase.js";
+import { notifyAdmins, notifyAdminPaymentsChanged } from "../services/notifications.service.js";
 
 // GET /api/seller/wallet — dashboard summary for the logged-in seller
 export async function getWalletStatus(req, res) {
@@ -58,8 +59,6 @@ export async function submitWalletPayment(req, res) {
     let screenshotUrl = req.body?.screenshotUrl || null;
 
     if (req.file) {
-        // Placeholder — replace with your actual storage upload call.
-        // e.g. screenshotUrl = await uploadPaymentScreenshot(req.file.buffer, req.file.mimetype, `wallet/${req.sellerId}/${Date.now()}`);
         try {
             const { uploadPaymentScreenshot } = await import("../utils/paymentScreenshotUpload.js");
             screenshotUrl = await uploadPaymentScreenshot(req.file.buffer, req.file.mimetype, `wallet/${req.sellerId}/${Date.now()}-${req.file.originalname}`);
@@ -76,6 +75,24 @@ export async function submitWalletPayment(req, res) {
         const map = { INVALID_AMOUNT: "Enter a valid top-up amount." };
         return res.status(400).json({ success: false, code: error.message, message: map[error.message] || "Couldn't submit payment." });
     }
+
+    // Admin doesn't otherwise know a wallet top-up needs verifying —
+    // mirrors approveSellerSubmission's notifyAdmins() pattern for the
+    // catalog queue, applied to the wallet-payments queue instead.
+    const { data: sellerRow } = await supabase
+        .from("seller_profiles")
+        .select("display_name")
+        .eq("id", req.sellerId)
+        .maybeSingle();
+
+    await notifyAdmins({
+        type: "wallet_payment_submitted",
+        title: `Wallet top-up submitted: ${sellerRow?.display_name || "A seller"}`,
+        body: `₹${Number(amount).toFixed(2)} top-up submitted for verification.`,
+        link: `/admin/payments?queue=wallet&status=pending&highlight=${data}`,
+    });
+    await notifyAdminPaymentsChanged();
+
     res.json({ success: true, paymentId: data, message: "Credits submitted — we'll verify it shortly." });
 }
 

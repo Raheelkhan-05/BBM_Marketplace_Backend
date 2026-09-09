@@ -21,6 +21,7 @@
 // use elsewhere in the codebase (you clearly have file upload infra already
 // for seller photos/certifications).
 import { supabase } from "../config/supabase.js";
+import { notifyAdmins, notifyAdminPaymentsChanged } from "../services/notifications.service.js";
 
 const PROOF_ERROR_MAP = {
     ORDER_NOT_FOUND: { status: 404, message: "Order not found." },
@@ -145,6 +146,24 @@ export async function submitPaymentProof(req, res) {
         const mapped = mapProofError(error);
         return res.status(mapped.status).json({ success: false, code: error.message, message: mapped.message });
     }
+
+    // Admin doesn't know a proof needs review until we tell them —
+    // mirrors how approveSellerSubmission/rejectSellerSubmission always
+    // call notifyAdminSubmissionsChanged() so the review queue refreshes,
+    // plus a persisted+emailable notification so it isn't socket-only.
+    const { data: orderRow } = await supabase
+        .from("orders")
+        .select("order_number")
+        .eq("id", req.params.id)
+        .maybeSingle();
+
+    await notifyAdmins({
+        type: "payment_proof_submitted",
+        title: `Payment proof submitted: ${orderRow?.order_number || req.params.id}`,
+        body: `Buyer submitted a ${paymentMethod.toUpperCase()} payment reference for review.`,
+        link: `/admin/payments?queue=orders&status=pending&highlight=${data}`,
+    });
+    await notifyAdminPaymentsChanged();
 
     res.json({
         success: true,
