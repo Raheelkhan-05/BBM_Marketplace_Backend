@@ -16,18 +16,35 @@
 //      description, manufacturing_details) — on the linked brand item
 //      (hs_generic_product_brands), shared across every seller listing it.
 //
-// PRODUCT-LEVEL AUTO-APPROVAL (this pass): approveSellerSubmission used to
-// only ever touch the ONE submission row it was called for. That's fine
+// PRODUCT-LEVEL AUTO-APPROVAL (previous pass): approveSellerSubmission used
+// to only ever touch the ONE submission row it was called for. That's fine
 // the very first time a brand-new product gets approved — but if a second
 // seller had already submitted the same (still-unmapped) brand item before
 // admin got to it, their row sat pending forever, needing a second manual
 // approval for a product that's now already live. approveSellerSubmission
-// now also auto-approves any other still-pending submissions for the same
+// also auto-approves any other still-pending submissions for the same
 // brand item in the same request, and notifies each of those sellers the
 // same way. Going forward, sellerCatalogListings.controller.js's
 // createSubmission / createListingForExistingBrand already skip the queue
 // entirely for an already-approved brand item, so this bulk step only ever
 // has anything to do at the moment a product is first approved.
+//
+// "NEEDS MAPPING" TAB (this pass): sellerCatalogListings.controller.js now
+// fast-approves a genuinely brand-new brand item the moment a seller
+// submits it — it's visible to buyers right away, but generic_product_id
+// is left null until admin maps it into the category hierarchy. Those
+// items no longer show up under "Pending" (they're already approved), so
+// they'd otherwise be invisible to admin entirely. listSellerSubmissions
+// now accepts status=unmapped: approved rows whose brand item has no
+// generic_product. This is filtered in JS after the fetch (same as the
+// existing free-text `q` filter below) because the relevant condition —
+// "the embedded generic_product relation is null" — isn't something
+// PostgREST can express as a top-level .eq()/.is() on this query shape.
+// getSellerSubmission / updateSellerSubmission / approveSellerSubmission
+// are UNCHANGED: the manual approve flow still requires mapping via the
+// NOT_MAPPED code below for anything that reaches it still pending or
+// resubmitted — this tab is purely a way for admin to find already-live,
+// still-unmapped items on their own schedule, not a new approval path.
 
 import { supabase } from "../config/supabase.js";
 import { notifyUser, notifySellerSubmissionsChanged, notifyAdminSubmissionsChanged } from "../services/notifications.service.js";
@@ -81,6 +98,13 @@ async function resolvePolicyText(kind, key) {
 }
 
 // GET /api/admin/seller-submissions?status=pending_review&q=
+//
+// status accepts one more value than before: "unmapped" — approved
+// submissions whose brand item hasn't been mapped to a
+// category/subcategory/generic product yet (generic_product_id is null).
+// These are already live for buyers (see sellerCatalogListings.controller.js
+// fast-approval), so they're excluded from "Pending" but still need admin
+// attention on their own timeline.
 export async function listSellerSubmissions(req, res) {
     const { status = "pending_review", q = "" } = req.query;
     let query = supabase
@@ -88,12 +112,24 @@ export async function listSellerSubmissions(req, res) {
         .select(BRAND_EMBED)
         .order("created_at", { ascending: false })
         .limit(200);
-    if (status !== "all") query = query.eq("review_status", status);
+
+    if (status === "unmapped") {
+        // Unmapped items are always approved (fast-approval never leaves
+        // them pending) — narrow the query itself before filtering the
+        // "no generic_product" condition in JS below.
+        query = query.eq("review_status", "approved");
+    } else if (status !== "all") {
+        query = query.eq("review_status", status);
+    }
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
 
     let items = (data || []).map(normalizeSubmission);
+
+    if (status === "unmapped") {
+        items = items.filter((it) => !it.generic_product);
+    }
 
     if (q.trim()) {
         const term = q.trim().toLowerCase();
@@ -379,6 +415,14 @@ async function autoApproveSiblingSubmissions({ brandItemId, excludeSubmissionId,
 }
 
 // POST /api/admin/seller-submissions/:id/approve
+//
+// UNCHANGED by this pass. Still requires the brand item to be mapped to a
+// generic_product before it will approve — this remains the path for
+// items still sitting in "pending_review" (or resubmitted after
+// rejection). Brand-new fast-approved items never reach this endpoint on
+// their way to being live; they're found and mapped later via
+// status=unmapped + FixMappingPicker's PATCH .../catalog/brand_item/:id,
+// which doesn't go through here at all.
 export async function approveSellerSubmission(req, res) {
     const { id } = req.params;
     const { data: existing, error: fetchErr } = await supabase
@@ -402,13 +446,11 @@ export async function approveSellerSubmission(req, res) {
     if (fetchErr) return res.status(500).json({ success: false, message: fetchErr.message });
     if (!existing) return res.status(404).json({ success: false, message: "Not found." });
 
-    if (!existing.brand?.generic_product?.id) {
-        return res.status(400).json({
-            success: false,
-            message: "This item's category hasn't been mapped yet. Map it below (Hierarchy mapping), then approve again.",
-            code: "NOT_MAPPED",
-        });
-    }
+    // Mapping is no longer a precondition for approval — admin can
+    // one-click approve immediately and map the category/subcategory/
+    // generic product hierarchy whenever they get to it (via the
+    // "Needs mapping" tab / FixMappingPicker). The cascade below only
+    // runs for whichever of cat/sub/gp actually exist right now.
     const { data, error } = await supabase
         .from("seller_product_submissions")
         .update({ review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: req.user.id, rejection_reason: null })

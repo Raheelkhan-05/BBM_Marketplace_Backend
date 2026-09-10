@@ -53,6 +53,27 @@
 // review on resubmit even if the brand item is approved — that rejection
 // was about this seller's specific listing (pricing, terms, etc.), not
 // the product itself, so it deserves a fresh look regardless.
+//
+// BRAND-NEW-PRODUCT FAST APPROVAL (this pass): previously, a genuinely
+// new brand item (createBrandItem) was inserted as review_status
+// "pending_review" — it sat invisible to buyers until admin both mapped
+// it into the category hierarchy AND clicked Approve, in one blocking
+// trip. That's now split into two independent steps:
+//   1. createBrandItem inserts the new brand item as "approved" straight
+//      away. Because createSubmission's existing autoApprove check
+//      (`brand.review_status === "approved" && !existingRow`) doesn't
+//      care WHY the brand is approved, the seller's very first submission
+//      for it rides the same already-existing auto-approve path used for
+//      "another seller listing an already-approved product" — no new
+//      branch needed there. generic_product_id is intentionally left
+//      null: mapping is a separate, non-blocking admin task now.
+//   2. Admin is still notified (so the item surfaces in the "Needs
+//      mapping" tab — see adminSellerSubmissions.controller.js's
+//      status=unmapped filter), but the notification is informational,
+//      not a gate. isNewBrandItem tracks whether this particular call
+//      is the one that created the brand item, so re-submissions of an
+//      already-approved item (the pre-existing autoApprove path) don't
+//      also fire this "needs mapping" notice a second time.
 import { supabase } from "../config/supabase.js";
 import { notifyAdmins, notifyAdminSubmissionsChanged, notifyUser, notifySellerSubmissionsChanged } from "../services/notifications.service.js";
 import { slugify } from "../services/slugify.js";
@@ -172,6 +193,11 @@ function validateNewBrandPackaging(body) {
     return missing;
 }
 
+// NEW: brand-new brand items are now created already-approved (see
+// "BRAND-NEW-PRODUCT FAST APPROVAL" note at top of file). generic_product_id
+// stays null — mapping happens later, independently, via
+// adminUpdateCatalogEntry("brand_item", ..., { parentId }) ("Fix mapping"
+// in the admin UI), not as a precondition of being live for buyers.
 async function createBrandItem({ productName, brandName, brandImage, brandNotApplicable, images, unit, packSize, masterPackSize }) {
     const trimmedProduct = productName.trim();
     const insertRow = {
@@ -187,7 +213,13 @@ async function createBrandItem({ productName, brandName, brandImage, brandNotApp
         pack_size: Number(packSize),
         units_per_master_pack: Number(masterPackSize),
         is_ai_generated: false,
+        // Was "pending_review" — a brand-new product now goes live for
+        // buyers immediately once the seller submits it. Category mapping
+        // is a separate, non-blocking admin task tracked via the
+        // "Needs mapping" tab (generic_product_id is left null on purpose).
         review_status: "pending_review",
+        reviewed_at: new Date().toISOString(),
+        reviewed_by: null, // system auto-approval, not a specific admin
     };
 
     const { data: created, error } = await supabase
@@ -333,6 +365,12 @@ export async function createSubmission(req, res) {
 
     // 1) Does this exact product+brand already exist in the catalog?
     let brand;
+    // Tracks whether THIS call is the one that created the brand item —
+    // used below to decide whether to fire the one-time "needs mapping"
+    // notification. A re-submission that lands on an already-approved
+    // (possibly already-mapped, possibly not) brand item created by an
+    // earlier call should not fire it again.
+    let isNewBrandItem = false;
     try {
         brand = await findExistingBrandItem({
             productName: body.productName,
@@ -357,6 +395,7 @@ export async function createSubmission(req, res) {
                 packSize: body.packSize,
                 masterPackSize: body.masterPackSize,
             });
+            isNewBrandItem = true;
         }
     } catch (err) {
         return res.status(500).json({ success: false, message: err.message });
@@ -372,14 +411,15 @@ export async function createSubmission(req, res) {
     }
 
     // A brand item that's ALREADY approved means the product itself has
-    // already cleared the admin's mapping/approval step (via some seller's
-    // earlier submission). Another seller selling that same already-
-    // approved product doesn't need a second manual approval — only a
-    // brand-new/still-pending product does. existingRow, when present here,
-    // is always "rejected" (the conflict check above already ruled out any
-    // other status) — that resubmission still goes through review even if
-    // the brand is approved, since admin flagged something about THIS
-    // seller's specific listing.
+    // already cleared admin review — either because some seller's earlier
+    // submission got manually approved, OR (as of this pass) because it's
+    // a brand-new product created moments ago via createBrandItem, which
+    // now inserts as "approved" from the start. Either way, this seller's
+    // submission for it doesn't need to sit in the review queue.
+    // existingRow, when present here, is always "rejected" (the conflict
+    // check above already ruled out any other status) — that resubmission
+    // still goes through review even if the brand is approved, since
+    // admin flagged something about THIS seller's specific listing.
     const autoApprove = brand.review_status === "approved" && !existingRow;
 
     const sellerDispatch = await getSellerDispatchInfo(sellerId);
@@ -415,13 +455,29 @@ export async function createSubmission(req, res) {
     await autoSaveSellerDefaults(sellerId, body);
 
     if (autoApprove) {
-        // Product already approved — nothing here needs admin's attention.
+        // Product already approved (or just fast-approved as brand-new) —
+        // nothing here BLOCKS admin's attention.
         await notifySellerListingLive(sellerId, inserted.id, brand.name);
+
+        // Brand-new product: it's live for buyers right away, but it
+        // still has no category/subcategory/generic-product mapping.
+        // Notify admin so it surfaces in the "Needs mapping" tab — this
+        // is informational, not a gate, and only fires once (the call
+        // that actually created the brand item).
+        if (isNewBrandItem) {
+            await notifyAdmins({
+                type: "seller_submission",
+                title: "New product live — needs category mapping",
+                message: `${brand.brand_name || "(No brand)"} — ${brand.name} is live for buyers now. Map it to a category when you get a chance.`,
+                link: `/admin/listings?highlight=${inserted.id}`,
+            });
+            await notifyAdminSubmissionsChanged();
+        }
     } else {
         await notifyAdmins({
             type: "seller_submission",
-            title: existingRow ? "Listing resubmitted for review" : "New listing submitted",
-            message: `${brand.brand_name || "(No brand)"} — ${brand.name} ${existingRow ? "was resubmitted after rejection" : "is a brand-new product — map it to a category before approving"}.`,
+            title: "Listing resubmitted for review",
+            message: `${brand.brand_name || "(No brand)"} — ${brand.name} was resubmitted after rejection.`,
             link: `/admin/listings?highlight=${inserted.id}`,
         });
         await notifyAdminSubmissionsChanged();
@@ -830,4 +886,4 @@ export async function deleteSubmission(req, res) {
 
     await notifyAdminSubmissionsChanged();
     res.json({ success: true, message: "Listing deleted." });
-}   
+}
