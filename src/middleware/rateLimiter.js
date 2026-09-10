@@ -31,3 +31,12 @@ export const anonUploadLimiter = rateLimit({
   legacyHeaders: false,
   message: { success: false, message: "Too many uploads. Please try again later." },
 });
+
+export const helpRequestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.id || req.ip,
+  message: { success: false, message: "Too many requests. Please wait a bit before trying again." },
+});

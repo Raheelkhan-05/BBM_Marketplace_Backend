@@ -114,10 +114,11 @@ async function autoSaveSellerDefaults(sellerId, body) {
 // notification type so the frontend doesn't need to special-case it, and
 // the same real-time channel (notifySellerSubmissionsChanged) used
 // everywhere else for live seller-side sync.
+
 async function notifySellerListingLive(sellerId, submissionId, displayName) {
     if (!sellerId) return;
     await notifyUser(sellerId, {
-        type: "listing_approved",
+        type: "listing_live_auto", // was "listing_approved" — see badge-exclusion note in notificationTypes.js
         title: "Your product listing is live",
         message: `"${displayName}" is an already-approved product on the marketplace, so your listing for it is live immediately.`,
         link: `/home?highlight=${submissionId}`,
