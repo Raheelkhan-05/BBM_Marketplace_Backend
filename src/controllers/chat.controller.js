@@ -32,7 +32,6 @@ function deriveStatus(message, otherParticipants) {
 }
 
 // ---- conversations --------------------------------------------
-
 export async function listConversations(req, res) {
     const userId = req.user.id;
 
@@ -52,21 +51,38 @@ export async function listConversations(req, res) {
         .order("last_message_at", { ascending: false, nullsFirst: false });
     if (convErr) return res.status(500).json({ success: false, message: convErr.message });
 
+    // NEW: actual unread MESSAGE counts, not just a boolean. We already
+    // have each conversation's last_read_at watermark from myRows above —
+    // fetch every message in these conversations NOT sent by this user,
+    // then bucket-count per conversation against that watermark. This
+    // mirrors the same "count, not just a flag" upgrade Orders/Cart got.
+    const { data: candidateMessages } = await supabase
+        .from("chat_messages")
+        .select("conversation_id, created_at")
+        .in("conversation_id", convIds)
+        .neq("sender_id", userId)
+        .is("deleted_at", null);
+
+    const lastReadById = Object.fromEntries(myRows.map((r) => [r.conversation_id, r.last_read_at]));
+    const unreadCountById = {};
+    for (const m of candidateMessages || []) {
+        const threshold = lastReadById[m.conversation_id];
+        if (!threshold || new Date(m.created_at) > new Date(threshold)) {
+            unreadCountById[m.conversation_id] = (unreadCountById[m.conversation_id] || 0) + 1;
+        }
+    }
+
     const otherUserIds = [...new Set(
         convs.flatMap((c) => (c.is_group ? [] : [c.direct_user_a, c.direct_user_b]).filter((id) => id !== userId))
     )];
-    // Shop name only — never fetch/expose the personal profile name here.
     const { data: otherSellerProfiles } = otherUserIds.length
         ? await supabase.from("seller_profiles").select("user_id, display_name, logo_url").in("user_id", otherUserIds)
         : { data: [] };
     const shopById = Object.fromEntries((otherSellerProfiles || []).map((p) => [p.user_id, p]));
 
-    const myRowById = Object.fromEntries(myRows.map((r) => [r.conversation_id, r]));
-
     const conversations = convs.map((c) => {
-        const mine = myRowById[c.id];
-        const unread = c.last_message_at && (!mine.last_read_at || new Date(mine.last_read_at) < new Date(c.last_message_at));
         const otherId = c.is_group ? null : (c.direct_user_a === userId ? c.direct_user_b : c.direct_user_a);
+        const unreadCount = unreadCountById[c.id] || 0;
         return {
             id: c.id,
             isGroup: c.is_group,
@@ -77,7 +93,8 @@ export async function listConversations(req, res) {
             lastMessagePreview: c.last_message_preview,
             lastMessageIsMine: c.last_message_sender_id === userId,
             lastMessageAt: c.last_message_at,
-            unread: !!unread,
+            unreadCount,          // NEW
+            unread: unreadCount > 0, // kept for anything still reading the boolean
         };
     });
 

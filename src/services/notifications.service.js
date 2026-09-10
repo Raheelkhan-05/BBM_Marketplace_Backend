@@ -72,6 +72,14 @@ export async function notifyAdminSubmissionsChanged() {
     catch (err) { console.error("[notifications] admin submissions_changed emit failed:", err.message); }
 }
 
+// Distinct room from "admin-submissions" so an admin payments-queue page
+// can listen just for payment-proof / wallet-top-up activity without
+// refetching on every unrelated catalog submission change.
+export async function notifyAdminPaymentsChanged() {
+    try { getIO().to("admin-payments").emit("payments_changed", {}); }
+    catch (err) { console.error("[notifications] admin payments_changed emit failed:", err.message); }
+}
+
 // Distinct from notifySellerSubmissionsChanged (product listings) — this
 // is for the seller's own shop profile status changing (approve/reject/
 // pending_changes cleared). Kept as its own event name so a listener on
@@ -82,12 +90,4 @@ export async function notifySellerProfileChanged(userId) {
     if (!userId) return;
     try { getIO().to(`user:${userId}`).emit("seller_profile_changed", {}); }
     catch (err) { console.error("[notifications] seller_profile_changed emit failed:", err.message); }
-}
-
-// Distinct room from "admin-submissions" so an admin payments-queue page
-// can listen just for payment-proof activity without refetching on every
-// unrelated catalog submission change.
-export async function notifyAdminPaymentsChanged() {
-    try { getIO().to("admin-payments").emit("payments_changed", {}); }
-    catch (err) { console.error("[notifications] admin payments_changed emit failed:", err.message); }
 }

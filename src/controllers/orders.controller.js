@@ -1,6 +1,8 @@
 // controllers/orders.controller.js
 import { supabase } from "../config/supabase.js";
 import { notifyUser, notifyOrderChanged, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
+import { sendOrderUpdateWhatsApp } from "../services/whatsapp.service.js";
+import { notifyIfWalletJustBlocked } from "../services/walletNotifications.service.js";
 
 import { getRoadDistanceKm } from "../services/pincodeDistance.js";
 import { purchaseQtyToSaleUnitQty, saleUnitQtyToBaseUnits, getSaleUnit, saleUnitLabel, round2 } from "../../shared/packUnits.js";
@@ -277,7 +279,6 @@ export async function getOrderQuote(req, res) {
 }
 
 // POST /api/orders
-// POST /api/orders
 export async function placeOrder(req, res) {
     const buyerId = req.user.id;
     const {
@@ -353,9 +354,9 @@ export async function placeOrder(req, res) {
     }
 
     // ---------------------------------------------------------------
-    // NEW: compute the authoritative delivery estimate ONCE, here, using
-    // the exact same OSRM-backed estimateDeliveryDate() that powers the
-    // Buy Now quote screen — and pass it straight into the RPC instead of
+    // Compute the authoritative delivery estimate ONCE, here, using the
+    // exact same OSRM-backed estimateDeliveryDate() that powers the Buy
+    // Now quote screen — and pass it straight into the RPC instead of
     // letting the RPC compute its own (haversine-based, different) date.
     // This guarantees the date the buyer saw on the quote matches the
     // date stored on the confirmed order.
@@ -403,7 +404,7 @@ export async function placeOrder(req, res) {
         p_transport_mode: transportMode || null,
         p_transport_company: transportCompany || null,
         p_transport_details: transportDetails || null,
-        p_estimated_delivery_date: estDeliveryDateISO, // NEW
+        p_estimated_delivery_date: estDeliveryDateISO,
         p_estimated_delivery_date_max: estDeliveryDateMaxISO,
     });
 
@@ -417,6 +418,27 @@ export async function placeOrder(req, res) {
     if (!row) {
         console.error("place_order RPC returned no row", { submissionId, orderType: safeOrderType, data });
         return res.status(500).json({ success: false, message: "Couldn't place the order — please try again." });
+    }
+
+    // WhatsApp acknowledgement to the buyer — sent regardless of whether
+    // the order lands straight in awaiting_payment or is already
+    // confirmed, so a buyer who isn't in the app right now still knows
+    // it went through. Best-effort: failures here never affect the API
+    // response below.
+    {
+        const { data: buyerProfile } = await supabase
+            .from("profiles").select("name, phone").eq("id", buyerId).maybeSingle();
+        if (buyerProfile?.phone) {
+            await sendOrderUpdateWhatsApp({
+                to: buyerProfile.phone,
+                name: buyerProfile.name,
+                headline: `Your order #${row.order_number} has been placed successfully.`,
+                detail: row.order_status === "awaiting_payment"
+                    ? "Please complete your payment to confirm this order."
+                    : `Estimated delivery: ${row.estimated_delivery_date || "will be shared soon"}.`,
+                footer: "Track your order anytime in the app.",
+            });
+        }
     }
 
     if (row.order_status !== "awaiting_payment") {
@@ -435,9 +457,17 @@ export async function placeOrder(req, res) {
             if (sellerProfile) {
                 await notifyUserOrdersChanged(sellerProfile.user_id);
             }
-        }
 
-        await supabase.rpc("wallet_accrue_commission", { p_order_id: row.order_id });
+            await supabase.rpc("wallet_accrue_commission", { p_order_id: row.order_id });
+
+            // Commission was JUST accrued above — check right now whether
+            // that push tipped this seller's wallet over the blocking
+            // threshold. Node never computes the balance itself, so this
+            // re-read is the only way to know.
+            if (sellerProfile) {
+                await notifyIfWalletJustBlocked({ sellerId: submission.seller_id, sellerUserId: sellerProfile.user_id });
+            }
+        }
     }
 
     res.json({
@@ -511,6 +541,16 @@ export async function cancelMyOrder(req, res) {
     await supabase.rpc("wallet_reverse_commission", { p_order_id: req.params.id });
 
     if (row?.notify_user_id) {
+        // row.notify_user_id here is the SELLER's user id (the buyer
+        // cancelled, seller gets told) — reuse it for the wallet re-check,
+        // since reversing commission can pull a seller back under the
+        // blocking threshold.
+        const { data: orderForWallet } = await supabase
+            .from("orders").select("seller_id").eq("id", req.params.id).maybeSingle();
+        if (orderForWallet?.seller_id) {
+            await notifyIfWalletJustBlocked({ sellerId: orderForWallet.seller_id, sellerUserId: row.notify_user_id });
+        }
+
         await notifyUser(row.notify_user_id, {
             type: "order_status_cancelled",
             title: `Order ${row.order_number} cancelled`,

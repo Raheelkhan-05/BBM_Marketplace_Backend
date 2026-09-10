@@ -1,6 +1,7 @@
 // controllers/wallet.controller.js
 import { supabase } from "../config/supabase.js";
 import { notifyAdmins, notifyAdminPaymentsChanged } from "../services/notifications.service.js";
+import { notifyIfWalletJustBlocked } from "../services/walletNotifications.service.js";
 
 // GET /api/seller/wallet — dashboard summary for the logged-in seller
 export async function getWalletStatus(req, res) {
@@ -21,7 +22,7 @@ export async function getWalletTransactions(req, res) {
     res.json({ success: true, transactions: data || [] });
 }
 
-// NEW — GET /api/seller/wallet/payment-instructions?amount=1000
+// GET /api/seller/wallet/payment-instructions?amount=1000
 // Dummy-payment QR details for a wallet top-up, mirroring the shape
 // fetchPaymentInstructions returns for order payments (vpa, payeeName,
 // note, upiUri) — but built from platform_settings directly since a
@@ -48,8 +49,8 @@ export async function getWalletPaymentInstructions(req, res) {
 }
 
 // POST /api/seller/wallet/payments — seller submits proof of payment
-// UPDATED — now accepts an optional multipart screenshot (req.file) in
-// addition to amount/utr, same shape as the order payment-proof upload.
+// Accepts an optional multipart screenshot (req.file) in addition to
+// amount/utr, same shape as the order payment-proof upload.
 // TODO(confirm): this assumes a shared screenshot-storage helper exists
 // (the same one paymentProof.controller.js's submitPaymentProof uses for
 // order payments) — swap `uploadPaymentScreenshot` below for whatever
@@ -110,8 +111,6 @@ export async function listWalletPayments(req, res) {
 // ---- Admin-side (mount under an admin-guarded router) ----
 
 // GET /api/admin/wallet/payments?status=pending
-// UPDATED — now also embeds screenshot_url + the seller's own UTR history
-// context needed for the unified admin verification UI.
 export async function adminListWalletPayments(req, res) {
     const { status = "pending" } = req.query;
     const { data, error } = await supabase
@@ -137,6 +136,22 @@ export async function adminVerifyWalletPayment(req, res) {
         return res.status(error.message === "PAYMENT_NOT_FOUND" ? 404 : 500)
             .json({ success: false, message: error.message === "PAYMENT_NOT_FOUND" ? "Payment not found or already processed." : "Couldn't verify payment." });
     }
+
+    if (approve) {
+        // Top-up was just applied — re-check right now whether this
+        // seller crossed back OUT of blocked, so the flag clears
+        // immediately rather than waiting for their next order event.
+        const { data: payment } = await supabase
+            .from("wallet_payments").select("seller_id").eq("id", req.params.id).maybeSingle();
+        if (payment?.seller_id) {
+            const { data: sellerProfile } = await supabase
+                .from("seller_profiles").select("user_id").eq("id", payment.seller_id).maybeSingle();
+            if (sellerProfile?.user_id) {
+                await notifyIfWalletJustBlocked({ sellerId: payment.seller_id, sellerUserId: sellerProfile.user_id });
+            }
+        }
+    }
+
     res.json({ success: true, message: approve ? "Payment verified — credits added." : "Payment rejected." });
 }
 

@@ -12,6 +12,8 @@
 //   router.post("/admin/payment-proofs/:id/reject", requireAdmin, rejectPayment);
 import { supabase } from "../config/supabase.js";
 import { notifyUser, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
+import { sendOrderUpdateWhatsApp } from "../services/whatsapp.service.js";
+import { notifyIfWalletJustBlocked } from "../services/walletNotifications.service.js";
 
 const VERIFY_ERROR_MAP = {
     PROOF_NOT_FOUND: { status: 404, message: "Payment proof not found." },
@@ -115,14 +117,23 @@ export async function verifyPayment(req, res) {
     }
 
     for (const orderId of orderIds) {
-        await supabase.rpc("wallet_accrue_commission", { p_order_id: orderId });
-
+        // Fetch BEFORE accruing so we have seller_id/seller_user_id ready
+        // for both the in-app notify below and the wallet re-check.
         const { data: order } = await supabase
             .from("orders")
-            .select("order_number, seller:seller_profiles ( user_id )")
+            .select("order_number, seller_id, seller:seller_profiles ( user_id )")
             .eq("id", orderId)
             .maybeSingle();
         const sellerUserId = order?.seller?.user_id;
+
+        await supabase.rpc("wallet_accrue_commission", { p_order_id: orderId });
+
+        // Commission was JUST accrued above — check right now whether that
+        // push tipped this seller's wallet over the blocking threshold.
+        if (order?.seller_id && sellerUserId) {
+            await notifyIfWalletJustBlocked({ sellerId: order.seller_id, sellerUserId });
+        }
+
         if (sellerUserId) {
             await notifyUser(sellerUserId, {
                 type: "order_placed",
@@ -131,6 +142,20 @@ export async function verifyPayment(req, res) {
                 link: `/seller/orders/${orderId}`,
             });
             await notifyUserOrdersChanged(sellerUserId);
+
+            // WhatsApp fallback for sellers not currently in the app —
+            // best-effort, never blocks the response below.
+            const { data: sellerProfile } = await supabase
+                .from("profiles").select("name, phone").eq("id", sellerUserId).maybeSingle();
+            if (sellerProfile?.phone) {
+                await sendOrderUpdateWhatsApp({
+                    to: sellerProfile.phone,
+                    name: sellerProfile.name,
+                    headline: `Payment confirmed for order #${order.order_number}.`,
+                    detail: "This order is now waiting for your confirmation.",
+                    footer: "Please confirm or reject it soon in Sales Orders so the buyer isn't kept waiting.",
+                });
+            }
         }
     }
 

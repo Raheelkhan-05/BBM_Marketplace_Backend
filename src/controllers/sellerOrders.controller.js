@@ -1,28 +1,30 @@
-// controllers/sellerOrders.controller.js — PATCH: de-duplicate notifications
+// controllers/sellerOrders.controller.js
 //
-// CHANGED: transitionHandler no longer calls notifyUser(...) after a
-// successful RPC call. update_order_status already inserts the buyer-facing
-// notification row itself (its final `insert into notifications` block —
-// the `else` branch, since actor_role here is always 'seller'). The
-// controller's notifyUser(...) call duplicated that with a second, shorter
-// notification for the same status change.
+// transitionHandler no longer calls notifyUser(...) a second time for the
+// same status change — update_order_status already inserts the buyer-facing
+// notification row itself. notifyOrderChanged/notifyUserOrdersChanged are
+// KEPT: both are realtime channel broadcasts, not notifications-table rows.
 //
-// Also fixed: the broadcast/notify block previously ran even when the RPC
-// itself errored (it sat after the `if (error) return ...` check already —
-// that part was correct — no change needed there, only the duplicate
-// removal). notifyOrderChanged and notifyUserOrdersChanged are KEPT: both
-// are realtime channel broadcasts, not notifications-table rows.
-//
-// NEW (this pass): listSellerOrders was missing transport_mode/
-// transport_company/transport_details/transport_source — the seller's
-// order list/detail views had no way to show the transport preference
-// that was agreed with the buyer, even though it's already snapshotted
-// onto every order row. getSellerOrder already had it via `select("*")`.
-//
-// listSellerOrders and getSellerOrder are otherwise unchanged, reproduced
-// for completeness so this is a drop-in replacement.
+// NEW: every transition now also sends a WhatsApp update to the buyer
+// (confirmed/rejected/processing/shipped/delivered all fall out of this
+// same handler), and the "rejected" transition re-checks the seller's
+// wallet after reversing commission, since a reversal can pull them back
+// under the blocking threshold.
 import { supabase } from "../config/supabase.js";
 import { notifyOrderChanged, notifyUserOrdersChanged, notifyUser } from "../services/realtimeBroadcast.js";
+import { sendOrderUpdateWhatsApp } from "../services/whatsapp.service.js";
+import { notifyIfWalletJustBlocked } from "../services/walletNotifications.service.js";
+
+function whatsappHeadlineForStatus(newStatus, orderNumber) {
+    const map = {
+        confirmed: `Your order #${orderNumber} has been confirmed by the seller.`,
+        rejected: `Your order #${orderNumber} was rejected by the seller.`,
+        processing: `Your order #${orderNumber} is now being processed.`,
+        shipped: `Your order #${orderNumber} has been shipped.`,
+        delivered: `Your order #${orderNumber} has been delivered.`,
+    };
+    return map[newStatus] || `Your order #${orderNumber} status changed to ${newStatus.replace("_", " ")}.`;
+}
 
 // GET /api/seller/orders
 export async function listSellerOrders(req, res) {
@@ -75,7 +77,19 @@ function transitionHandler(newStatus) {
             return res.status(status).json({ success: false, code: error.message, message: status === 400 ? "That status change isn't allowed right now." : "Couldn't update the order." });
         }
 
-        if (newStatus === "rejected") { await supabase.rpc("wallet_reverse_commission", { p_order_id: req.params.id }); }
+        if (newStatus === "rejected") {
+            await supabase.rpc("wallet_reverse_commission", { p_order_id: req.params.id });
+
+            // Reversing commission can pull a seller back UNDER the
+            // threshold — re-check so the blocked flag clears (and the
+            // seller is told, on the next block cycle) the moment that
+            // happens, not just on their next top-up.
+            const { data: orderForWallet } = await supabase
+                .from("orders").select("seller_id").eq("id", req.params.id).maybeSingle();
+            if (orderForWallet?.seller_id) {
+                await notifyIfWalletJustBlocked({ sellerId: orderForWallet.seller_id, sellerUserId: req.sellerId });
+            }
+        }
 
         const row = Array.isArray(data) ? data[0] : data;
 
@@ -88,6 +102,27 @@ function transitionHandler(newStatus) {
                 link: `/orders/${req.params.id}`,
             });
             await notifyUserOrdersChanged(row.notify_user_id);
+
+            // WhatsApp fallback for buyers not currently in the app —
+            // covers confirmed/rejected/processing/shipped/delivered, all
+            // through this one handler. Best-effort, never blocks the
+            // response below.
+            const { data: orderRow } = await supabase
+                .from("orders")
+                .select("buyer_contact_name, buyer_contact_phone")
+                .eq("id", req.params.id)
+                .maybeSingle();
+            if (orderRow?.buyer_contact_phone) {
+                await sendOrderUpdateWhatsApp({
+                    to: orderRow.buyer_contact_phone,
+                    name: orderRow.buyer_contact_name,
+                    headline: whatsappHeadlineForStatus(newStatus, row.order_number),
+                    detail: reason || "",
+                    footer: newStatus === "rejected"
+                        ? "Contact support if you have questions about this order."
+                        : "Track your order anytime in the app.",
+                });
+            }
         }
         res.json({ success: true, message: `Order marked as ${newStatus.replace("_", " ")}.` });
     };
