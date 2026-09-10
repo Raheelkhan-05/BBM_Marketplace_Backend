@@ -92,7 +92,11 @@ async function estimateTransitDayRange(originPincode, originState, destPincode, 
     return daysFromDistance(km);
 }
 
-async function estimateDeliveryDate(submission, buyerPincode, buyerState) {
+// ---------------------------------------------------------------------
+// Distance-based transit estimate — unchanged, plus acceptanceDelayDays
+// now folds into the total before building dateMin/dateMax.
+// ---------------------------------------------------------------------
+async function estimateDeliveryDate(submission, buyerPincode, buyerState, acceptanceDelayDays = 0) {
     const leadDays = submission.stock_type === "made_to_order"
         ? Number(submission.production_lead_time_days || 0)
         : Number(submission.dispatch_time_days ?? submission.lead_time ?? 0);
@@ -104,19 +108,44 @@ async function estimateDeliveryDate(submission, buyerPincode, buyerState) {
         buyerState
     );
 
-    const dateMin = new Date();
-    dateMin.setDate(dateMin.getDate() + leadDays + transitMin);
-    const dateMax = new Date();
-    dateMax.setDate(dateMax.getDate() + leadDays + transitMax);
+    const totalMin = acceptanceDelayDays + leadDays + transitMin;
+    const totalMax = acceptanceDelayDays + leadDays + transitMax;
 
-    const label = transitMin === transitMax
+    const dateMin = new Date();
+    dateMin.setDate(dateMin.getDate() + totalMin);
+    const dateMax = new Date();
+    dateMax.setDate(dateMax.getDate() + totalMax);
+
+    // Same floor/ceil-range convention as the existing transit range: if
+    // the total isn't a single fixed number, show it as a range.
+    const label = totalMin === totalMax
         ? formatDDMon(dateMin)
         : `${formatDDMon(dateMin)} - ${formatDDMon(dateMax)}`;
 
     return {
         dateMin, dateMax, label,
-        leadDays, transitDaysMin: transitMin, transitDaysMax: transitMax,
+        acceptanceDelayDays,
+        leadDays,
+        transitDaysMin: transitMin,
+        transitDaysMax: transitMax,
     };
+}
+
+// Small helper so getOrderQuote / placeOrder don't duplicate the
+// "fetch seller working profile -> checkOrderWindow" plumbing.
+async function getAcceptanceWindow(submissionId, now = new Date()) {
+    const { data } = await supabase
+        .from("seller_product_submissions")
+        .select("seller:seller_profiles!seller_product_submissions_seller_id_fkey ( working_days, order_acceptance_start, order_acceptance_end, holidays )")
+        .eq("id", submissionId)
+        .maybeSingle();
+
+    return checkOrderWindow({
+        workingDays: data?.seller?.working_days,
+        orderAcceptanceStart: data?.seller?.order_acceptance_start,
+        orderAcceptanceEnd: data?.seller?.order_acceptance_end,
+        holidays: data?.seller?.holidays,
+    }, now);
 }
 
 function toBaseUnits(submission, quantity, purchaseBasis) {
@@ -212,14 +241,23 @@ export async function getOrderQuote(req, res) {
     const saleQty = purchaseQtyToSaleUnitQty(qty, purchaseBasis, submission.pack_size, submission.units_per_master_pack);
     const baseQty = saleUnitQtyToBaseUnits(saleQty, submission.pack_size, submission.units_per_master_pack);
 
-    const packQty = toPackQty(submission, qty, purchaseBasis);
-
     let addressPincode = null, addressState = null;
     if (addressId) {
         const { data: addr } = await supabase.from("buyer_addresses").select("pincode, state").eq("id", addressId).maybeSingle();
         if (addr) { addressPincode = addr.pincode; addressState = addr.state; }
     }
-    const delivery = await estimateDeliveryDate(submission, addressPincode, addressState);
+
+    // NOTE: window is now purely informational — never gates the quote or
+    // the eventual order. It only pushes the delivery estimate out.
+    const acceptanceWindow = await getAcceptanceWindow(submissionId);
+    const delivery = await estimateDeliveryDate(submission, addressPincode, addressState, acceptanceWindow.delayDays);
+
+    const acceptanceInfo = {
+        acceptingNow: acceptanceWindow.open,
+        acceptanceMessage: acceptanceWindow.message || null,
+        acceptanceDelayDays: acceptanceWindow.delayDays,
+        acceptanceWindowLabel: acceptanceWindow.windowLabel || null,
+    };
 
     if (isSample) {
         if (!submission.sample_available) return res.status(400).json({ success: false, message: "This seller doesn't offer a sample for this item." });
@@ -235,11 +273,11 @@ export async function getOrderQuote(req, res) {
             exceedsSampleQuantity: exceedsSample,
             estimatedDeliveryDate: delivery.label,
             leadDays: delivery.leadDays, transitDaysMin: delivery.transitDaysMin, transitDaysMax: delivery.transitDaysMax,
+            ...acceptanceInfo,
         });
     }
 
     const pricePerSaleUnit = Number(submission.price);
-
     const { price: slabPrice, slab: appliedSlab } = resolveSlabUnitPrice(submission.price_slabs, saleQty, pricePerSaleUnit);
     const { percent: discountPercent, tier: discountTier } = resolveDiscountPercent(submission.quantity_discounts, saleQty);
     const unitPrice = round2(slabPrice * (1 - discountPercent / 100));
@@ -251,10 +289,6 @@ export async function getOrderQuote(req, res) {
     const subtotal = round2(unitPrice * saleQty);
     const platformFee = round2(subtotal * commissionPercent / 100);
 
-    // Stock is now a hard cap, not just a warning: exceedsStock means the
-    // buyer literally cannot place this order at this quantity. The
-    // frontend uses this (together with availableStock) to disable the
-    // submit buttons and show "Only N available" — see BuyNowModal.
     const { exceedsStock, availableStock } = checkStockLimit(submission, saleQty);
     const outOfStock = submission.stock_type === "ready_stock"
         && submission.stock_quantity != null
@@ -268,13 +302,15 @@ export async function getOrderQuote(req, res) {
         saleUnit: getSaleUnit(submission.units_per_master_pack),
         saleUnitLabel: saleUnitLabel(submission.units_per_master_pack),
         purchaseBasis, quantity: qty, saleUnitQuantity: saleQty,
-        estimatedDeliveryDate: delivery.label, leadDays: delivery.leadDays,
+        estimatedDeliveryDate: delivery.label,
+        leadDays: delivery.leadDays,
         transitDaysMin: delivery.transitDaysMin, transitDaysMax: delivery.transitDaysMax,
         availableStock, subtotal,
         platformFeePercent: commissionPercent, platformFeeAmount: platformFee, sellerPayoutAmount: subtotal - platformFee,
         meetsMoq: saleQty >= Number(submission.moq),
         exceedsStock,
         outOfStock,
+        ...acceptanceInfo,
     });
 }
 
@@ -302,26 +338,18 @@ export async function placeOrder(req, res) {
         if (blockMsg) return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: blockMsg });
     }
 
-    // Hard re-check of order window + delivery serviceability — the UI
-    // already disables the buttons for this; this is the last line of
-    // defense against client clock skew, a stale page, or a direct API call.
+    // Location serviceability is still a HARD block — a seller who
+    // genuinely doesn't ship to this state/city can't fulfill the order.
+    // Order-window/hours is NO LONGER checked here as a block — see
+    // estimateDeliveryDate below, which is where "seller currently closed"
+    // now shows up (as extra days on the estimate) instead.
     const { data: constraintRow } = await supabase
         .from("seller_product_submissions")
-        .select("dispatching_locations, seller:seller_profiles!seller_product_submissions_seller_id_fkey ( working_days, order_acceptance_start, order_acceptance_end, holidays )")
+        .select("dispatching_locations")
         .eq("id", submissionId)
         .maybeSingle();
 
     if (constraintRow) {
-        const windowCheck = checkOrderWindow({
-            workingDays: constraintRow.seller?.working_days,
-            orderAcceptanceStart: constraintRow.seller?.order_acceptance_start,
-            orderAcceptanceEnd: constraintRow.seller?.order_acceptance_end,
-            holidays: constraintRow.seller?.holidays,
-        });
-        if (!windowCheck.open) {
-            return res.status(400).json({ success: false, code: windowCheck.reason, message: windowCheck.message });
-        }
-
         const { data: address } = await supabase.from("buyer_addresses").select("state, city").eq("id", shippingAddressId).maybeSingle();
         const locationCheck = checkLocationServiceable(constraintRow.dispatching_locations, address);
         if (!locationCheck.serviceable) {
@@ -354,16 +382,18 @@ export async function placeOrder(req, res) {
     }
 
     // ---------------------------------------------------------------
-    // Compute the authoritative delivery estimate ONCE, here, using the
-    // exact same OSRM-backed estimateDeliveryDate() that powers the Buy
-    // Now quote screen — and pass it straight into the RPC instead of
-    // letting the RPC compute its own (haversine-based, different) date.
-    // This guarantees the date the buyer saw on the quote matches the
-    // date stored on the confirmed order.
+    // Authoritative delivery estimate: acceptance delay (server clock,
+    // computed fresh here — never trust whatever the client last saw)
+    // + lead time + transit, all folded together into one final date
+    // range, exactly the same shape the quote screen showed.
     // ---------------------------------------------------------------
     let estDeliveryDateISO = null;
     let estDeliveryDateMaxISO = null;
+    let acceptanceDelayDaysUsed = 0;
     {
+        const acceptanceWindow = await getAcceptanceWindow(submissionId);
+        acceptanceDelayDaysUsed = acceptanceWindow.delayDays;
+
         const { data: submissionForDelivery } = await supabase
             .from("seller_product_submissions")
             .select("stock_type, production_lead_time_days, dispatch_time_days, lead_time, dispatch_pincode, dispatch_state")
@@ -378,15 +408,10 @@ export async function placeOrder(req, res) {
 
         if (submissionForDelivery && shippingAddress) {
             try {
-                const delivery = await estimateDeliveryDate(submissionForDelivery, shippingAddress.pincode, shippingAddress.state);
-                // dateMin is the earlier end of whatever range the quote
-                // screen showed — using it means the stored date is never
-                // later than what the buyer saw before confirming.
+                const delivery = await estimateDeliveryDate(submissionForDelivery, shippingAddress.pincode, shippingAddress.state, acceptanceDelayDaysUsed);
                 estDeliveryDateISO = delivery.dateMin.toISOString().slice(0, 10);
                 estDeliveryDateMaxISO = delivery.dateMax.toISOString().slice(0, 10);
             } catch (err) {
-                // Don't let a routing/estimation failure block order placement —
-                // the RPC has its own +3-day fallback if this stays null.
                 console.error("estimateDeliveryDate failed during placeOrder:", err?.message || err);
             }
         }
@@ -581,6 +606,13 @@ export async function getOrderConstraints(req, res) {
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!data) return res.status(404).json({ success: false, message: "Listing not available." });
 
+    const windowStatus = checkOrderWindow({
+        workingDays: data.seller?.working_days,
+        orderAcceptanceStart: data.seller?.order_acceptance_start,
+        orderAcceptanceEnd: data.seller?.order_acceptance_end,
+        holidays: data.seller?.holidays,
+    });
+
     res.json({
         success: true,
         dispatchingLocations: data.dispatching_locations || [],
@@ -588,5 +620,10 @@ export async function getOrderConstraints(req, res) {
         orderAcceptanceStart: data.seller?.order_acceptance_start || null,
         orderAcceptanceEnd: data.seller?.order_acceptance_end || null,
         holidays: data.seller?.holidays || [],
+        // pre-computed so the frontend doesn't need to reimplement the
+        // "next open day" scan just to render the notice
+        acceptingNow: windowStatus.open,
+        acceptanceDelayDays: windowStatus.delayDays,
+        acceptanceMessage: windowStatus.message || null,
     });
 }

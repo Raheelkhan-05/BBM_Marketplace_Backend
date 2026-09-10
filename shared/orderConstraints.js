@@ -1,33 +1,27 @@
 // shared/orderConstraints.js
 //
-// Two independent gates on placing an order with a seller:
-//  1. checkOrderWindow  — is it within the seller's working days + hours (IST)?
-//  2. checkLocationServiceable — does the seller deliver to the buyer's state/city?
+// checkOrderWindow no longer represents a hard "can this be placed" gate —
+// it now tells you (a) whether the seller is accepting RIGHT NOW, and
+// (b) if not, how many whole days that pushes acceptance out by. Callers
+// use `delayDays` to push the estimated delivery date forward — they must
+// NEVER use this to block order placement anymore (this is an online
+// marketplace; a closed shop just means "we'll get to it a bit later").
 //
-// Both fail OPEN when data is missing/unconfigured — same posture as
-// assertSellerAcceptingOrders() in orders.controller.js. A missing config
-// should never silently block every seller who hasn't filled the field in.
+// checkLocationServiceable is UNCHANGED and still a hard block — a seller
+// who doesn't ship to a state/city genuinely cannot fulfill that order,
+// which is a different kind of problem than "not open right now".
 
 const IST_OFFSET_MINUTES = 5 * 60 + 30;
 const DAY_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
 const DAY_ABBR = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
-// Converts any Date (an absolute instant — Date.getTime() is already UTC,
-// regardless of the host machine's own timezone) into its IST wall-clock
-// parts, by shifting the instant forward by +5:30 and reading it back with
-// the UTC getters. Do NOT add date.getTimezoneOffset() here — that's only
-// needed when building a Date from local wall-clock components, not when
-// you already have a real instant; adding it on top of the IST shift
-// silently cancels the shift out on any machine whose own timezone happens
-// to be IST, which makes the check compute UTC time and label it IST —
-// i.e. every check ends up off by exactly 5 hours 30 minutes.
 export function getISTParts(date = new Date()) {
     const ist = new Date(date.getTime() + IST_OFFSET_MINUTES * 60000);
     return {
-        dayOfWeek: ist.getUTCDay(), // 0=Sunday ... 6=Saturday (IST)
+        dayOfWeek: ist.getUTCDay(),
         hours: ist.getUTCHours(),
         minutes: ist.getUTCMinutes(),
-        isoDate: ist.toISOString().slice(0, 10), // YYYY-MM-DD in IST
+        isoDate: ist.toISOString().slice(0, 10),
     };
 }
 
@@ -35,9 +29,6 @@ function normalizeDayToken(token) {
     return String(token ?? "").trim().toLowerCase();
 }
 
-// Accepts weekday names ("Monday"/"Mon") or 0-6 indices. Returns null
-// (= no restriction) when working_days is empty/unset, matching the
-// column's '[]' default.
 function workingDaysToIndexSet(workingDays) {
     if (!Array.isArray(workingDays) || workingDays.length === 0) return null;
     const set = new Set();
@@ -66,9 +57,6 @@ function formatTimeLabel(t) {
     return `${h12}:${String(m || 0).padStart(2, "0")} ${period}`;
 }
 
-// sellerProfile: { workingDays, orderAcceptanceStart, orderAcceptanceEnd, holidays }
-// `now`: pass the caller's own Date — client Date() for instant UI feedback,
-// server `new Date()` for the authoritative re-check on submit.
 const DAY_LABELS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 const MONTH_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
@@ -77,12 +65,6 @@ function formatIsoDateLabel(isoDate) {
     return `${d} ${MONTH_SHORT[m - 1]}`;
 }
 
-// Scans forward day-by-day (IST calendar days) starting from `fromDate`
-// itself (offset 0) looking for the next day that's both a working day
-// and not a holiday. This is what lets the message correctly skip past
-// non-working days AND holidays together — a seller open Mon/Wed/Fri who
-// also happens to have Wednesday marked as a holiday will correctly be
-// told Friday, not Wednesday.
 function findNextOpenDay(workingDaysSet, holidays, fromDate, maxDaysAhead = 21) {
     for (let offset = 0; offset <= maxDaysAhead; offset++) {
         const ist = getISTParts(new Date(fromDate.getTime() + offset * 86400000));
@@ -93,15 +75,29 @@ function findNextOpenDay(workingDaysSet, holidays, fromDate, maxDaysAhead = 21) 
     return null;
 }
 
-// sellerProfile: { workingDays, orderAcceptanceStart, orderAcceptanceEnd, holidays }
-// `now`: pass the caller's own Date — client Date() for instant UI feedback,
-// server `new Date()` for the authoritative re-check on submit.
+/**
+ * sellerProfile: { workingDays, orderAcceptanceStart, orderAcceptanceEnd, holidays }
+ * `now`: client Date() for instant UI feedback, server `new Date()` for the
+ * authoritative computation used to build the final delivery estimate.
+ *
+ * Returns:
+ *   {
+ *     open: boolean,          // accepting orders RIGHT NOW
+ *     delayDays: number,      // whole days this pushes acceptance out by (0 if open)
+ *     reason?: string,
+ *     message?: string,       // buyer-facing "accepted then" copy — informational, non-blocking
+ *     windowLabel?: string,   // "9:00 AM–6:00 PM IST"
+ *   }
+ *
+ * NEVER use `open === false` to block placement — only to decide whether
+ * to show the informational notice and to compute delayDays.
+ */
 export function checkOrderWindow(sellerProfile, now = new Date()) {
-    if (!sellerProfile) return { open: true };
+    if (!sellerProfile) return { open: true, delayDays: 0 };
 
     const { workingDays, orderAcceptanceStart, orderAcceptanceEnd, holidays } = sellerProfile;
     const holidayList = Array.isArray(holidays) ? holidays : [];
-    const dayIndexSet = workingDaysToIndexSet(workingDays); // null = no restriction, every day is a working day
+    const dayIndexSet = workingDaysToIndexSet(workingDays);
     const ist = getISTParts(now);
 
     const startMin = parseTimeToMinutes(orderAcceptanceStart);
@@ -113,26 +109,26 @@ export function checkOrderWindow(sellerProfile, now = new Date()) {
     const isWorkingDayToday = !dayIndexSet || dayIndexSet.has(ist.dayOfWeek);
     const withinTimeWindow = !hasTimeWindow || (startMin <= endMin
         ? (nowMin >= startMin && nowMin <= endMin)
-        : (nowMin >= startMin || nowMin <= endMin)); // overnight window e.g. 22:00–06:00
+        : (nowMin >= startMin || nowMin <= endMin));
 
     if (isWorkingDayToday && !isHolidayToday && withinTimeWindow) {
-        return { open: true };
+        return { open: true, delayDays: 0 };
     }
 
     const windowLabel = hasTimeWindow ? `${formatTimeLabel(orderAcceptanceStart)}–${formatTimeLabel(orderAcceptanceEnd)} IST` : null;
 
-    // Still today, a real working day, just before the window opens —
-    // the one case where "today" is actually the right answer.
+    // Still today, a working day, just before the window opens — order
+    // will be accepted later TODAY, so it doesn't push the date forward.
     if (isWorkingDayToday && !isHolidayToday && hasTimeWindow && nowMin < startMin) {
         return {
-            open: false, reason: "OUTSIDE_ORDER_HOURS",
-            message: `This seller opens today at ${formatTimeLabel(orderAcceptanceStart)} IST.`,
+            open: false,
+            delayDays: 0,
+            reason: "OUTSIDE_ORDER_HOURS",
+            message: `This seller is currently closed and opens today at ${formatTimeLabel(orderAcceptanceStart)} IST — your order will be placed now and accepted once they're open.`,
+            windowLabel,
         };
     }
 
-    // Every other closed case (non-working day, holiday, or today's window
-    // already passed) needs to say WHEN they're actually next open, not
-    // just repeat today's hours — that's what was misleading before.
     const closedTodayPrefix = isHolidayToday
         ? "This seller is on holiday today."
         : !isWorkingDayToday
@@ -141,10 +137,13 @@ export function checkOrderWindow(sellerProfile, now = new Date()) {
 
     const next = findNextOpenDay(dayIndexSet, holidayList, new Date(now.getTime() + 86400000));
     if (!next) {
-        // No working day found in the lookahead window — extremely unlikely
-        // (would mean 3+ weeks with no open day), but don't leave the UI
-        // hanging on a bad message if it somehow happens.
-        return { open: false, reason: "SELLER_CLOSED", message: `${closedTodayPrefix} Please check back later.` };
+        return {
+            open: false,
+            delayDays: 3, // conservative fallback — should basically never hit this path
+            reason: "SELLER_CLOSED",
+            message: `${closedTodayPrefix} Your order will still be placed, but acceptance may take a little longer than usual.`,
+            windowLabel,
+        };
     }
 
     const dayLabel = next.daysAhead === 0
@@ -155,25 +154,24 @@ export function checkOrderWindow(sellerProfile, now = new Date()) {
 
     return {
         open: false,
+        // next.daysAhead is relative to "now + 1 day" (that's the scan's
+        // start), so the actual day-count from *now* is daysAhead + 1.
+        delayDays: next.daysAhead + 1,
         reason: isHolidayToday ? "SELLER_ON_HOLIDAY" : (!isWorkingDayToday ? "NON_WORKING_DAY" : "OUTSIDE_ORDER_HOURS"),
-        message: `${closedTodayPrefix} They're next open ${dayLabel}${windowLabel ? `, ${windowLabel}.` : "."}`,
+        message: `${closedTodayPrefix} Your order will be placed now and accepted ${dayLabel}${windowLabel ? `, ${windowLabel}.` : "."}`,
+        windowLabel,
     };
 }
 
 function norm(s) { return String(s ?? "").trim().toLowerCase(); }
 
-// dispatchingLocations: the jsonb array from seller_product_submissions,
-// e.g. [{type:"country",...,includeOnly:true}, {type:"state",name:"Gujarat",includedCities:["JAMNAGAR","AHMADABAD"]}]
-// - No entries at all -> unconfigured, serviceable everywhere (fail open).
-// - No "state" entries -> only a country scope was set, no state narrowing.
-// - A "state" entry with includedCities -> only those cities in that state.
-// - A "state" entry with no includedCities -> the whole state.
+// UNCHANGED — location serviceability is still a hard block.
 export function checkLocationServiceable(dispatchingLocations, address) {
     if (!Array.isArray(dispatchingLocations) || dispatchingLocations.length === 0) {
         return { serviceable: true };
     }
     if (!address || (!address.state && !address.city)) {
-        return { serviceable: true }; // nothing picked yet — don't block before there's an address to check
+        return { serviceable: true };
     }
 
     const stateEntries = dispatchingLocations.filter((l) => norm(l.type) === "state");

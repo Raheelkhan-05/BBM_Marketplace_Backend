@@ -176,12 +176,7 @@ export async function checkoutCart(req, res) {
             .select("id, working_days, order_acceptance_start, order_acceptance_end, holidays")
             .in("id", uniqueSellerIds);
         const profileById = new Map((sellerProfiles || []).map((p) => [p.id, p]));
-        for (const sid of uniqueSellerIds) {
-            const windowCheck = checkOrderWindow(profileById.get(sid));
-            if (!windowCheck.open) {
-                return res.status(400).json({ success: false, code: windowCheck.reason, message: windowCheck.message });
-            }
-        }
+
     }
 
     if (submissionIds.length) {
