@@ -3,6 +3,27 @@ import { supabase } from "../config/supabase.js";
 import { emitToConversation } from "../socket/emit.js";
 import { notifyUser } from "../services/realtimeBroadcast.js";
 
+
+async function getBuyerInfoForSeller(buyerId) {
+    const [{ data: profile }, { data: bp }, { data: sp }] = await Promise.all([
+        supabase.from("profiles").select("name, phone, email, created_at").eq("id", buyerId).maybeSingle(),
+        supabase.from("business_profiles").select("legal_name, trade_name, gstin, district, state").eq("user_id", buyerId).maybeSingle(),
+        supabase.from("seller_profiles").select("logo_url").eq("user_id", buyerId).maybeSingle(), // NEW
+    ]);
+    if (!profile && !bp) return null;
+    return {
+        name: profile?.name || null,
+        phone: profile?.phone || null,
+        email: profile?.email || null,
+        memberSince: profile?.created_at || null,
+        businessName: bp?.trade_name || bp?.legal_name || null,
+        gstin: bp?.gstin || null,
+        location: [bp?.district, bp?.state].filter(Boolean).join(", ") || null,
+        logoUrl: sp?.logo_url || null, // NEW
+    };
+}
+
+
 // GET /api/credit/status
 // Three ways to call it:
 //   ?sellerId=<seller_profiles.id>        — buyer's perspective (BuyNowModal, where sellerId is already known)
@@ -27,20 +48,13 @@ export async function getCreditStatus(req, res) {
         if (!sp) return res.status(403).json({ success: false, message: "Not a seller." });
         query = query.eq("buyer_id", buyerId).eq("seller_id", sp.id);
         viewerRole = "seller";
+        // controllers/credit.controller.js — getCreditStatus, inside the otherUserId branch
     } else if (otherUserId) {
         const [{ data: meAsSeller }, { data: otherAsSeller }] = await Promise.all([
             supabase.from("seller_profiles").select("id").eq("user_id", req.user.id).maybeSingle(),
             supabase.from("seller_profiles").select("id").eq("user_id", otherUserId).maybeSingle(),
         ]);
 
-        // A user can be BOTH a seller themselves AND a buyer from someone
-        // else — `meAsSeller` being truthy doesn't mean *this* conversation
-        // is the one where they're the seller. Check both possible
-        // directions and use whichever one actually has a credit row,
-        // instead of assuming "has a seller_profiles row" == "is the seller
-        // here". This was the actual bug: it always took the seller branch
-        // when true, even when the real relationship for this chat was the
-        // other direction, silently querying the wrong row forever.
         const [sellerDirection, buyerDirection] = await Promise.all([
             meAsSeller
                 ? supabase.from("buyer_seller_credit").select("*").eq("buyer_id", otherUserId).eq("seller_id", meAsSeller.id).maybeSingle()
@@ -51,28 +65,35 @@ export async function getCreditStatus(req, res) {
         ]);
 
         if (sellerDirection.data) {
-            return res.json({ success: true, credit: sellerDirection.data, viewerRole: "seller" });
+            // NEW — this branch means req.user IS the seller, otherUserId is the buyer
+            const buyerInfo = await getBuyerInfoForSeller(otherUserId);
+            return res.json({ success: true, credit: sellerDirection.data, viewerRole: "seller", buyerInfo });
         }
         if (buyerDirection.data) {
             return res.json({ success: true, credit: buyerDirection.data, viewerRole: "buyer" });
         }
 
-        // Neither direction has a row yet (no request has ever been made).
-        // Default to whichever direction is actually possible — prefer
-        // "buyer" since requesting credit is the more common first action,
-        // but only if the other party can even receive one (is a seller).
+        // Neither direction has a row yet — still tell a seller-viewer who they'd be
+        // approving, even before any request exists, so the UI is consistent
+        // whenever a credit row does eventually appear.
         if (otherAsSeller) {
             return res.json({ success: true, credit: null, viewerRole: "buyer" });
         }
         if (meAsSeller) {
-            return res.json({ success: true, credit: null, viewerRole: "seller" });
+            const buyerInfo = await getBuyerInfoForSeller(otherUserId); // NEW
+            return res.json({ success: true, credit: null, viewerRole: "seller", buyerInfo });
         }
         return res.json({ success: true, credit: null, viewerRole: null });
     }
 
     const { data, error } = await query.maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
-    res.json({ success: true, credit: data || null, viewerRole });
+
+    let buyerInfo = null;
+    if (viewerRole === "seller" && data) {
+        buyerInfo = await getBuyerInfoForSeller(data.buyer_id);
+    }
+    res.json({ success: true, credit: data || null, viewerRole, buyerInfo });
 }
 
 export async function requestCredit(req, res) {
@@ -117,12 +138,18 @@ export async function requestCredit(req, res) {
         p_buyer_id: req.user.id, p_seller_id: sellerId, p_conversation_id: convId,
     });
     if (error) {
+        console.error("request_credit RPC failed:", error);
         const map = {
             ALREADY_APPROVED: "Credit is already approved for this seller.",
             ALREADY_PENDING: "A credit request is already pending.",
             COOLDOWN_ACTIVE: "You can request credit from this seller again after the cooldown period.",
         };
-        return res.status(400).json({ success: false, code: error.message, message: map[error.message] || "Couldn't send the request." });
+        const code = error.message; // Postgres RAISE EXCEPTION message becomes error.message via the RPC
+        return res.status(400).json({
+            success: false,
+            code: map[code] ? code : "REQUEST_FAILED",
+            message: map[code] || "Couldn't send the request. Please try again.",
+        });
     }
 
     const row = Array.isArray(data) ? data[0] : data;
@@ -132,18 +159,29 @@ export async function requestCredit(req, res) {
 
     emitToConversation(convId, "message:new", { ...message, status: "sent" });
 
+    // Freeze the OUTGOING request's final outcome onto its own message before
+    // request_message_id moves on to the new one — otherwise the old bubble
+    // has no way to distinguish "this was declined" from "this was turned
+    // off" from "I have no idea, guess I'll say Sent" once it's no longer
+    // the row's live pointer. This reuses the message:updated event/listener
+    // that transport_proposal's finalStatus already relies on — no new
+    // plumbing needed on the client.
+    if (row.previous_message_id && row.previous_status) {
+        const { data: prevMsg } = await supabase.from("chat_messages").select("metadata").eq("id", row.previous_message_id).maybeSingle();
+        const metadataPatch = { finalStatus: row.previous_status };
+        await supabase.from("chat_messages")
+            .update({ metadata: { ...(prevMsg?.metadata || {}), ...metadataPatch } })
+            .eq("id", row.previous_message_id);
+        emitToConversation(convId, "message:updated", { conversationId: convId, messageId: row.previous_message_id, metadataPatch });
+    }
 
-    // NEW: tell the seller's live thread a credit request just landed, so
-    // useCredit doesn't have to wait for a page refresh (its mount-time
-    // fetch) to learn about it. credit:decided/credit:toggled already
-    // update state live for later transitions — this covers the missing
-    // "just created" transition into "pending".
     emitToConversation(convId, "credit:requested", {
         conversationId: convId,
         creditId: row.credit_id,
         buyerId: req.user.id,
         sellerId,
         status: "pending",
+        buyerInfo: await getBuyerInfoForSeller(req.user.id),
     }, { excludeUserId: req.user.id });
 
     notifyUser(sellerUserId, {
