@@ -19,6 +19,31 @@ async function assertParticipant(conversationId, userId) {
     return !!data;
 }
 
+// Returns the seller_profiles row (if any) for a user_id, deleted_at
+// included — used to gate message-sending, not to hide the conversation.
+// A user can be a seller and be soft-deleted while still owning history
+// buyers need to see, so this is intentionally a lookup, not a filter.
+async function getSellerDeletionStatus(userId) {
+    const { data } = await supabase
+        .from("seller_profiles")
+        .select("user_id, deleted_at")
+        .eq("user_id", userId)
+        .maybeSingle();
+    return { isSeller: !!data, isDeleted: !!data?.deleted_at };
+}
+
+// For a 1:1 conversation, returns the other participant's user_id.
+// Groups have no single "other" party, so this only applies to direct chats.
+async function getOtherParticipantId(conversationId, userId) {
+    const { data } = await supabase
+        .from("chat_conversations")
+        .select("is_group, direct_user_a, direct_user_b")
+        .eq("id", conversationId)
+        .maybeSingle();
+    if (!data || data.is_group) return null;
+    return data.direct_user_a === userId ? data.direct_user_b : data.direct_user_a;
+}
+
 // derive sent/delivered/read for a message given the OTHER
 // participants' watermarks (group-safe: "read" only once every other
 // participant's last_read_at has passed the message).
@@ -51,11 +76,10 @@ export async function listConversations(req, res) {
         .order("last_message_at", { ascending: false, nullsFirst: false });
     if (convErr) return res.status(500).json({ success: false, message: convErr.message });
 
-    // NEW: actual unread MESSAGE counts, not just a boolean. We already
-    // have each conversation's last_read_at watermark from myRows above —
+    // actual unread MESSAGE counts, not just a boolean. We already have
+    // each conversation's last_read_at watermark from myRows above —
     // fetch every message in these conversations NOT sent by this user,
-    // then bucket-count per conversation against that watermark. This
-    // mirrors the same "count, not just a flag" upgrade Orders/Cart got.
+    // then bucket-count per conversation against that watermark.
     const { data: candidateMessages } = await supabase
         .from("chat_messages")
         .select("conversation_id, created_at")
@@ -75,26 +99,33 @@ export async function listConversations(req, res) {
     const otherUserIds = [...new Set(
         convs.flatMap((c) => (c.is_group ? [] : [c.direct_user_a, c.direct_user_b]).filter((id) => id !== userId))
     )];
+    // IMPORTANT: no `.is("deleted_at", null)` filter here — unlike the
+    // browse/search paths, a chat with a since-deleted seller still needs
+    // to render (shop name intact) so the buyer's message history isn't
+    // wiped or replaced with "Unknown seller". We fetch deleted_at instead
+    // so the UI can show the name AND flag it as deleted.
     const { data: otherSellerProfiles } = otherUserIds.length
-        ? await supabase.from("seller_profiles").select("user_id, display_name, logo_url").in("user_id", otherUserIds)
+        ? await supabase.from("seller_profiles").select("user_id, display_name, logo_url, deleted_at").in("user_id", otherUserIds)
         : { data: [] };
     const shopById = Object.fromEntries((otherSellerProfiles || []).map((p) => [p.user_id, p]));
 
     const conversations = convs.map((c) => {
         const otherId = c.is_group ? null : (c.direct_user_a === userId ? c.direct_user_b : c.direct_user_a);
         const unreadCount = unreadCountById[c.id] || 0;
+        const otherShop = c.is_group ? null : shopById[otherId];
         return {
             id: c.id,
             isGroup: c.is_group,
             title: c.is_group ? c.title : undefined,
-            otherShopName: c.is_group ? undefined : (shopById[otherId]?.display_name || "Unknown seller"),
-            otherShopLogo: c.is_group ? undefined : (shopById[otherId]?.logo_url || null),
+            otherShopName: c.is_group ? undefined : (otherShop?.display_name || "Unknown seller"),
+            otherShopLogo: c.is_group ? undefined : (otherShop?.logo_url || null),
             otherUserId: otherId,
+            otherIsDeletedSeller: c.is_group ? false : !!otherShop?.deleted_at, // NEW
             lastMessagePreview: c.last_message_preview,
             lastMessageIsMine: c.last_message_sender_id === userId,
             lastMessageAt: c.last_message_at,
-            unreadCount,          // NEW
-            unread: unreadCount > 0, // kept for anything still reading the boolean
+            unreadCount,
+            unread: unreadCount > 0,
         };
     });
 
@@ -124,13 +155,6 @@ export async function listMessages(req, res) {
     if (error) return res.status(500).json({ success: false, message: error.message });
 
     const hasMore = rows.length === MESSAGE_PAGE_SIZE;
-
-    // BUG FIX: the pagination cursor must come from the raw fetched page
-    // (its oldest row), independent of any per-user "delete for me"
-    // filtering below. The old code derived the cursor from the *filtered*
-    // array (`messages[0]`), so once a user had deleted even one message
-    // in a page, the next "load older" call would silently skip messages
-    // around the deleted one.
     const oldestInPage = rows.length ? rows[rows.length - 1].created_at : null;
 
     const { data: participants } = await supabase
@@ -139,12 +163,6 @@ export async function listMessages(req, res) {
         .eq("conversation_id", conversationId);
     const others = (participants || []).filter((p) => p.user_id !== userId);
 
-    // BUG FIX: previously this block computed a filtered `visible` array
-    // (dropping messages the user deleted "for me") but then never used
-    // it — the response always sent the raw, unfiltered `messages`. That
-    // is why "delete for me" appeared to do nothing after a refresh or
-    // when paginating: the deletion was recorded, but never applied to
-    // what got sent back.
     const { data: myDeletions } = await supabase
         .from("chat_message_deletions")
         .select("message_id")
@@ -157,22 +175,21 @@ export async function listMessages(req, res) {
         .reverse()
         .map((m) => ({ ...m, status: m.sender_id === userId ? deriveStatus(m, others) : undefined }));
 
-    // BUG FIX: the client used to seed its live read/delivered watermark
-    // at {deliveredAt: null, readAt: null} on every mount, and only ever
-    // learned the real values from a *live* socket event after that. That
-    // meant every one of your sent messages rendered as a single "sent"
-    // tick on initial load, even ones the other person had already read
-    // days ago — the tick only jumped to the correct state if a new
-    // status event happened to fire while you were looking at the
-    // screen. Sending the current watermark down lets the client seed
-    // correctly on first paint. (Only meaningful for direct/1:1 chats —
-    // for groups, each message's `status` above is already the
-    // authoritative per-message value.)
     const otherWatermarks = others.length === 1
         ? { deliveredAt: others[0].last_delivered_at, readAt: others[0].last_read_at }
         : null;
 
-    res.json({ success: true, messages, hasMore, oldestCursor: oldestInPage, otherWatermarks });
+    // NEW: tell the client whether sending is currently allowed in this
+    // conversation, so the composer can disable itself proactively
+    // instead of only finding out on a failed send. Only meaningful for
+    // 1:1 chats — groups aren't gated by a single "other party" status.
+    let canSend = true;
+    if (others.length === 1) {
+        const { isDeleted } = await getSellerDeletionStatus(others[0].user_id);
+        canSend = !isDeleted;
+    }
+
+    res.json({ success: true, messages, hasMore, oldestCursor: oldestInPage, otherWatermarks, canSend });
 }
 
 // ---- creating/finding a 1:1 conversation ----
@@ -181,6 +198,14 @@ export async function getOrCreateDirectConversation(req, res) {
     const { otherUserId } = req.body;
     if (!otherUserId || otherUserId === userId) {
         return res.status(400).json({ success: false, message: "Invalid recipient." });
+    }
+
+    // Can't start a fresh conversation with a seller who's been deleted —
+    // existing threads still open (see listConversations), this only
+    // blocks NEW ones.
+    const { isDeleted } = await getSellerDeletionStatus(otherUserId);
+    if (isDeleted) {
+        return res.status(403).json({ success: false, code: "SELLER_DELETED", message: "This seller's account is no longer active." });
     }
 
     const [a, b] = [userId, otherUserId].sort();
@@ -225,6 +250,26 @@ export async function sendMessage(req, res) {
     if (!body?.trim() && !attachmentUrl) return res.status(400).json({ success: false, message: "Empty message." });
     if (!(await assertParticipant(conversationId, userId))) return res.status(403).json({ success: false, message: "Not a participant." });
 
+    // NEW: block sending into a conversation where the other party (for
+    // 1:1 chats) is a deleted seller. Checked on BOTH sides — a buyer
+    // can't message a deleted seller, and if a deleted seller's session
+    // somehow still tries to send, that's blocked too, since their own
+    // account is what's deleted.
+    const otherUserId = await getOtherParticipantId(conversationId, userId);
+    if (otherUserId) {
+        const [otherStatus, selfStatus] = await Promise.all([
+            getSellerDeletionStatus(otherUserId),
+            getSellerDeletionStatus(userId),
+        ]);
+        if (otherStatus.isDeleted || selfStatus.isDeleted) {
+            return res.status(403).json({
+                success: false,
+                code: "SELLER_DELETED",
+                message: "This seller's account has been deleted. You can no longer send messages in this conversation.",
+            });
+        }
+    }
+
     const { data: message, error } = await supabase
         .from("chat_messages")
         .insert({ conversation_id: conversationId, sender_id: userId, body: body?.trim() || null, attachment_url: attachmentUrl || null, client_message_id: clientMessageId || null })
@@ -240,11 +285,6 @@ export async function sendMessage(req, res) {
     ]);
 
     const payload = { ...message, status: "sent" };
-    // excludeUserId: the sender already has this message from the
-    // optimistic bubble + HTTP response; re-delivering it over the socket
-    // to the *same* tab just adds dedup work for no benefit (other open
-    // tabs/devices for this user still get it, since emitToConversation
-    // fans out to every participant's personal room, not this socket).
     await emitToConversation(conversationId, "message:new", payload);
 
     const { data: recipients } = await supabase.from("chat_participants").select("user_id, is_muted").eq("conversation_id", conversationId).neq("user_id", userId);
@@ -263,15 +303,8 @@ export async function sendMessage(req, res) {
     await emitToConversation(conversationId, "conversation:updated", { conversationId }, { excludeUserId: userId });
 
     const toNotify = (recipients || []).filter((r) => !r.is_muted);
-    // BUG FIX: notification title used the sender's PERSONAL name (profiles.name)
-    // unconditionally, instead of preferring their shop name — inconsistent with
-    // listConversations, which already deliberately shows shop name only (see its
-    // own comment: "Shop name only — never fetch/expose the personal profile
-    // name here"). This now prefers the shop name (sellers messaging buyers),
-    // falling back to the personal name only when the sender has no seller
-    // profile (e.g. a buyer messaging a seller).
     const [{ data: senderShop }, { data: senderProfile }] = await Promise.all([
-        supabase.from("seller_profiles").select("display_name").eq("user_id", userId).maybeSingle(),
+        supabase.from("seller_profiles").select("display_name").eq("user_id", userId).is("deleted_at", null).maybeSingle(),
         supabase.from("profiles").select("name").eq("id", userId).single(),
     ]);
     const notificationTitle = senderShop?.display_name || senderProfile?.name || "New message";
@@ -338,10 +371,9 @@ export async function deleteMessage(req, res) {
         return res.json({ success: true, scope: "everyone" });
     }
 
-    // "me" — invisible to everyone else, only affects this user's view/devices
     const { error } = await supabase.from("chat_message_deletions").upsert({ message_id: messageId, user_id: userId });
     if (error) return res.status(500).json({ success: false, message: error.message });
-    getIO().to(`user:${userId}`).emit("message:deleted", { conversationId, messageId, scope: "me" }); // syncs their other open tabs/devices
+    getIO().to(`user:${userId}`).emit("message:deleted", { conversationId, messageId, scope: "me" });
     res.json({ success: true, scope: "me" });
 }
 
@@ -356,6 +388,7 @@ export async function searchChatUsers(req, res) {
         .select("user_id, display_name")
         .eq("status", "approved")
         .neq("user_id", myId)
+        .is("deleted_at", null)
         .ilike("display_name", `%${q}%`)
         .limit(12);
     if (error) return res.status(500).json({ success: false, message: error.message });
@@ -375,6 +408,7 @@ export async function listApprovedSellers(req, res) {
         .select("user_id, display_name, logo_url")
         .eq("status", "approved")
         .neq("user_id", myId)
+        .is("deleted_at", null)
         .order("display_name", { ascending: true });
     if (error) return res.status(500).json({ success: false, message: error.message });
 
