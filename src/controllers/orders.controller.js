@@ -8,6 +8,7 @@ import { getRoadDistanceKm } from "../services/pincodeDistance.js";
 import { purchaseQtyToSaleUnitQty, saleUnitQtyToBaseUnits, getSaleUnit, saleUnitLabel, round2 } from "../../shared/packUnits.js";
 
 import { checkOrderWindow, checkLocationServiceable } from "../../shared/orderConstraints.js";
+import { TRANSPORT_OPTIONS } from "../../shared/transportOptions.js"; // NEW
 
 
 const ERROR_MAP = {
@@ -92,10 +93,6 @@ async function estimateTransitDayRange(originPincode, originState, destPincode, 
     return daysFromDistance(km);
 }
 
-// ---------------------------------------------------------------------
-// Distance-based transit estimate — unchanged, plus acceptanceDelayDays
-// now folds into the total before building dateMin/dateMax.
-// ---------------------------------------------------------------------
 async function estimateDeliveryDate(submission, buyerPincode, buyerState, acceptanceDelayDays = 0) {
     const leadDays = submission.stock_type === "made_to_order"
         ? Number(submission.production_lead_time_days || 0)
@@ -116,8 +113,6 @@ async function estimateDeliveryDate(submission, buyerPincode, buyerState, accept
     const dateMax = new Date();
     dateMax.setDate(dateMax.getDate() + totalMax);
 
-    // Same floor/ceil-range convention as the existing transit range: if
-    // the total isn't a single fixed number, show it as a range.
     const label = totalMin === totalMax
         ? formatDDMon(dateMin)
         : `${formatDDMon(dateMin)} - ${formatDDMon(dateMax)}`;
@@ -131,8 +126,6 @@ async function estimateDeliveryDate(submission, buyerPincode, buyerState, accept
     };
 }
 
-// Small helper so getOrderQuote / placeOrder don't duplicate the
-// "fetch seller working profile -> checkOrderWindow" plumbing.
 async function getAcceptanceWindow(submissionId, now = new Date()) {
     const { data } = await supabase
         .from("seller_product_submissions")
@@ -146,20 +139,6 @@ async function getAcceptanceWindow(submissionId, now = new Date()) {
         orderAcceptanceEnd: data?.seller?.order_acceptance_end,
         holidays: data?.seller?.holidays,
     }, now);
-}
-
-function toBaseUnits(submission, quantity, purchaseBasis) {
-    const packSize = Number(submission.pack_size) > 0 ? Number(submission.pack_size) : 1;
-    const masterPackSize = Number(submission.units_per_master_pack) > 0 ? Number(submission.units_per_master_pack) : 1;
-    if (purchaseBasis === "per_pack") return quantity * packSize;
-    if (purchaseBasis === "per_master_pack") return quantity * packSize * masterPackSize;
-    return quantity;
-}
-
-function toPackQty(submission, quantity, purchaseBasis) {
-    const masterPackSize = Number(submission.units_per_master_pack) > 0 ? Number(submission.units_per_master_pack) : 1;
-    if (purchaseBasis === "per_master_pack") return quantity * masterPackSize;
-    return quantity;
 }
 
 function resolveSlabUnitPrice(priceSlabs, quantity, fallbackPrice) {
@@ -179,11 +158,6 @@ function resolveDiscountPercent(quantityDiscounts, quantity) {
     return { percent: Number(applicable[0].discountPercent) || 0, tier: applicable[0] };
 }
 
-// Shared stock-limit check — used by both the quote endpoint (to warn/
-// disable in the UI) and placeOrder (to actually block the order).
-// Returns { exceedsStock, availableStock } — exceedsStock is only ever
-// true for ready_stock listings with a known stock_quantity; made_to_order
-// listings and listings with no stock cap set have nothing to exceed.
 function checkStockLimit(submission, saleQty) {
     const availableStock = submission.stock_type === "ready_stock" ? submission.stock_quantity : null;
     const exceedsStock = availableStock != null && saleQty > Number(availableStock);
@@ -247,8 +221,6 @@ export async function getOrderQuote(req, res) {
         if (addr) { addressPincode = addr.pincode; addressState = addr.state; }
     }
 
-    // NOTE: window is now purely informational — never gates the quote or
-    // the eventual order. It only pushes the delivery estimate out.
     const acceptanceWindow = await getAcceptanceWindow(submissionId);
     const delivery = await estimateDeliveryDate(submission, addressPincode, addressState, acceptanceWindow.delayDays);
 
@@ -314,13 +286,30 @@ export async function getOrderQuote(req, res) {
     });
 }
 
+// GET /api/orders/transport-options?submissionId=...
+// NEW — lets BuyNowModal fetch exactly the channels THIS seller services,
+// without needing the seller's full profile.
+export async function getSellerTransportOptions(req, res) {
+    const { submissionId } = req.query;
+    if (!submissionId) return res.status(400).json({ success: false, message: "submissionId is required." });
+
+    const { data: sub } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
+    if (!sub) return res.status(404).json({ success: false, message: "Listing not available." });
+
+    const { data: seller } = await supabase.from("seller_profiles").select("transport_options").eq("id", sub.seller_id).maybeSingle();
+    const keys = Array.isArray(seller?.transport_options) ? seller.transport_options : [];
+    const options = TRANSPORT_OPTIONS.filter((t) => keys.includes(t.key)).map((t) => ({ key: t.key, label: t.label }));
+
+    res.json({ success: true, transportOptions: options });
+}
+
 // POST /api/orders
 export async function placeOrder(req, res) {
     const buyerId = req.user.id;
     const {
         submissionId, quantity, purchaseBasis = "per_unit", orderType = "standard",
         sampleOrderId, shippingAddressId, notes,
-        transportMode, transportCompany, transportDetails,
+        transportMode, // NEW — buyer's OPTIONAL preferred channel key; everything else moved to confirm-time
     } = req.body || {};
 
     if (!submissionId) return res.status(400).json({ success: false, message: "Missing listing." });
@@ -338,11 +327,23 @@ export async function placeOrder(req, res) {
         if (blockMsg) return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: blockMsg });
     }
 
-    // Location serviceability is still a HARD block — a seller who
-    // genuinely doesn't ship to this state/city can't fulfill the order.
-    // Order-window/hours is NO LONGER checked here as a block — see
-    // estimateDeliveryDate below, which is where "seller currently closed"
-    // now shows up (as extra days on the estimate) instead.
+    // NEW — a buyer can only "request" a channel the seller actually offers.
+    let safeTransportMode = null;
+    if (transportMode) {
+        if (!TRANSPORT_OPTIONS.some((t) => t.key === transportMode)) {
+            return res.status(400).json({ success: false, message: "Unrecognised transport method." });
+        }
+        const { data: sellerProfile } = await supabase
+            .from("seller_profiles").select("transport_options")
+            .eq("id", sellerRow?.seller_id)
+            .maybeSingle();
+        const allowed = Array.isArray(sellerProfile?.transport_options) ? sellerProfile.transport_options : [];
+        if (!allowed.includes(transportMode)) {
+            return res.status(400).json({ success: false, message: "That transport method isn't offered by this seller." });
+        }
+        safeTransportMode = transportMode;
+    }
+
     const { data: constraintRow } = await supabase
         .from("seller_product_submissions")
         .select("dispatching_locations")
@@ -381,12 +382,6 @@ export async function placeOrder(req, res) {
         }
     }
 
-    // ---------------------------------------------------------------
-    // Authoritative delivery estimate: acceptance delay (server clock,
-    // computed fresh here — never trust whatever the client last saw)
-    // + lead time + transit, all folded together into one final date
-    // range, exactly the same shape the quote screen showed.
-    // ---------------------------------------------------------------
     let estDeliveryDateISO = null;
     let estDeliveryDateMaxISO = null;
     let acceptanceDelayDaysUsed = 0;
@@ -426,9 +421,7 @@ export async function placeOrder(req, res) {
         p_purchase_basis: purchaseBasis,
         p_order_type: safeOrderType,
         p_sample_order_id: sampleOrderId || null,
-        p_transport_mode: transportMode || null,
-        p_transport_company: transportCompany || null,
-        p_transport_details: transportDetails || null,
+        p_transport_mode: safeTransportMode, // buyer's optional preference only
         p_estimated_delivery_date: estDeliveryDateISO,
         p_estimated_delivery_date_max: estDeliveryDateMaxISO,
     });
@@ -445,11 +438,6 @@ export async function placeOrder(req, res) {
         return res.status(500).json({ success: false, message: "Couldn't place the order — please try again." });
     }
 
-    // WhatsApp acknowledgement to the buyer — sent regardless of whether
-    // the order lands straight in awaiting_payment or is already
-    // confirmed, so a buyer who isn't in the app right now still knows
-    // it went through. Best-effort: failures here never affect the API
-    // response below.
     {
         const { data: buyerProfile } = await supabase
             .from("profiles").select("name, phone").eq("id", buyerId).maybeSingle();
@@ -485,10 +473,6 @@ export async function placeOrder(req, res) {
 
             await supabase.rpc("wallet_accrue_commission", { p_order_id: row.order_id });
 
-            // Commission was JUST accrued above — check right now whether
-            // that push tipped this seller's wallet over the blocking
-            // threshold. Node never computes the balance itself, so this
-            // re-read is the only way to know.
             if (sellerProfile) {
                 await notifyIfWalletJustBlocked({ sellerId: submission.seller_id, sellerUserId: sellerProfile.user_id });
             }
@@ -520,7 +504,7 @@ export async function listMyOrders(req, res) {
       order_group_id,
       order_group:order_groups ( group_number ),
       subtotal_amount, total_amount, payment_status, created_at, updated_at,
-      transport_mode, transport_company, transport_details, transport_source,
+      buyer_transport_mode, transport_mode, transport_fields, transport_notes, transport_proof_url, transport_confirmed_at, transport_source,
       seller:seller_profiles ( id, display_name, shop_slug, logo_url, city, state ),
       items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied, discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )
     `)
@@ -566,10 +550,6 @@ export async function cancelMyOrder(req, res) {
     await supabase.rpc("wallet_reverse_commission", { p_order_id: req.params.id });
 
     if (row?.notify_user_id) {
-        // row.notify_user_id here is the SELLER's user id (the buyer
-        // cancelled, seller gets told) — reuse it for the wallet re-check,
-        // since reversing commission can pull a seller back under the
-        // blocking threshold.
         const { data: orderForWallet } = await supabase
             .from("orders").select("seller_id").eq("id", req.params.id).maybeSingle();
         if (orderForWallet?.seller_id) {
@@ -589,10 +569,6 @@ export async function cancelMyOrder(req, res) {
 
 
 // GET /api/orders/order-constraints?submissionId=...
-// Powers BuyNowModal's instant "seller not accepting orders right now" /
-// "not deliverable to your address" checks. placeOrder() below re-checks
-// both with the server's own clock before actually creating the order —
-// this endpoint is only for fast UI feedback, never the source of truth.
 export async function getOrderConstraints(req, res) {
     const { submissionId } = req.query;
     if (!submissionId) return res.status(400).json({ success: false, message: "submissionId is required." });
@@ -620,8 +596,6 @@ export async function getOrderConstraints(req, res) {
         orderAcceptanceStart: data.seller?.order_acceptance_start || null,
         orderAcceptanceEnd: data.seller?.order_acceptance_end || null,
         holidays: data.seller?.holidays || [],
-        // pre-computed so the frontend doesn't need to reimplement the
-        // "next open day" scan just to render the notice
         acceptingNow: windowStatus.open,
         acceptanceDelayDays: windowStatus.delayDays,
         acceptanceMessage: windowStatus.message || null,

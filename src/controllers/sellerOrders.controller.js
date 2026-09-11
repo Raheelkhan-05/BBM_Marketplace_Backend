@@ -1,19 +1,9 @@
 // controllers/sellerOrders.controller.js
-//
-// transitionHandler no longer calls notifyUser(...) a second time for the
-// same status change — update_order_status already inserts the buyer-facing
-// notification row itself. notifyOrderChanged/notifyUserOrdersChanged are
-// KEPT: both are realtime channel broadcasts, not notifications-table rows.
-//
-// NEW: every transition now also sends a WhatsApp update to the buyer
-// (confirmed/rejected/processing/shipped/delivered all fall out of this
-// same handler), and the "rejected" transition re-checks the seller's
-// wallet after reversing commission, since a reversal can pull them back
-// under the blocking threshold.
 import { supabase } from "../config/supabase.js";
 import { notifyOrderChanged, notifyUserOrdersChanged, notifyUser } from "../services/realtimeBroadcast.js";
 import { sendOrderUpdateWhatsApp } from "../services/whatsapp.service.js";
 import { notifyIfWalletJustBlocked } from "../services/walletNotifications.service.js";
+import { getTransportOption, transportLabel } from "../../shared/transportOptions.js"; // NEW
 
 function whatsappHeadlineForStatus(newStatus, orderNumber) {
     const map = {
@@ -39,7 +29,7 @@ export async function listSellerOrders(req, res) {
       payment_status, buyer_contact_name, buyer_contact_phone, buyer_contact_email,
       buyer_gstin, buyer_business_name, buyer_gst_verified,
       shipping_address_snapshot, buyer_notes, created_at, updated_at,
-      transport_mode, transport_company, transport_details, transport_source,
+      buyer_transport_mode, transport_mode, transport_fields, transport_notes, transport_proof_url, transport_confirmed_at, transport_source,
       items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied, discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )
     `)
         .eq("seller_id", req.sellerId).neq("status", "awaiting_payment").order("created_at", { ascending: false });
@@ -65,6 +55,16 @@ export async function getSellerOrder(req, res) {
     res.json({ success: true, order, events: events || [] });
 }
 
+// GET /api/seller/orders/transport-options
+// NEW — the currently logged-in seller's own configured channels, so the
+// frontend can render the ConfirmOrderModal's picker without another
+// round trip through the dashboard endpoint.
+export async function getOwnTransportOptions(req, res) {
+    const { data, error } = await supabase.from("seller_profiles").select("transport_options").eq("id", req.sellerId).maybeSingle();
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    res.json({ success: true, transportOptions: data?.transport_options || [] });
+}
+
 function transitionHandler(newStatus) {
     return async function (req, res) {
         const { reason } = req.body || {};
@@ -80,10 +80,6 @@ function transitionHandler(newStatus) {
         if (newStatus === "rejected") {
             await supabase.rpc("wallet_reverse_commission", { p_order_id: req.params.id });
 
-            // Reversing commission can pull a seller back UNDER the
-            // threshold — re-check so the blocked flag clears (and the
-            // seller is told, on the next block cycle) the moment that
-            // happens, not just on their next top-up.
             const { data: orderForWallet } = await supabase
                 .from("orders").select("seller_id").eq("id", req.params.id).maybeSingle();
             if (orderForWallet?.seller_id) {
@@ -103,21 +99,20 @@ function transitionHandler(newStatus) {
             });
             await notifyUserOrdersChanged(row.notify_user_id);
 
-            // WhatsApp fallback for buyers not currently in the app —
-            // covers confirmed/rejected/processing/shipped/delivered, all
-            // through this one handler. Best-effort, never blocks the
-            // response below.
             const { data: orderRow } = await supabase
                 .from("orders")
-                .select("buyer_contact_name, buyer_contact_phone")
+                .select("buyer_contact_name, buyer_contact_phone, transport_mode, transport_fields")
                 .eq("id", req.params.id)
                 .maybeSingle();
             if (orderRow?.buyer_contact_phone) {
+                const transportDetail = newStatus === "confirmed" && orderRow.transport_mode
+                    ? `Transport: ${transportLabel(orderRow.transport_mode)}.`
+                    : (reason || "");
                 await sendOrderUpdateWhatsApp({
                     to: orderRow.buyer_contact_phone,
                     name: orderRow.buyer_contact_name,
                     headline: whatsappHeadlineForStatus(newStatus, row.order_number),
-                    detail: reason || "",
+                    detail: transportDetail,
                     footer: newStatus === "rejected"
                         ? "Contact support if you have questions about this order."
                         : "Track your order anytime in the app.",
@@ -128,7 +123,105 @@ function transitionHandler(newStatus) {
     };
 }
 
-export const confirmOrder = transitionHandler("confirmed");
+// Internal — actually flips the order to "confirmed" via the shared RPC
+// path (order_events row, notifications, wallet accrual, WhatsApp). Not
+// exported: always called AFTER the transport details below are saved,
+// via confirmOrder().
+const runConfirmTransition = transitionHandler("confirmed");
+
+async function uploadTransportProofFile(file, orderId) {
+    if (!file) return null;
+    const ext = (file.originalname.split(".").pop() || "bin").toLowerCase();
+    const path = `${orderId}/${Date.now()}.${ext}`;
+    const { error } = await supabase.storage
+        .from("order-transport-proof")
+        .upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
+    if (error) throw new Error(error.message);
+    const { data } = supabase.storage.from("order-transport-proof").getPublicUrl(path);
+    return data.publicUrl;
+}
+
+// POST /api/seller/orders/:id/confirm
+// REPLACES the old plain "confirm" — the seller must now supply how the
+// order will actually travel: a transport method (locked to whatever the
+// buyer requested at Buy Now, if anything) plus that method's required
+// details, an optional proof file, and an optional note. Everything is
+// saved to the order BEFORE the status flips to "confirmed", so a failed
+// validation never leaves the order confirmed with no transport info.
+//
+// Expects multipart/form-data (multer, field name "proof" for the file):
+//   mode    - one of shared/transportOptions.js keys
+//   fields  - JSON string of { [fieldKey]: value }
+//   notes   - optional free text
+export async function confirmOrder(req, res) {
+    const orderId = req.params.id;
+    const { mode, fields, notes } = req.body || {};
+
+    if (!mode) return res.status(400).json({ success: false, message: "Please select a transport method." });
+
+    const { data: order, error: orderErr } = await supabase
+        .from("orders")
+        .select("id, seller_id, buyer_transport_mode, order_number, status")
+        .eq("id", orderId).eq("seller_id", req.sellerId)
+        .maybeSingle();
+    if (orderErr) return res.status(500).json({ success: false, message: orderErr.message });
+    if (!order) return res.status(404).json({ success: false, message: "Order not found." });
+    if (order.status !== "pending_confirmation") {
+        return res.status(400).json({ success: false, message: "This order isn't awaiting confirmation." });
+    }
+
+    // If the buyer asked for a specific channel, the seller must honour it.
+    if (order.buyer_transport_mode && order.buyer_transport_mode !== mode) {
+        return res.status(400).json({
+            success: false,
+            message: `The buyer requested ${transportLabel(order.buyer_transport_mode)} for this order.`,
+        });
+    }
+
+    const optionSchema = getTransportOption(mode);
+    if (!optionSchema) return res.status(400).json({ success: false, message: "Unrecognised transport method." });
+
+    // The chosen channel must be one this seller actually offers.
+    const { data: sellerProfile } = await supabase.from("seller_profiles").select("transport_options").eq("id", req.sellerId).maybeSingle();
+    const offered = Array.isArray(sellerProfile?.transport_options) ? sellerProfile.transport_options : [];
+    if (!offered.includes(mode)) {
+        return res.status(400).json({ success: false, message: "You haven't enabled this transport method — update it from Shop Settings." });
+    }
+
+    let parsedFields = {};
+    try { parsedFields = fields ? JSON.parse(fields) : {}; } catch { parsedFields = {}; }
+
+    const missing = optionSchema.fields.filter((f) => f.required && !String(parsedFields[f.key] || "").trim()).map((f) => f.label);
+    if (missing.length) {
+        return res.status(400).json({ success: false, message: `Please fill in: ${missing.join(", ")}.` });
+    }
+
+    let proofUrl = null;
+    try {
+        proofUrl = await uploadTransportProofFile(req.file, orderId);
+    } catch (e) {
+        console.error("[confirmOrder] transport proof upload failed:", e);
+        return res.status(500).json({ success: false, message: "Couldn't upload the proof file. Please try again." });
+    }
+
+    const { error: updateErr } = await supabase
+        .from("orders")
+        .update({
+            transport_mode: mode,
+            transport_fields: parsedFields,
+            transport_notes: notes?.trim() || null,
+            transport_proof_url: proofUrl,
+            transport_confirmed_at: new Date().toISOString(),
+            transport_source: order.buyer_transport_mode ? "buyer_requested" : "seller_choice",
+        })
+        .eq("id", orderId);
+    if (updateErr) return res.status(500).json({ success: false, message: updateErr.message });
+
+    // Everything else (order_events row, notifications, WhatsApp, wallet
+    // accrual) is unchanged from before — reuse the same transition path.
+    return runConfirmTransition(req, res);
+}
+
 export const rejectOrder = transitionHandler("rejected");
 export const processOrder = transitionHandler("processing");
 export const shipOrder = transitionHandler("shipped");

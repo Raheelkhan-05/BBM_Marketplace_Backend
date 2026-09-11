@@ -24,6 +24,7 @@ const REQUIRED_FIELDS = [
   "logo_url",
   "order_acceptance_start", "order_acceptance_end",
   "dispatch_pincode",
+  "transport_options",
 ];
 
 const GATED_FIELDS = [
@@ -33,6 +34,7 @@ const GATED_FIELDS = [
   "pan",
   "working_days", "order_acceptance_start", "order_acceptance_end",
   "dispatch_pincode", "dispatch_district", "dispatch_state",
+  "transport_options",
 ];
 
 const THEME_FIELDS = ["primary_color", "secondary_color"];
