@@ -56,6 +56,8 @@ export async function getTableSchema(req, res) {
     res.json({ success: true, columns: columns || [], incomingFks: incomingFks || [] });
 }
 
+const SOFT_DELETE_FILTERED_TABLES = new Set(["profiles", "seller_profiles"]);
+
 export async function listRows(req, res) {
     const { table } = req.params;
     try { assertTableAllowed(table); } catch (e) { return handleGuard(res, e); }
@@ -65,6 +67,7 @@ export async function listRows(req, res) {
     const to = from + Number(pageSize) - 1;
 
     let query = supabase.from(table).select("*", { count: "exact" }).range(from, to);
+    if (SOFT_DELETE_FILTERED_TABLES.has(table)) query = query.is("deleted_at", null);
     if (sortBy) query = query.order(sortBy, { ascending: sortDir !== "desc" });
 
     const { data, error, count } = await query;
@@ -115,15 +118,55 @@ export async function updateRow(req, res) {
 export async function deleteRow(req, res) {
     const { table, id } = req.params;
     try { assertTableAllowed(table); } catch (e) { return handleGuard(res, e); }
-    const { pk = "id", cascade } = req.query;
+    const { pk = "id", cascade, purge } = req.query;
 
-    // If this table has a `deleted_at` column, soft-delete instead of a hard
-    // DELETE — avoids FK violations on tables still referenced elsewhere
-    // (e.g. seller_profiles <- orders.seller_id) and matches how `profiles`
-    // already handles deletion.
     const { data: columns, error: colErr } = await supabase.rpc("admin_table_columns", { p_table: table });
     if (colErr) return res.status(500).json({ success: false, message: colErr.message });
     const hasSoftDelete = (columns || []).some((c) => c.column_name === "deleted_at");
+
+    // NEW — permanently remove a row that's ALREADY soft-deleted. Only
+    // reachable when the row's own deleted_at is already set, so this can
+    // never be used to skip past the soft-delete step on a live record —
+    // it's strictly a "empty the trash" action for rows already marked.
+    if (purge === "true" && hasSoftDelete) {
+        const { data: existing, error: fetchErr } = await supabase.from(table).select(`${pk}, deleted_at`).eq(pk, id).maybeSingle();
+        if (fetchErr) return res.status(500).json({ success: false, message: fetchErr.message });
+        if (!existing) return res.status(404).json({ success: false, message: "Row not found." });
+        if (!existing.deleted_at) {
+            return res.status(400).json({ success: false, message: "This record isn't soft-deleted yet — delete it first." });
+        }
+
+        if (cascade === "true") {
+            const { data, error } = await supabase.rpc("admin_smart_purge", {
+                p_table: table, p_pk_column: pk, p_pk_value: String(id),
+            });
+            if (error) return res.status(500).json({ success: false, message: error.message });
+            return res.json({ success: true, purged: true, result: data });
+        }
+
+        const { error } = await supabase.from(table).delete().eq(pk, id);
+        if (error) {
+            if (error.code === "23503") {
+                const { data: dependents } = await supabase.rpc("admin_row_dependents", { p_table: table, p_pk_value: String(id) });
+                return res.status(409).json({
+                    success: false,
+                    message: "This record is referenced by other records and can't be purged on its own.",
+                    dependents: dependents || [],
+                    requiresCascade: true,
+                });
+            }
+            return res.status(500).json({ success: false, message: error.message });
+        }
+        return res.json({ success: true, purged: true });
+    }
+
+    if (hasSoftDelete && cascade === "true") {
+        const { data, error } = await supabase.rpc("admin_smart_delete", {
+            p_table: table, p_pk_column: pk, p_pk_value: String(id),
+        });
+        if (error) return res.status(500).json({ success: false, message: error.message });
+        return res.json({ success: true, result: data });
+    }
 
     if (hasSoftDelete) {
         const { data, error } = await supabase
