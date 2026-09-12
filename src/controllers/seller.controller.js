@@ -342,21 +342,23 @@ export async function getSellerDashboard(req, res) {
   const { data: seller, error } = await supabase.from("seller_profiles").select("*").eq("user_id", userId).maybeSingle();
   if (error || !seller) return res.status(404).json({ success: false, message: "No shop found for this account." });
 
-  const [{ data: business }, { data: photos }, { data: certifications }, { data: products }] = await Promise.all([
+  const [{ data: business }, { data: photos }, { data: certifications }, { data: products }, { data: profile }] = await Promise.all([
     supabase.from("business_profiles").select("*").eq("user_id", userId).maybeSingle(),
     supabase.from("seller_photos").select("*").eq("seller_id", seller.id).order("sort_order"),
     supabase.from("seller_certifications").select("*").eq("seller_id", seller.id),
     supabase.from("seller_products").select("*").eq("seller_id", seller.id).order("sort_order"),
+    supabase.from("profiles").select("email").eq("id", userId).maybeSingle(), // NEW
   ]);
 
   res.json({
     success: true,
     seller: stripInternal(seller),
     effective: stripInternal(mergeEffective(seller)),
-    business,   // full GST reference block — read-only in UI
+    business,
     photos: photos || [],
     certifications: certifications || [],
     products: products || [],
+    email: profile?.email || null, // NEW
   });
 }
 
