@@ -520,9 +520,26 @@ export async function listMyOrders(req, res) {
 }
 
 // GET /api/orders/:id
+// NEW (PO document pass): nest the seller's GSTIN (business_profiles.gstin,
+// via seller_profiles.business_profile_id) under `seller` so the Purchase
+// Order document can print it. If this select throws a foreign-key error,
+// your actual FK constraint name differs from the guessed
+// "seller_profiles_business_profile_id_fkey" (Postgres's default
+// table_column_fkey pattern, matching how the rest of this codebase names
+// them, e.g. seller_product_submissions_seller_id_fkey above) — check
+// `\d seller_profiles` in psql or your Supabase schema view and swap in
+// the real name.
 export async function getMyOrder(req, res) {
     const { data: order, error } = await supabase
-        .from("orders").select("*, seller:seller_profiles ( id, display_name, shop_slug, logo_url, city, state ), items:order_items ( * )")
+        .from("orders")
+        .select(`
+      *,
+      seller:seller_profiles (
+        id, display_name, shop_slug, logo_url, city, state,
+        business:business_profiles!seller_profiles_business_profile_id_fkey ( gstin )
+      ),
+      items:order_items ( * )
+    `)
         .eq("id", req.params.id).eq("buyer_id", req.user.id).maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!order) return res.status(404).json({ success: false, message: "Order not found." });

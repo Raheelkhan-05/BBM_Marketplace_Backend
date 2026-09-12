@@ -44,9 +44,30 @@ export async function listSellerOrders(req, res) {
 }
 
 // GET /api/seller/orders/:id
+// NEW (vendor-block fix): the seller's own order fetch previously had no
+// `seller_profiles` join at all — since a seller obviously already knows
+// their own shop, that seemed redundant. But PurchaseOrderDocument.jsx
+// (shared with the buyer's view) reads `order.seller` for the "Vendor"
+// block, and without this join that field is `undefined`, which is what
+// was rendering blank on the seller side despite the `vendorOverride`
+// fallback (that fallback reads fields off the auth `profile` object that
+// don't actually exist there). Joining here — same shape as
+// orders.controller.js's getMyOrder — makes both views consistent and
+// makes vendorOverride purely a belt-and-suspenders fallback instead of
+// the only source of truth.
+// NOTE: swap in the real FK constraint name below if this throws — see
+// the same caveat left on getMyOrder in orders.controller.js.
 export async function getSellerOrder(req, res) {
     const { data: order, error } = await supabase
-        .from("orders").select("*, items:order_items ( * )")
+        .from("orders")
+        .select(`
+      *,
+      seller:seller_profiles!orders_seller_id_fkey (
+        id, display_name, shop_slug, logo_url, city, state,
+        business:business_profiles!seller_profiles_business_profile_id_fkey ( gstin )
+      ),
+      items:order_items ( * )
+    `)
         .eq("id", req.params.id).eq("seller_id", req.sellerId).neq("status", "awaiting_payment").maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!order) return res.status(404).json({ success: false, message: "Order not found." });
@@ -142,17 +163,6 @@ async function uploadTransportProofFile(file, orderId) {
 }
 
 // POST /api/seller/orders/:id/confirm
-// REPLACES the old plain "confirm" — the seller must now supply how the
-// order will actually travel: a transport method (locked to whatever the
-// buyer requested at Buy Now, if anything) plus that method's required
-// details, an optional proof file, and an optional note. Everything is
-// saved to the order BEFORE the status flips to "confirmed", so a failed
-// validation never leaves the order confirmed with no transport info.
-//
-// Expects multipart/form-data (multer, field name "proof" for the file):
-//   mode    - one of shared/transportOptions.js keys
-//   fields  - JSON string of { [fieldKey]: value }
-//   notes   - optional free text
 export async function confirmOrder(req, res) {
     const orderId = req.params.id;
     const { mode, fields, notes } = req.body || {};
@@ -170,7 +180,6 @@ export async function confirmOrder(req, res) {
         return res.status(400).json({ success: false, message: "This order isn't awaiting confirmation." });
     }
 
-    // If the buyer asked for a specific channel, the seller must honour it.
     if (order.buyer_transport_mode && order.buyer_transport_mode !== mode) {
         return res.status(400).json({
             success: false,
@@ -181,7 +190,6 @@ export async function confirmOrder(req, res) {
     const optionSchema = getTransportOption(mode);
     if (!optionSchema) return res.status(400).json({ success: false, message: "Unrecognised transport method." });
 
-    // The chosen channel must be one this seller actually offers.
     const { data: sellerProfile } = await supabase.from("seller_profiles").select("transport_options").eq("id", req.sellerId).maybeSingle();
     const offered = Array.isArray(sellerProfile?.transport_options) ? sellerProfile.transport_options : [];
     if (!offered.includes(mode)) {
@@ -217,8 +225,6 @@ export async function confirmOrder(req, res) {
         .eq("id", orderId);
     if (updateErr) return res.status(500).json({ success: false, message: updateErr.message });
 
-    // Everything else (order_events row, notifications, WhatsApp, wallet
-    // accrual) is unchanged from before — reuse the same transition path.
     return runConfirmTransition(req, res);
 }
 
