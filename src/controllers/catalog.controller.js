@@ -112,18 +112,24 @@ export async function getBrandItemDetail(req, res) {
 }
 
 // GET /api/catalog/brand-items/:brandItemId/sellers?sort=&limit=&offset=
+// let invocationCount = 0;
+
 export async function getBrandItemSellers(req, res) {
+    // invocationCount++;
+    // console.log(`[timing] invocation #${invocationCount} (pid ${process.pid})`);
     const { brandItemId } = req.params;
     const { sort = "relevance" } = req.query;
     const limit = parseIntSafe(req.query.limit, 24);
     const offset = parseIntSafe(req.query.offset, 0);
 
+    // const t0 = Date.now(); // temporary
     const { data, error } = await supabaseAdmin.rpc("catalog_brand_item_sellers", {
         p_brand_item_id: brandItemId,
         p_sort: sort,
         p_limit: limit,
         p_offset: offset,
     });
+    // console.log(`[timing] RPC call: ${Date.now() - t0}ms`); // temporary
 
     if (error) {
         console.error("[catalog] getBrandItemSellers failed:", error.message);
@@ -137,16 +143,20 @@ export async function getBrandItemSellers(req, res) {
 // hs_generic_product_brands rows directly (same shape as
 // getGenericProductBrands), scoped by category only, with no generic
 // product picked yet. categoryId omitted = browse everything.
+// GET /api/catalog/brand-items-feed?categoryId=&q=&sort=&limit=&offset=
 export async function getBrandItemsFeed(req, res) {
     const { categoryId = "", q = "", sort = "relevance" } = req.query;
     const limit = parseIntSafe(req.query.limit, 24);
     const offset = parseIntSafe(req.query.offset, 0);
 
-    const { data, error } = await supabaseAdmin.rpc("catalog_browse", {
+    // CHANGED: was calling catalog_browse (computes 3 facet aggregations
+    // + seller_count per row) — the home feed never reads either. Uses
+    // catalog_browse_feed instead: identical item shape the frontend
+    // actually consumes, without the wasted work. If you need facets or
+    // seller_count for some OTHER consumer of catalog_browse, that
+    // function is untouched — only this call site moved.
+    const { data, error } = await supabaseAdmin.rpc("catalog_browse_feed", {
         p_category_id: categoryId || null,
-        p_subcategory_ids: null,
-        p_generic_product_ids: null,
-        p_brand_names: null,
         p_q: q,
         p_sort: sort,
         p_limit: limit,
