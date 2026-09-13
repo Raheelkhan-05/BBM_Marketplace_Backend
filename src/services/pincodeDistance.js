@@ -1,19 +1,16 @@
 // services/pincodeDistance.js
 //
-// FIXED: getRoadDistanceKm previously used haversine (straight-line)
-// distance × a flat 1.3 "road factor" fudge multiplier. That breaks down
-// badly on routes with real detours — e.g. Mumbai (400001) -> Rajkot
-// (360003) needed a ~1.54x factor to match the real ~680km road distance,
-// while Mumbai -> Chennai (600001) only needed ~1.30x. There's no single
-// constant that's correct for both, because the actual detour depends on
-// coastline/hills/river crossings on that specific route, not distance.
-//
-// FIX: call OSRM (Open Source Routing Machine) to get the real driving
-// route distance between the two lat/lng points, instead of guessing from
-// a straight line. This is the actual road network, not an approximation
-// of it. Falls back to haversine × 1.3 only if the routing call itself
-// fails (network issue, OSRM demo server down, etc.) — that fallback is
-// now a last resort, not the primary path.
+// CHANGED: added a cache table (road_distance_cache) in front of the
+// OSRM call. OSRM is a free public demo server with no latency
+// guarantee — every quote fetch (which fires on every quantity/basis
+// change in BuyNowModal) was paying its full round trip live, commonly
+// 500ms-4s. Most quote requests are the same seller <-> same buyer
+// pincode pair repeated (a buyer trying different quantities, or the
+// debounced re-fetch firing again), so a cache makes almost every quote
+// after the first one for a given route effectively free. A haversine
+// fallback result is cached too (tagged so it's easy to identify/backfill
+// later), so a transient OSRM outage doesn't cause repeated slow retries
+// for the same route within the outage window.
 import { supabase } from "../config/supabase.js";
 
 function haversineKm(lat1, lng1, lat2, lng2) {
@@ -25,32 +22,27 @@ function haversineKm(lat1, lng1, lat2, lng2) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Only used if the OSRM call itself fails — a rough placeholder so
-// delivery estimates degrade gracefully instead of breaking entirely.
 const FALLBACK_ROAD_FACTOR = 1.3;
-
-// Public OSRM demo server. Fine for low/moderate volume; if this becomes
-// a high-traffic path, self-host OSRM (or switch to a paid provider like
-// Google Distance Matrix / Mapbox Directions) instead of relying on the
-// public demo instance's rate limits and uptime.
 const OSRM_BASE_URL = "https://router.project-osrm.org/route/v1/driving";
-const OSRM_TIMEOUT_MS = 4000;
+// CHANGED: was 4000ms — with caching in front, a slow/failed OSRM call
+// only ever happens once per route ever (or once per cache-expiry
+// window), so it's safe to fail fast and fall back rather than making a
+// buyer wait up to 4s on a cold route.
+const OSRM_TIMEOUT_MS = 2000;
+// Re-fetch a cached route occasionally in case road infrastructure
+// changes — 90 days is generous; road distances don't change often.
+const CACHE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 
 async function fetchOsrmRoadDistanceKm(originLat, originLng, destLat, destLng) {
     const url = `${OSRM_BASE_URL}/${originLng},${originLat};${destLng},${destLat}?overview=false`;
-
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), OSRM_TIMEOUT_MS);
-
     try {
         const res = await fetch(url, { signal: controller.signal });
         if (!res.ok) return null;
-
         const data = await res.json();
         const meters = data?.routes?.[0]?.distance;
-        if (typeof meters !== "number") return null;
-
-        return meters / 1000; // OSRM returns meters
+        return typeof meters === "number" ? meters / 1000 : null;
     } catch (err) {
         console.error("OSRM routing call failed:", err?.message || err);
         return null;
@@ -59,29 +51,54 @@ async function fetchOsrmRoadDistanceKm(originLat, originLng, destLat, destLng) {
     }
 }
 
+async function getCachedDistance(originPincode, destPincode) {
+    const { data } = await supabase
+        .from("road_distance_cache")
+        .select("distance_km, computed_at")
+        .eq("origin_pincode", originPincode)
+        .eq("dest_pincode", destPincode)
+        .maybeSingle();
+    if (!data) return null;
+    if (Date.now() - new Date(data.computed_at).getTime() > CACHE_TTL_MS) return null;
+    return data.distance_km;
+}
+
+async function cacheDistance(originPincode, destPincode, km, source) {
+    // Fire-and-forget — a caching failure should never slow down or break
+    // the quote response itself.
+    supabase
+        .from("road_distance_cache")
+        .upsert({ origin_pincode: originPincode, dest_pincode: destPincode, distance_km: km, source, computed_at: new Date().toISOString() })
+        .then(() => { }, (err) => console.error("[pincodeDistance] cache write failed:", err?.message || err));
+}
+
 export async function getRoadDistanceKm(originPincode, destPincode) {
     if (!originPincode || !destPincode) return null;
     if (originPincode === destPincode) return 0;
+
+    // CHANGED: check the cache before doing anything else — this is the
+    // fast path that now serves almost every repeat request.
+    const cached = await getCachedDistance(originPincode, destPincode);
+    if (cached != null) return cached;
 
     const { data, error } = await supabase
         .from("pincode_geo")
         .select("pincode, lat, lng")
         .in("pincode", [originPincode, destPincode]);
-    if (error || !data || data.length < 2) return null; // fall back to old heuristic upstream
+    if (error || !data || data.length < 2) return null;
 
     const origin = data.find((r) => r.pincode === originPincode);
     const dest = data.find((r) => r.pincode === destPincode);
     if (!origin || !dest) return null;
 
-    // Primary path: real road-network routing.
     const roadKm = await fetchOsrmRoadDistanceKm(origin.lat, origin.lng, dest.lat, dest.lng);
-    if (roadKm != null) return roadKm;
+    if (roadKm != null) {
+        cacheDistance(originPincode, destPincode, roadKm, "osrm");
+        return roadKm;
+    }
 
-    // Last resort only: OSRM was unreachable/failed, so approximate with
-    // haversine × a flat factor rather than returning nothing. This is
-    // knowingly less accurate (see file header) — it exists purely so a
-    // transient network hiccup doesn't take delivery estimates down
-    // entirely, not as a substitute for real routing.
     console.warn(`OSRM unavailable for ${originPincode}->${destPincode}, falling back to haversine estimate`);
-    return haversineKm(origin.lat, origin.lng, dest.lat, dest.lng) * FALLBACK_ROAD_FACTOR;
+    const fallbackKm = haversineKm(origin.lat, origin.lng, dest.lat, dest.lng) * FALLBACK_ROAD_FACTOR;
+    cacheDistance(originPincode, destPincode, fallbackKm, "haversine_fallback");
+    return fallbackKm;
 }

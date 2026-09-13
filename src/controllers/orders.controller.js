@@ -184,18 +184,18 @@ export async function checkoutStatus(req, res) {
     res.json({ success: true, canCheckout: true, profile, business: business || null });
 }
 
-// GET /api/orders/quote
+// CHANGED: was 6 sequential round trips (seller lookup, wallet check,
+// submission fetch, address fetch, acceptance-window fetch — which
+// re-queried the SAME seller_profiles row the wallet check and submission
+// fetch already touched — then delivery estimate, then commission RPC).
+// Restructured into: one combined submission+seller select (was two
+// separate reads of overlapping data), then everything else that doesn't
+// depend on submission's own fields fires in parallel via Promise.all.
 export async function getOrderQuote(req, res) {
     const { submissionId, quantity, purchaseBasis = "per_pack", orderType = "standard", addressId } = req.query;
     const qty = Number(quantity);
     if (!submissionId) return res.status(400).json({ success: false, message: "submissionId is required." });
     if (!(qty > 0)) return res.status(400).json({ success: false, message: "Enter a valid quantity." });
-
-    const { data: sellerRow } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
-    if (sellerRow) {
-        const blockMsg = await assertSellerAcceptingOrders(sellerRow.seller_id);
-        if (blockMsg) return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: blockMsg });
-    }
 
     const isSample = orderType === "sample";
     const allowedBases = isSample ? ["per_unit", "per_pack", "per_master_pack"] : ["per_pack", "per_master_pack"];
@@ -203,25 +203,50 @@ export async function getOrderQuote(req, res) {
         return res.status(400).json({ success: false, message: "Invalid purchase basis." });
     }
 
+    // Single combined fetch — submission fields + the seller fields
+    // getAcceptanceWindow used to fetch in a SEPARATE second query.
     const { data: submission, error } = await supabase
         .from("seller_product_submissions")
-        .select("id, price, moq, unit, lead_time, stock_quantity, review_status, price_slabs, quantity_discounts, stock_type, dispatch_time_days, production_lead_time_days, pack_size, units_per_master_pack, dispatch_pincode, dispatch_state, sample_available, sample_quantity, sample_price, generic_product_brand_id")
+        .select(`
+            id, price, moq, unit, lead_time, stock_quantity, review_status, price_slabs, quantity_discounts,
+            stock_type, dispatch_time_days, production_lead_time_days, pack_size, units_per_master_pack,
+            dispatch_pincode, dispatch_state, sample_available, sample_quantity, sample_price, generic_product_brand_id,
+            seller_id,
+            seller:seller_profiles!seller_product_submissions_seller_id_fkey ( working_days, order_acceptance_start, order_acceptance_end, holidays )
+        `)
         .eq("id", submissionId).maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!submission || submission.review_status !== "approved") {
         return res.status(404).json({ success: false, message: "Listing not available." });
     }
 
+    // Everything below is independent of everything else below it —
+    // run it all at once instead of one-after-another.
+    const [blockMsg, addressResult, commissionResult] = await Promise.all([
+        assertSellerAcceptingOrders(submission.seller_id),
+        addressId
+            ? supabase.from("buyer_addresses").select("pincode, state").eq("id", addressId).maybeSingle()
+            : Promise.resolve({ data: null }),
+        supabase.rpc("resolve_commission_percent", { p_generic_product_brand_id: submission.generic_product_brand_id }),
+    ]);
+
+    if (blockMsg) return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: blockMsg });
+
+    const addressPincode = addressResult.data?.pincode || null;
+    const addressState = addressResult.data?.state || null;
+    const commissionPercent = Number(commissionResult.data ?? 0.25);
+
     const saleQty = purchaseQtyToSaleUnitQty(qty, purchaseBasis, submission.pack_size, submission.units_per_master_pack);
     const baseQty = saleUnitQtyToBaseUnits(saleQty, submission.pack_size, submission.units_per_master_pack);
 
-    let addressPincode = null, addressState = null;
-    if (addressId) {
-        const { data: addr } = await supabase.from("buyer_addresses").select("pincode, state").eq("id", addressId).maybeSingle();
-        if (addr) { addressPincode = addr.pincode; addressState = addr.state; }
-    }
+    // Computed locally from the fields already fetched above — no extra query.
+    const acceptanceWindow = checkOrderWindow({
+        workingDays: submission.seller?.working_days,
+        orderAcceptanceStart: submission.seller?.order_acceptance_start,
+        orderAcceptanceEnd: submission.seller?.order_acceptance_end,
+        holidays: submission.seller?.holidays,
+    });
 
-    const acceptanceWindow = await getAcceptanceWindow(submissionId);
     const delivery = await estimateDeliveryDate(submission, addressPincode, addressState, acceptanceWindow.delayDays);
 
     const acceptanceInfo = {
@@ -253,10 +278,6 @@ export async function getOrderQuote(req, res) {
     const { price: slabPrice, slab: appliedSlab } = resolveSlabUnitPrice(submission.price_slabs, saleQty, pricePerSaleUnit);
     const { percent: discountPercent, tier: discountTier } = resolveDiscountPercent(submission.quantity_discounts, saleQty);
     const unitPrice = round2(slabPrice * (1 - discountPercent / 100));
-
-    const { data: commissionPercentData } = await supabase
-        .rpc("resolve_commission_percent", { p_generic_product_brand_id: submission.generic_product_brand_id });
-    const commissionPercent = Number(commissionPercentData ?? 0.25);
 
     const subtotal = round2(unitPrice * saleQty);
     const platformFee = round2(subtotal * commissionPercent / 100);
