@@ -7,7 +7,6 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 .env
-.cache/
 
 node_modules
 dist
@@ -26,3 +25,4 @@ backups/
 *.njsproj
 *.sln
 *.sw?
+src/scripts/.cache/
