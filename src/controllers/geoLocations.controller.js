@@ -81,8 +81,8 @@ async function fetchPincodeRecordsFromGovApi(pincode) {
     const json = await resp.json();
 
     // TEMP DIAGNOSTIC — remove once field name is confirmed.
-    console.log("[fetchPincodeRecordsFromGovApi] field list:", json?.field ? json.field.map(f => f.name) : "no field metadata");
-    console.log("[fetchPincodeRecordsFromGovApi] raw first record:", JSON.stringify(json?.records?.[0], null, 2));
+    // console.log("[fetchPincodeRecordsFromGovApi] field list:", json?.field ? json.field.map(f => f.name) : "no field metadata");
+    // console.log("[fetchPincodeRecordsFromGovApi] raw first record:", JSON.stringify(json?.records?.[0], null, 2));
 
     return Array.isArray(json?.records) ? json.records : [];
 }

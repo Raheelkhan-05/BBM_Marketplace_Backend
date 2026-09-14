@@ -387,7 +387,7 @@ export async function placeOrder(req, res) {
         const { data: address } = await supabase.from("buyer_addresses").select("state, city").eq("id", shippingAddressId).maybeSingle();
         const locationCheck = checkLocationServiceable(constraintRow.dispatching_locations, address);
         // const locationCheck = checkLocationServiceable(dispatchingLocations, { state: geo.state, city: geo.district });
-        console.log("[deliverability check]", { pincode, resolvedState: geo.state, resolvedDistrict: geo.district, result: locationCheck });
+        // console.log("[deliverability check]", { pincode, resolvedState: geo.state, resolvedDistrict: geo.district, result: locationCheck });
         if (!locationCheck.serviceable) {
             return res.status(400).json({ success: false, code: locationCheck.reason, message: locationCheck.message });
         }
