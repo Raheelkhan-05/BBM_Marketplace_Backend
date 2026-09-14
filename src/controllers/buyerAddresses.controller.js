@@ -16,6 +16,16 @@ export async function createAddress(req, res) {
     const missing = validateAddress(body);
     if (missing.length) return res.status(400).json({ success: false, message: `Please fill: ${missing.join(", ")}` });
 
+    // Add: check for an existing near-duplicate before inserting
+    const norm = (s) => String(s || "").trim().toLowerCase();
+    const { data: existingRows } = await supabase.from("buyer_addresses").select("*").eq("user_id", req.user.id);
+    const dup = (existingRows || []).find((a) =>
+        norm(a.contact_phone) === norm(body.contact_phone) &&
+        norm(a.address_line1) === norm(body.address_line1) &&
+        norm(a.pincode) === norm(body.pincode)
+    );
+    if (dup) return res.json({ success: true, address: dup, deduped: true });
+
     const { count } = await supabase.from("buyer_addresses").select("id", { count: "exact", head: true }).eq("user_id", req.user.id);
     const isFirst = !count;
 
@@ -36,7 +46,7 @@ export async function createAddress(req, res) {
 }
 
 export async function updateAddress(req, res) {
-    const { data: existing } = await supabase.from("buyer_addresses").select("id, user_id").eq("id", req.params.id).maybeSingle();
+    const { data: existing } = await supabase.from("buyer_addresses").select("*").eq("id", req.params.id).maybeSingle();
     if (!existing || existing.user_id !== req.user.id) return res.status(404).json({ success: false, message: "Address not found." });
 
     const body = req.body || {};
@@ -44,6 +54,13 @@ export async function updateAddress(req, res) {
     for (const key of ["label", "contact_name", "contact_phone", "address_line1", "address_line2", "city", "state", "pincode"]) {
         if (body[key] !== undefined) patch[key] = String(body[key]).trim() || null;
     }
+
+    // Validate against the MERGED result, not just the raw patch — a
+    // partial update must never leave a required field blank.
+    const merged = { ...existing, ...patch };
+    const missing = validateAddress(merged);
+    if (missing.length) return res.status(400).json({ success: false, message: `Please fill: ${missing.join(", ")}` });
+
     const { data, error } = await supabase.from("buyer_addresses").update(patch).eq("id", req.params.id).select("*").single();
     if (error) return res.status(500).json({ success: false, message: error.message });
     res.json({ success: true, address: data });

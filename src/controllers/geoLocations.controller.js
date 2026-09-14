@@ -79,6 +79,11 @@ async function fetchPincodeRecordsFromGovApi(pincode) {
     const resp = await fetch(url, { signal: AbortSignal.timeout(6000) });
     if (!resp.ok) throw new Error(`Gov pincode API responded ${resp.status}`);
     const json = await resp.json();
+
+    // TEMP DIAGNOSTIC — remove once field name is confirmed.
+    console.log("[fetchPincodeRecordsFromGovApi] field list:", json?.field ? json.field.map(f => f.name) : "no field metadata");
+    console.log("[fetchPincodeRecordsFromGovApi] raw first record:", JSON.stringify(json?.records?.[0], null, 2));
+
     return Array.isArray(json?.records) ? json.records : [];
 }
 
@@ -121,8 +126,12 @@ async function ensureStateId(indiaId, stateName) {
 // visible to DispatchingLocationsPicker via listCities() below with no
 // extra join needed.
 async function ensureDistrictCity(stateId, districtName, pincode) {
+    if (!districtName || !districtName.trim()) {
+        throw new Error(`ensureDistrictCity called with empty districtName for stateId=${stateId}, pincode=${pincode}`);
+    }
     const { data: existing } = await supabase
         .from("geo_locations").select("id, pincode").eq("type", "city").ilike("name", districtName).eq("parent_id", stateId).maybeSingle();
+
     if (existing) {
         if (pincode && !existing.pincode) {
             await supabase.from("geo_locations").update({ pincode }).eq("id", existing.id);
@@ -140,73 +149,68 @@ async function ensureDistrictCity(stateId, districtName, pincode) {
     return created;
 }
 
-// GET /api/geo/pincode/:pincode
+// Reusable — same logic that used to live only inside lookupPincode's
+// handler, now callable from other controllers too.
+export async function resolvePincode(pincode) {
+    const cached = PINCODE_MEMORY_CACHE.get(pincode);
+    if (cached && cached.expiresAt > Date.now()) return { ...cached.data, fromCache: true };
+
+    const { data: cacheRow } = await supabase
+        .from("pincode_lookup_cache")
+        .select("state_id, city_id")
+        .eq("pincode", pincode)
+        .maybeSingle();
+
+    if (cacheRow) {
+        const [{ data: stateRow }, { data: cityRow }] = await Promise.all([
+            supabase.from("geo_locations").select("name").eq("id", cacheRow.state_id).maybeSingle(),
+            supabase.from("geo_locations").select("name").eq("id", cacheRow.city_id).maybeSingle(),
+        ]);
+        if (stateRow?.name && cityRow?.name) {
+            const payload = { success: true, state: stateRow.name, district: cityRow.name };
+            PINCODE_MEMORY_CACHE.set(pincode, { data: payload, expiresAt: Date.now() + CACHE_TTL_MS });
+            return { ...payload, fromCache: true };
+        }
+        // Cache row points at something that no longer resolves cleanly —
+        // fall through and re-resolve fresh instead of trusting it blindly.
+    }
+
+    const records = await fetchPincodeRecordsFromGovApi(pincode);
+    const pairs = dedupeToStateDistrictPairs(records);
+    if (!pairs.length) return { success: false, message: "That pincode wasn't found." };
+
+    const { data: india } = await supabase.from("geo_locations").select("id").eq("type", "country").eq("name", "India").maybeSingle();
+    if (!india) return { success: false, message: "Location data isn't set up yet." };
+
+    // Pick the FIRST resolved pair as canonical for this pincode (a pincode
+    // maps to one town in practice, even if the raw gov records list
+    // several post offices with slightly different sub-divisions).
+    const { stateName, districtName } = pairs[0];
+    const stateId = await ensureStateId(india.id, stateName);
+    const city = await ensureDistrictCity(stateId, districtName); // no pincode param anymore
+
+    // Store the pincode -> (state,city) mapping in its OWN table —
+    // never on the city row itself, since one city legitimately has many
+    // pincodes and a single column can't represent that.
+    await supabase.from("pincode_lookup_cache").upsert({ pincode, state_id: stateId, city_id: city.id });
+
+    const payload = { success: true, state: stateName, district: city.name };
+    PINCODE_MEMORY_CACHE.set(pincode, { data: payload, expiresAt: Date.now() + CACHE_TTL_MS });
+    return { ...payload, fromCache: false };
+}
+
+// GET /api/geo/pincode/:pincode — now just a thin wrapper
 export async function lookupPincode(req, res) {
     const { pincode } = req.params;
     if (!/^\d{6}$/.test(pincode)) {
         return res.status(400).json({ success: false, message: "Enter a valid 6-digit pincode." });
     }
-
-    const cached = PINCODE_MEMORY_CACHE.get(pincode);
-    if (cached && cached.expiresAt > Date.now()) {
-        return res.json({ ...cached.data, fromCache: true });
-    }
-
-    const { data: cachedCities } = await supabase
-        .from("geo_locations").select("id, name, parent_id").eq("type", "city").eq("pincode", pincode);
-    if (cachedCities?.length) {
-        const stateIds = [...new Set(cachedCities.map((c) => c.parent_id))];
-        const { data: states } = await supabase.from("geo_locations").select("id, name").in("id", stateIds);
-        const stateNameById = Object.fromEntries((states || []).map((s) => [s.id, s.name]));
-
-        const payload = {
-            success: true,
-            state: stateNameById[cachedCities[0].parent_id],
-            district: cachedCities[0].name,
-            districts: cachedCities.map((c) => ({ state: stateNameById[c.parent_id], district: c.name })),
-        };
-        PINCODE_MEMORY_CACHE.set(pincode, { data: payload, expiresAt: Date.now() + CACHE_TTL_MS });
-        return res.json({ ...payload, fromCache: true });
-    }
-
-    let records;
     try {
-        records = await fetchPincodeRecordsFromGovApi(pincode);
+        res.json(await resolvePincode(pincode));
     } catch (err) {
-        console.error("[lookupPincode] gov API fetch failed:", err.message);
-        return res.status(502).json({ success: false, message: "Couldn't reach the pincode lookup service. You can still type your location manually." });
+        console.error("[lookupPincode]", err.message);
+        res.status(502).json({ success: false, message: "Couldn't reach the pincode lookup service." });
     }
-
-    const pairs = dedupeToStateDistrictPairs(records);
-    if (!pairs.length) {
-        console.warn("[lookupPincode] no valid state/district pairs for", pincode, "— raw record count:", records.length);
-        return res.status(404).json({ success: false, message: "That pincode wasn't found." });
-    }
-
-    const { data: india, error: indiaErr } = await supabase.from("geo_locations").select("id").eq("type", "country").eq("name", "India").maybeSingle();
-    if (indiaErr) console.error("[lookupPincode] India lookup errored:", indiaErr.message);
-    if (!india) {
-        console.error("[lookupPincode] No 'India' row found in geo_locations (type='country'). Seed it — see migration.");
-        return res.status(500).json({ success: false, message: "Location data isn't set up yet — contact support." });
-    }
-
-    const resolved = await Promise.all(
-        pairs.map(async ({ stateName, districtName }) => {
-            const stateId = await ensureStateId(india.id, stateName);
-            const city = await ensureDistrictCity(stateId, districtName, pincode);
-            return { state: stateName, district: city.name };
-        })
-    );
-
-    const payload = {
-        success: true,
-        state: resolved[0].state,
-        district: resolved[0].district,
-        districts: resolved,
-    };
-
-    PINCODE_MEMORY_CACHE.set(pincode, { data: payload, expiresAt: Date.now() + CACHE_TTL_MS });
-    res.json({ ...payload, fromCache: false });
 }
 
 // GET /api/geo/search?q=&type=

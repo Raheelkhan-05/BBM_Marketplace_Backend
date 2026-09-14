@@ -222,13 +222,19 @@ export async function getOrderQuote(req, res) {
 
     // Everything below is independent of everything else below it —
     // run it all at once instead of one-after-another.
-    const [blockMsg, addressResult, commissionResult] = await Promise.all([
-        assertSellerAcceptingOrders(submission.seller_id),
-        addressId
-            ? supabase.from("buyer_addresses").select("pincode, state").eq("id", addressId).maybeSingle()
-            : Promise.resolve({ data: null }),
-        supabase.rpc("resolve_commission_percent", { p_generic_product_brand_id: submission.generic_product_brand_id }),
-    ]);
+    let blockMsg, addressResult, commissionResult;
+    try {
+        [blockMsg, addressResult, commissionResult] = await Promise.all([
+            assertSellerAcceptingOrders(submission.seller_id),
+            addressId
+                ? supabase.from("buyer_addresses").select("pincode, state").eq("id", addressId).maybeSingle()
+                : Promise.resolve({ data: null }),
+            supabase.rpc("resolve_commission_percent", { p_generic_product_brand_id: submission.generic_product_brand_id }),
+        ]);
+    } catch (err) {
+        console.error("getOrderQuote parallel fetch failed:", err?.message || err);
+        return res.status(500).json({ success: false, message: "Couldn't calculate a quote right now. Please try again." });
+    }
 
     if (blockMsg) return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: blockMsg });
 
@@ -247,7 +253,13 @@ export async function getOrderQuote(req, res) {
         holidays: submission.seller?.holidays,
     });
 
-    const delivery = await estimateDeliveryDate(submission, addressPincode, addressState, acceptanceWindow.delayDays);
+    let delivery;
+    try {
+        delivery = await estimateDeliveryDate(submission, addressPincode, addressState, acceptanceWindow.delayDays);
+    } catch (err) {
+        console.error("estimateDeliveryDate failed in getOrderQuote:", err?.message || err);
+        return res.status(500).json({ success: false, message: "Couldn't calculate delivery estimate right now." });
+    }
 
     const acceptanceInfo = {
         acceptingNow: acceptanceWindow.open,
@@ -374,6 +386,8 @@ export async function placeOrder(req, res) {
     if (constraintRow) {
         const { data: address } = await supabase.from("buyer_addresses").select("state, city").eq("id", shippingAddressId).maybeSingle();
         const locationCheck = checkLocationServiceable(constraintRow.dispatching_locations, address);
+        // const locationCheck = checkLocationServiceable(dispatchingLocations, { state: geo.state, city: geo.district });
+        console.log("[deliverability check]", { pincode, resolvedState: geo.state, resolvedDistrict: geo.district, result: locationCheck });
         if (!locationCheck.serviceable) {
             return res.status(400).json({ success: false, code: locationCheck.reason, message: locationCheck.message });
         }
