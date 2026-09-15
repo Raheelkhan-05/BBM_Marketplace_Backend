@@ -60,47 +60,120 @@ function daysFromDistance(km) {
     return { min: min === max ? min : min, max: max === min ? min : max };
 }
 
-function estimateFallbackKm(originPincode, originState, destPincode, destState) {
-    if (!originPincode || !destPincode) return 600;
-
-    const originPrefix3 = originPincode.slice(0, 3);
-    const destPrefix3 = destPincode.slice(0, 3);
-    if (originPrefix3 === destPrefix3) return 60;
-
-    const sameState = originState && destState &&
-        originState.trim().toLowerCase() === destState.trim().toLowerCase();
-    if (sameState) return 250;
-
-    const originZone = Number(originPincode[0]);
-    const destZone = Number(destPincode[0]);
-    const zoneDiff = Math.abs(originZone - destZone);
-
-    if (zoneDiff <= 1) return 700;
-    if (zoneDiff === 2) return 1200;
-    return 1900;
+// NEW: dispatch location moved from seller_product_submissions to
+// seller_profiles a while back (seller_product_submissions.dispatch_pincode/
+// dispatch_state are legacy columns that are no longer written to — that's
+// why they read as null on every listing, not just some). The seller's
+// actual dispatch location now lives on seller_profiles: either their
+// registered pincode/state (when dispatch_same_as_registered is true) or
+// their explicit dispatch_pincode/dispatch_district/dispatch_state.
+function resolveSellerDispatchLocation(seller) {
+    if (!seller) return { pincode: null, state: null };
+    if (seller.dispatch_same_as_registered) {
+        return { pincode: seller.pincode || null, state: seller.state || null };
+    }
+    // Defensive fallback: if the seller was switched to "custom dispatch
+    // location" but never actually filled it in, fall back to their
+    // registered address rather than silently returning nothing.
+    return {
+        pincode: seller.dispatch_pincode || seller.pincode || null,
+        state: seller.dispatch_state || seller.state || null,
+    };
 }
 
+// FIXED: previously this bailed out to a flat 600km the instant EITHER
+// pincode was missing, even when both states WERE known — throwing away
+// perfectly good same-state/cross-state info. Now it only falls back to
+// the fully-generic default when we have no usable geography at all.
+function estimateFallbackKm(originPincode, originState, destPincode, destState) {
+    if (originPincode && destPincode) {
+        const originPrefix3 = originPincode.slice(0, 3);
+        const destPrefix3 = destPincode.slice(0, 3);
+        if (originPrefix3 === destPrefix3) return 60;
+
+        const sameState = originState && destState &&
+            originState.trim().toLowerCase() === destState.trim().toLowerCase();
+        if (sameState) return 250;
+
+        const originZone = Number(originPincode[0]);
+        const destZone = Number(destPincode[0]);
+        const zoneDiff = Math.abs(originZone - destZone);
+
+        if (zoneDiff <= 1) return 700;
+        if (zoneDiff === 2) return 1200;
+        return 1900;
+    }
+
+    // One or both pincodes missing — fall back to state-level comparison
+    // if we at least have both states.
+    if (originState && destState) {
+        const sameState = originState.trim().toLowerCase() === destState.trim().toLowerCase();
+        return sameState ? 250 : 700;
+    }
+
+    // No usable geography at all.
+    return 600;
+}
+
+// FIXED:
+// 1. No longer calls the external getRoadDistanceKm API when either
+//    pincode is null — that call can never succeed with a null input,
+//    it was just a wasted round trip that always resolved to km=null.
+// 2. Logs a single console.warn (with context) only when data is
+//    actually missing, instead of unconditionally logging km/origin/dest
+//    on every request.
 async function estimateTransitDayRange(originPincode, originState, destPincode, destState) {
     const originPrefix3 = originPincode?.slice(0, 3);
     const destPrefix3 = destPincode?.slice(0, 3);
     if (originPrefix3 && originPrefix3 === destPrefix3) return { min: 1, max: 1 };
 
-    const km = await getRoadDistanceKm(originPincode, destPincode);
-    if (km == null) {
+    if (!originPincode || !destPincode) {
+        console.warn("[estimateTransitDayRange] missing pincode(s), using fallback distance", {
+            originPincode, originState, destPincode, destState,
+        });
         const fallbackKm = estimateFallbackKm(originPincode, originState, destPincode, destState);
         return daysFromDistance(fallbackKm);
     }
+
+    const km = await getRoadDistanceKm(originPincode, destPincode);
+    if (km == null) {
+        console.warn("[estimateTransitDayRange] getRoadDistanceKm returned null for a complete pincode pair", {
+            originPincode, destPincode,
+        });
+        const fallbackKm = estimateFallbackKm(originPincode, originState, destPincode, destState);
+        return daysFromDistance(fallbackKm);
+    }
+
     return daysFromDistance(km);
 }
 
-async function estimateDeliveryDate(submission, buyerPincode, buyerState, acceptanceDelayDays = 0) {
+// CHANGED: dispatchPincode/dispatchState are now passed in explicitly,
+// already resolved (by the caller) via resolveSellerDispatchLocation from
+// seller_profiles — submission.dispatch_pincode/dispatch_state are legacy
+// and no longer used as a source.
+async function estimateDeliveryDate(submission, dispatchPincode, dispatchState, buyerPincode, buyerState, acceptanceDelayDays = 0) {
     const leadDays = submission.stock_type === "made_to_order"
         ? Number(submission.production_lead_time_days || 0)
         : Number(submission.dispatch_time_days ?? submission.lead_time ?? 0);
 
+    // NEW: surface *why* a distance estimate might be degraded. If this
+    // fires, the seller genuinely has no pincode anywhere on their profile
+    // (neither dispatch nor registered) — a real seller-profile gap, not a
+    // per-request glitch.
+    if (!dispatchPincode) {
+        console.warn("[estimateDeliveryDate] seller has no resolvable dispatch pincode (checked seller_profiles dispatch + registered pincode)", {
+            submissionId: submission.id || null,
+        });
+    }
+    if (!buyerPincode) {
+        console.warn("[estimateDeliveryDate] no buyer/destination pincode available", {
+            submissionId: submission.id || null,
+        });
+    }
+
     const { min: transitMin, max: transitMax } = await estimateTransitDayRange(
-        submission.dispatch_pincode,
-        submission.dispatch_state,
+        dispatchPincode,
+        dispatchState,
         buyerPincode,
         buyerState
     );
@@ -192,7 +265,7 @@ export async function checkoutStatus(req, res) {
 // separate reads of overlapping data), then everything else that doesn't
 // depend on submission's own fields fires in parallel via Promise.all.
 export async function getOrderQuote(req, res) {
-    const { submissionId, quantity, purchaseBasis = "per_pack", orderType = "standard", addressId } = req.query;
+    const { submissionId, quantity, purchaseBasis = "per_pack", orderType = "standard", addressId, destPincode, destState } = req.query;
     const qty = Number(quantity);
     if (!submissionId) return res.status(400).json({ success: false, message: "submissionId is required." });
     if (!(qty > 0)) return res.status(400).json({ success: false, message: "Enter a valid quantity." });
@@ -210,9 +283,12 @@ export async function getOrderQuote(req, res) {
         .select(`
             id, price, moq, unit, lead_time, stock_quantity, review_status, price_slabs, quantity_discounts,
             stock_type, dispatch_time_days, production_lead_time_days, pack_size, units_per_master_pack,
-            dispatch_pincode, dispatch_state, sample_available, sample_quantity, sample_price, generic_product_brand_id,
+            sample_available, sample_quantity, sample_price, generic_product_brand_id,
             seller_id,
-            seller:seller_profiles!seller_product_submissions_seller_id_fkey ( working_days, order_acceptance_start, order_acceptance_end, holidays )
+            seller:seller_profiles!seller_product_submissions_seller_id_fkey (
+                working_days, order_acceptance_start, order_acceptance_end, holidays,
+                pincode, state, dispatch_pincode, dispatch_state, dispatch_same_as_registered
+            )
         `)
         .eq("id", submissionId).maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
@@ -238,8 +314,28 @@ export async function getOrderQuote(req, res) {
 
     if (blockMsg) return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: blockMsg });
 
-    const addressPincode = addressResult.data?.pincode || null;
-    const addressState = addressResult.data?.state || null;
+    // NEW: addressId was provided but the row had no pincode saved on it —
+    // that's worth knowing about separately from "no address given at all".
+    if (addressId && !addressResult.data?.pincode) {
+        console.warn("[getOrderQuote] buyer_addresses row has no pincode", {
+            submissionId: submission.id,
+            addressId,
+            addressRowFound: !!addressResult.data,
+            addressRowPincode: addressResult.data?.pincode ?? null,
+            addressRowState: addressResult.data?.state ?? null,
+            queryDestPincode: destPincode ?? null,
+            queryDestState: destState ?? null,
+        });
+    }
+    if (!addressId && !destPincode) {
+        console.warn("[getOrderQuote] no addressId and no destPincode query param provided at all", {
+            submissionId: submission.id,
+        });
+    }
+
+    const addressPincode = addressResult.data?.pincode || destPincode || null;
+    const addressState = addressResult.data?.state || destState || null;
+
     const commissionPercent = Number(commissionResult.data ?? 0.25);
 
     const saleQty = purchaseQtyToSaleUnitQty(qty, purchaseBasis, submission.pack_size, submission.units_per_master_pack);
@@ -253,9 +349,20 @@ export async function getOrderQuote(req, res) {
         holidays: submission.seller?.holidays,
     });
 
+    const dispatchLocation = resolveSellerDispatchLocation(submission.seller);
+
+    console.log("[getOrderQuote] delivery estimate inputs", {
+        submissionId: submission.id,
+        addressId: addressId || null,
+        dispatchPincode: dispatchLocation.pincode,
+        dispatchState: dispatchLocation.state,
+        buyerPincode: addressPincode,
+        buyerState: addressState,
+    });
+
     let delivery;
     try {
-        delivery = await estimateDeliveryDate(submission, addressPincode, addressState, acceptanceWindow.delayDays);
+        delivery = await estimateDeliveryDate(submission, dispatchLocation.pincode, dispatchLocation.state, addressPincode, addressState, acceptanceWindow.delayDays);
     } catch (err) {
         console.error("estimateDeliveryDate failed in getOrderQuote:", err?.message || err);
         return res.status(500).json({ success: false, message: "Couldn't calculate delivery estimate right now." });
@@ -426,7 +533,12 @@ export async function placeOrder(req, res) {
 
         const { data: submissionForDelivery } = await supabase
             .from("seller_product_submissions")
-            .select("stock_type, production_lead_time_days, dispatch_time_days, lead_time, dispatch_pincode, dispatch_state")
+            .select(`
+                stock_type, production_lead_time_days, dispatch_time_days, lead_time,
+                seller:seller_profiles!seller_product_submissions_seller_id_fkey (
+                    pincode, state, dispatch_pincode, dispatch_state, dispatch_same_as_registered
+                )
+            `)
             .eq("id", submissionId)
             .maybeSingle();
 
@@ -438,12 +550,28 @@ export async function placeOrder(req, res) {
 
         if (submissionForDelivery && shippingAddress) {
             try {
-                const delivery = await estimateDeliveryDate(submissionForDelivery, shippingAddress.pincode, shippingAddress.state, acceptanceDelayDaysUsed);
+                const dispatchLocation = resolveSellerDispatchLocation(submissionForDelivery.seller);
+                console.log("[placeOrder] delivery estimate inputs", {
+                    submissionId,
+                    shippingAddressId,
+                    dispatchPincode: dispatchLocation.pincode,
+                    dispatchState: dispatchLocation.state,
+                    buyerPincode: shippingAddress.pincode,
+                    buyerState: shippingAddress.state,
+                });
+                const delivery = await estimateDeliveryDate(submissionForDelivery, dispatchLocation.pincode, dispatchLocation.state, shippingAddress.pincode, shippingAddress.state, acceptanceDelayDaysUsed);
                 estDeliveryDateISO = delivery.dateMin.toISOString().slice(0, 10);
                 estDeliveryDateMaxISO = delivery.dateMax.toISOString().slice(0, 10);
             } catch (err) {
                 console.error("estimateDeliveryDate failed during placeOrder:", err?.message || err);
             }
+        } else {
+            console.warn("[placeOrder] skipped delivery estimate — missing submission or shippingAddress row", {
+                submissionId,
+                shippingAddressId,
+                submissionForDeliveryFound: !!submissionForDelivery,
+                shippingAddressFound: !!shippingAddress,
+            });
         }
     }
 
