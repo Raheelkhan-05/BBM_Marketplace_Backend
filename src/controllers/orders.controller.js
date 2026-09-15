@@ -21,6 +21,7 @@ const ERROR_MAP = {
     EXCEEDS_AVAILABLE_STOCK: { status: 400, message: "That quantity isn't available from this seller." },
     CREDIT_NOT_APPROVED: { status: 403, message: "You don't have approved credit with this seller." },
     BUYER_NOT_FOUND: { status: 401, message: "Please sign in again." },
+    INVALID_TRANSPORT_OPTION: { status: 400, message: "That transport option is no longer valid — please pick another." },
     BUYER_NOT_VERIFIED: { status: 403, message: "Please verify your email or phone before placing an order." },
     ADDRESS_NOT_FOUND: { status: 400, message: "Please select a valid shipping address." },
     INVALID_QUANTITY: { status: 400, message: "Please enter a valid quantity." },
@@ -351,15 +352,6 @@ export async function getOrderQuote(req, res) {
 
     const dispatchLocation = resolveSellerDispatchLocation(submission.seller);
 
-    console.log("[getOrderQuote] delivery estimate inputs", {
-        submissionId: submission.id,
-        addressId: addressId || null,
-        dispatchPincode: dispatchLocation.pincode,
-        dispatchState: dispatchLocation.state,
-        buyerPincode: addressPincode,
-        buyerState: addressState,
-    });
-
     let delivery;
     try {
         delivery = await estimateDeliveryDate(submission, dispatchLocation.pincode, dispatchLocation.state, addressPincode, addressState, acceptanceWindow.delayDays);
@@ -446,10 +438,11 @@ export async function getSellerTransportOptions(req, res) {
 // POST /api/orders
 export async function placeOrder(req, res) {
     const buyerId = req.user.id;
+    // in placeOrder's req.body destructuring, add:
     const {
         submissionId, quantity, purchaseBasis = "per_unit", orderType = "standard",
         sampleOrderId, shippingAddressId, notes,
-        transportMode, // NEW — buyer's OPTIONAL preferred channel key; everything else moved to confirm-time
+        transportMode, transportRouteOptionId, // transportRouteOptionId is NEW
     } = req.body || {};
 
     if (!submissionId) return res.status(400).json({ success: false, message: "Missing listing." });
@@ -584,6 +577,7 @@ export async function placeOrder(req, res) {
         p_purchase_basis: purchaseBasis,
         p_order_type: safeOrderType,
         p_sample_order_id: sampleOrderId || null,
+        p_transport_route_option_id: transportRouteOptionId || null,
         p_transport_mode: safeTransportMode, // buyer's optional preference only
         p_estimated_delivery_date: estDeliveryDateISO,
         p_estimated_delivery_date_max: estDeliveryDateMaxISO,

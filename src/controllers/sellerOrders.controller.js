@@ -1,15 +1,31 @@
 // controllers/sellerOrders.controller.js
+//
+// CHANGED (Transport Library pass):
+// - confirmOrder no longer collects transport details — the buyer and
+//   seller already agreed on a transport option BEFORE purchase, via the
+//   Transport Library (see controllers/transportLibrary.controller.js and
+//   place_order's new p_transport_route_option_id param). Confirming an
+//   order is now a plain approval step. It only falls back to asking for
+//   a `mode` when an order somehow has none set (legacy/edge case).
+// - "processing" is removed from the seller-driven flow. Confirmed orders
+//   go straight to "shipped".
+// - shipOrder is NEW and replaces the old bare status flip: the seller
+//   must upload an LR (their reference document for the buyer, e.g. an
+//   LR/consignment note photo or PDF) AND a bill for the order before the
+//   status can move to "shipped". Company-level transport info (which
+//   company, branch, contact) is already on the order from place_order —
+//   this step only asks for the LR number/proof and the bill.
 import { supabase } from "../config/supabase.js";
 import { notifyOrderChanged, notifyUserOrdersChanged, notifyUser } from "../services/realtimeBroadcast.js";
 import { sendOrderUpdateWhatsApp } from "../services/whatsapp.service.js";
 import { notifyIfWalletJustBlocked } from "../services/walletNotifications.service.js";
-import { getTransportOption, transportLabel } from "../../shared/transportOptions.js"; // NEW
+import { getTransportOption, transportLabel } from "../../shared/transportOptions.js";
+import { routeOptionSummary } from "../../shared/routeTransportFields.js";
 
 function whatsappHeadlineForStatus(newStatus, orderNumber) {
     const map = {
         confirmed: `Your order #${orderNumber} has been confirmed by the seller.`,
         rejected: `Your order #${orderNumber} was rejected by the seller.`,
-        processing: `Your order #${orderNumber} is now being processed.`,
         shipped: `Your order #${orderNumber} has been shipped.`,
         delivered: `Your order #${orderNumber} has been delivered.`,
     };
@@ -29,7 +45,8 @@ export async function listSellerOrders(req, res) {
       payment_status, buyer_contact_name, buyer_contact_phone, buyer_contact_email,
       buyer_gstin, buyer_business_name, buyer_gst_verified,
       shipping_address_snapshot, buyer_notes, created_at, updated_at,
-      buyer_transport_mode, transport_mode, transport_fields, transport_notes, transport_proof_url, transport_confirmed_at, transport_source,
+      buyer_transport_mode, transport_mode, transport_fields, transport_route_option_id,
+      ship_lr_number, ship_bill_url, ship_details_confirmed_at,
       items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied, discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )
     `)
         .eq("seller_id", req.sellerId).neq("status", "awaiting_payment").order("created_at", { ascending: false });
@@ -44,19 +61,6 @@ export async function listSellerOrders(req, res) {
 }
 
 // GET /api/seller/orders/:id
-// NEW (vendor-block fix): the seller's own order fetch previously had no
-// `seller_profiles` join at all — since a seller obviously already knows
-// their own shop, that seemed redundant. But PurchaseOrderDocument.jsx
-// (shared with the buyer's view) reads `order.seller` for the "Vendor"
-// block, and without this join that field is `undefined`, which is what
-// was rendering blank on the seller side despite the `vendorOverride`
-// fallback (that fallback reads fields off the auth `profile` object that
-// don't actually exist there). Joining here — same shape as
-// orders.controller.js's getMyOrder — makes both views consistent and
-// makes vendorOverride purely a belt-and-suspenders fallback instead of
-// the only source of truth.
-// NOTE: swap in the real FK constraint name below if this throws — see
-// the same caveat left on getMyOrder in orders.controller.js.
 export async function getSellerOrder(req, res) {
     const { data: order, error } = await supabase
         .from("orders")
@@ -77,9 +81,6 @@ export async function getSellerOrder(req, res) {
 }
 
 // GET /api/seller/orders/transport-options
-// NEW — the currently logged-in seller's own configured channels, so the
-// frontend can render the ConfirmOrderModal's picker without another
-// round trip through the dashboard endpoint.
 export async function getOwnTransportOptions(req, res) {
     const { data, error } = await supabase.from("seller_profiles").select("transport_options").eq("id", req.sellerId).maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
@@ -115,20 +116,24 @@ function transitionHandler(newStatus) {
             await notifyUser(row.notify_user_id, {
                 type: `order_status_${newStatus}`,
                 title: `Order ${row.order_number} ${newStatus.replace("_", " ")}`,
-                body: reason || `Your order status was updated to ${newStatus.replace("_", " ")}.`,
+                body: newStatus === "shipped"
+                    ? "Your order has shipped — the LR details and bill are attached to your order."
+                    : (reason || `Your order status was updated to ${newStatus.replace("_", " ")}.`),
                 link: `/orders/${req.params.id}`,
             });
             await notifyUserOrdersChanged(row.notify_user_id);
 
             const { data: orderRow } = await supabase
                 .from("orders")
-                .select("buyer_contact_name, buyer_contact_phone, transport_mode, transport_fields")
+                .select("buyer_contact_name, buyer_contact_phone, transport_mode, transport_fields, ship_lr_number")
                 .eq("id", req.params.id)
                 .maybeSingle();
             if (orderRow?.buyer_contact_phone) {
-                const transportDetail = newStatus === "confirmed" && orderRow.transport_mode
-                    ? `Transport: ${transportLabel(orderRow.transport_mode)}.`
-                    : (reason || "");
+                let transportDetail = reason || "";
+                if (newStatus === "shipped") {
+                    const companyLabel = routeOptionSummary(orderRow.transport_mode, orderRow.transport_fields || {});
+                    transportDetail = `Shipped via ${companyLabel}. LR/tracking no.: ${orderRow.ship_lr_number || "—"}. Check your order for the LR document and bill.`;
+                }
                 await sendOrderUpdateWhatsApp({
                     to: orderRow.buyer_contact_phone,
                     name: orderRow.buyer_contact_name,
@@ -144,34 +149,20 @@ function transitionHandler(newStatus) {
     };
 }
 
-// Internal — actually flips the order to "confirmed" via the shared RPC
-// path (order_events row, notifications, wallet accrual, WhatsApp). Not
-// exported: always called AFTER the transport details below are saved,
-// via confirmOrder().
 const runConfirmTransition = transitionHandler("confirmed");
-
-async function uploadTransportProofFile(file, orderId) {
-    if (!file) return null;
-    const ext = (file.originalname.split(".").pop() || "bin").toLowerCase();
-    const path = `${orderId}/${Date.now()}.${ext}`;
-    const { error } = await supabase.storage
-        .from("order-transport-proof")
-        .upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
-    if (error) throw new Error(error.message);
-    const { data } = supabase.storage.from("order-transport-proof").getPublicUrl(path);
-    return data.publicUrl;
-}
+const runShipTransition = transitionHandler("shipped");
 
 // POST /api/seller/orders/:id/confirm
+// Transport is agreed pre-purchase now (Transport Library) — this is a
+// plain approval. Only falls back to asking for `mode` if an order
+// somehow has no transport_mode set at all (e.g. buyer skipped selecting
+// a preference and none was ever attached).
 export async function confirmOrder(req, res) {
     const orderId = req.params.id;
-    const { mode, fields, notes } = req.body || {};
-
-    if (!mode) return res.status(400).json({ success: false, message: "Please select a transport method." });
 
     const { data: order, error: orderErr } = await supabase
         .from("orders")
-        .select("id, seller_id, buyer_transport_mode, order_number, status")
+        .select("id, seller_id, status, transport_mode")
         .eq("id", orderId).eq("seller_id", req.sellerId)
         .maybeSingle();
     if (orderErr) return res.status(500).json({ success: false, message: orderErr.message });
@@ -180,55 +171,99 @@ export async function confirmOrder(req, res) {
         return res.status(400).json({ success: false, message: "This order isn't awaiting confirmation." });
     }
 
-    if (order.buyer_transport_mode && order.buyer_transport_mode !== mode) {
-        return res.status(400).json({
-            success: false,
-            message: `The buyer requested ${transportLabel(order.buyer_transport_mode)} for this order.`,
-        });
+    if (!order.transport_mode) {
+        const { mode } = req.body || {};
+        if (!mode) {
+            return res.status(400).json({ success: false, code: "TRANSPORT_MODE_REQUIRED", message: "Please select a transport method for this order before confirming." });
+        }
+        const optionSchema = getTransportOption(mode);
+        if (!optionSchema) return res.status(400).json({ success: false, message: "Unrecognised transport method." });
+
+        const { data: sellerProfile } = await supabase.from("seller_profiles").select("transport_options").eq("id", req.sellerId).maybeSingle();
+        const offered = Array.isArray(sellerProfile?.transport_options) ? sellerProfile.transport_options : [];
+        if (!offered.includes(mode)) {
+            return res.status(400).json({ success: false, message: "You haven't enabled this transport method — update it from Shop Settings." });
+        }
+
+        const { error: updateErr } = await supabase
+            .from("orders")
+            .update({ transport_mode: mode, transport_source: "seller_choice" })
+            .eq("id", orderId);
+        if (updateErr) return res.status(500).json({ success: false, message: updateErr.message });
     }
 
-    const optionSchema = getTransportOption(mode);
-    if (!optionSchema) return res.status(400).json({ success: false, message: "Unrecognised transport method." });
+    return runConfirmTransition(req, res);
+}
 
-    const { data: sellerProfile } = await supabase.from("seller_profiles").select("transport_options").eq("id", req.sellerId).maybeSingle();
-    const offered = Array.isArray(sellerProfile?.transport_options) ? sellerProfile.transport_options : [];
-    if (!offered.includes(mode)) {
-        return res.status(400).json({ success: false, message: "You haven't enabled this transport method — update it from Shop Settings." });
+async function uploadShipmentFile(file, orderId, kind) {
+    const ext = (file.originalname.split(".").pop() || "bin").toLowerCase();
+    const path = `${orderId}/${kind}-${Date.now()}.${ext}`;
+    const { error } = await supabase.storage
+        .from("order-shipment-docs")
+        .upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
+    if (error) throw new Error(error.message);
+    const { data } = supabase.storage.from("order-shipment-docs").getPublicUrl(path);
+    return data.publicUrl;
+}
+
+// POST /api/seller/orders/:id/ship
+// multipart/form-data: fields lrNumber, lrNotes; files lr_proof, bill
+// (both required). Replaces the previous bare "processing"/"shipped"
+// status flip and folds in what used to be collected at confirm time —
+// but now scoped to the actual shipment, not the transport company
+// choice (which is already fixed from place_order).
+export async function shipOrder(req, res) {
+    const orderId = req.params.id;
+    const { lrNumber, lrNotes } = req.body || {};
+
+    if (!lrNumber || !lrNumber.trim()) {
+        return res.status(400).json({ success: false, message: "Please enter the LR / tracking number." });
     }
 
-    let parsedFields = {};
-    try { parsedFields = fields ? JSON.parse(fields) : {}; } catch { parsedFields = {}; }
+    const lrFile = req.files?.lr_proof?.[0];
+    const billFile = req.files?.bill?.[0];
+    if (!lrFile) return res.status(400).json({ success: false, message: "Please upload the LR document for the buyer's reference." });
+    if (!billFile) return res.status(400).json({ success: false, message: "Please upload the bill for this order." });
 
-    const missing = optionSchema.fields.filter((f) => f.required && !String(parsedFields[f.key] || "").trim()).map((f) => f.label);
-    if (missing.length) {
-        return res.status(400).json({ success: false, message: `Please fill in: ${missing.join(", ")}.` });
+    const { data: order, error: orderErr } = await supabase
+        .from("orders")
+        .select("id, seller_id, status, order_number")
+        .eq("id", orderId).eq("seller_id", req.sellerId)
+        .maybeSingle();
+    if (orderErr) return res.status(500).json({ success: false, message: orderErr.message });
+    if (!order) return res.status(404).json({ success: false, message: "Order not found." });
+    if (!["confirmed", "processing"].includes(order.status)) {
+        return res.status(400).json({ success: false, message: "This order isn't ready to be shipped." });
     }
 
-    let proofUrl = null;
+    let lrProofUrl, billUrl;
     try {
-        proofUrl = await uploadTransportProofFile(req.file, orderId);
+        lrProofUrl = await uploadShipmentFile(lrFile, orderId, "lr");
+        billUrl = await uploadShipmentFile(billFile, orderId, "bill");
     } catch (e) {
-        console.error("[confirmOrder] transport proof upload failed:", e);
-        return res.status(500).json({ success: false, message: "Couldn't upload the proof file. Please try again." });
+        console.error("[shipOrder] upload failed:", e?.message || e);
+        return res.status(500).json({ success: false, message: "Couldn't upload one of the files. Please try again." });
     }
 
     const { error: updateErr } = await supabase
         .from("orders")
         .update({
-            transport_mode: mode,
-            transport_fields: parsedFields,
-            transport_notes: notes?.trim() || null,
-            transport_proof_url: proofUrl,
-            transport_confirmed_at: new Date().toISOString(),
-            transport_source: order.buyer_transport_mode ? "buyer_requested" : "seller_choice",
+            ship_lr_number: lrNumber.trim(),
+            ship_lr_notes: lrNotes?.trim() || null,
+            ship_lr_proof_url: lrProofUrl,
+            ship_bill_url: billUrl,
+            ship_details_confirmed_at: new Date().toISOString(),
         })
         .eq("id", orderId);
     if (updateErr) return res.status(500).json({ success: false, message: updateErr.message });
 
-    return runConfirmTransition(req, res);
+    return runShipTransition(req, res);
 }
 
 export const rejectOrder = transitionHandler("rejected");
-export const processOrder = transitionHandler("processing");
-export const shipOrder = transitionHandler("shipped");
 export const deliverOrder = transitionHandler("delivered");
+
+// Kept for backward compatibility with any orders/tools still calling it
+// directly — no longer routed from the seller UI (see routes file: the
+// "processing" step is skipped, confirmed -> shipped directly).
+export const processOrder = transitionHandler("processing");

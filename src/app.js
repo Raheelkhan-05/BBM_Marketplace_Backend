@@ -27,6 +27,7 @@ import sellerWalletRoutes from "./routes/wallet.routes.js";
 import contactsRoutes from "./routes/contacts.routes.js";
 import buyerBusinessProfileRoutes from "./routes/buyerBusinessProfile.routes.js";
 import helpRoutes from "./routes/help.routes.js";
+import transportLibraryRoutes from "./routes/transportLibrary.routes.js";
 
 export function createApp() {
   const app = express();
@@ -96,6 +97,7 @@ export function createApp() {
   app.use("/api/credit", creditRoutes);
   app.use("/api/cart", cartRoutes);
   app.use("/api/help", helpRoutes);
+  app.use("/api/transport-library", transportLibraryRoutes);
 
   app.use((err, req, res, next) => {
     console.error(err);
