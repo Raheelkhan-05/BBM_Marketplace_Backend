@@ -26,6 +26,8 @@ const ERROR_MAP = {
     ADDRESS_NOT_FOUND: { status: 400, message: "Please select a valid shipping address." },
     INVALID_QUANTITY: { status: 400, message: "Please enter a valid quantity." },
     OUT_OF_STOCK: { status: 400, message: "This item is currently out of stock." },
+    CREDIT_LIMIT_EXCEEDED: { status: 400, message: "This order exceeds what's currently available on credit with this seller. Try a smaller order, pay another way, or ask the seller to reconsider your credit." },
+    CREDIT_LIMIT_REQUIRED: { status: 400, message: "A credit limit is required to approve this request." },
 };
 function mapRpcError(error) {
     return ERROR_MAP[(error?.message || "").trim()] || { status: 500, message: "Couldn't place the order. Please try again." };

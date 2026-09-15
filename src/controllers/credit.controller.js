@@ -193,11 +193,15 @@ export async function requestCredit(req, res) {
 }
 
 export async function decideCredit(req, res) {
-    const { decision } = req.body;
+    const { decision, creditLimit } = req.body;
     const { error } = await supabase.rpc("decide_credit", {
-        p_credit_id: req.params.id, p_seller_user_id: req.user.id, p_decision: decision,
+        p_credit_id: req.params.id, p_seller_user_id: req.user.id,
+        p_decision: decision, p_credit_limit: decision === "approved" ? Number(creditLimit) : null,
     });
-    if (error) return res.status(400).json({ success: false, message: "Couldn't record the decision." });
+    if (error) {
+        const map = { CREDIT_LIMIT_REQUIRED: "Please set a credit limit to approve this request." };
+        return res.status(400).json({ success: false, message: map[error.message] || "Couldn't record the decision." });
+    }
 
     const { data: credit } = await supabase.from("buyer_seller_credit").select("*").eq("id", req.params.id).single();
 
@@ -215,6 +219,42 @@ export async function decideCredit(req, res) {
         });
     }
 }
+
+// credit.controller.js — before returning to a buyer-viewer
+function sanitizeForBuyer(credit) {
+    if (!credit) return credit;
+    const { credit_limit, credit_used, period_start, ...safe } = credit;
+    return safe; // buyer gets status/cooldown/etc, never limit or usage
+}
+
+// credit.controller.js — new export
+// export async function requestCreditIncrease(req, res) {
+//     const { creditId } = req.body;
+//     const { data: credit } = await supabase.from("buyer_seller_credit").select("*").eq("id", creditId).eq("buyer_id", req.user.id).maybeSingle();
+//     if (!credit || credit.status !== "approved") {
+//         return res.status(400).json({ success: false, message: "No active credit arrangement found." });
+//     }
+//     const { data: msg, error } = await supabase.from("chat_messages").insert({
+//         conversation_id: credit.conversation_id, sender_id: req.user.id,
+//         body: "Requested a higher credit limit", message_type: "credit_limit_request",
+//         metadata: { creditId: credit.id },
+//     }).select("*").single();
+//     if (error) return res.status(500).json({ success: false, message: error.message });
+
+//     await supabase.from("buyer_seller_credit").update({
+//         limit_increase_requested_at: new Date().toISOString(),
+//         limit_increase_request_message_id: msg.id,
+//     }).eq("id", creditId);
+
+//     res.json({ success: true, conversationId: credit.conversation_id });
+//     emitToConversation(credit.conversation_id, "message:new", { ...msg, status: "sent" });
+//     notifyUser(/* seller's user id, looked up same way as requestCredit */ {
+//         type: "credit_limit_request",
+//         title: "Credit limit increase requested",
+//         body: "A buyer has asked you to reconsider their credit limit.",
+//         link: `/chat/${credit.conversation_id}`,
+//     });
+// }
 
 export async function toggleCredit(req, res) {
     const { buyerId, enabled } = req.body;
@@ -234,5 +274,152 @@ export async function toggleCredit(req, res) {
         title: enabled ? "Credit enabled" : "Credit turned off",
         body: enabled ? "A seller has enabled buy-on-credit for you." : "A seller has turned off buy-on-credit for you.",
         link: credit?.conversation_id ? `/chat/${credit.conversation_id}` : undefined,
+    });
+}
+
+// credit.controller.js — new export
+// REPLACE the existing updateCreditLimit body's post-RPC section with this
+// (defensive clear, since we don't know what update_credit_limit RPC itself clears):
+export async function updateCreditLimit(req, res) {
+    const { newLimit, resetUsed } = req.body;
+    const { data: before } = await supabase.from("buyer_seller_credit").select("limit_increase_request_message_id").eq("id", req.params.id).maybeSingle();
+
+    const { error } = await supabase.rpc("update_credit_limit", {
+        p_credit_id: req.params.id,
+        p_seller_user_id: req.user.id,
+        p_new_limit: Number(newLimit),
+        p_reset_used: resetUsed !== false,
+    });
+    if (error) {
+        const map = { CREDIT_LIMIT_REQUIRED: "Please enter a valid credit limit." };
+        return res.status(400).json({ success: false, message: map[error.message] || "Couldn't update the credit limit." });
+    }
+
+    // Defensive: make sure a live limit-increase request doesn't linger as
+    // "pending" forever after being approved this way.
+    if (before?.limit_increase_request_message_id) {
+        await supabase.from("buyer_seller_credit").update({
+            limit_increase_requested_at: null,
+            limit_increase_request_message_id: null,
+        }).eq("id", req.params.id);
+
+        const { data: msg } = await supabase.from("chat_messages").select("metadata").eq("id", before.limit_increase_request_message_id).maybeSingle();
+        const metadataPatch = { finalStatus: "approved" };
+        await supabase.from("chat_messages").update({ metadata: { ...(msg?.metadata || {}), ...metadataPatch } }).eq("id", before.limit_increase_request_message_id);
+    }
+
+    const { data: credit } = await supabase.from("buyer_seller_credit").select("*").eq("id", req.params.id).single();
+
+    res.json({ success: true, credit });
+
+    if (credit?.conversation_id) {
+        if (before?.limit_increase_request_message_id) {
+            emitToConversation(credit.conversation_id, "message:updated", {
+                conversationId: credit.conversation_id, messageId: before.limit_increase_request_message_id, metadataPatch: { finalStatus: "approved" },
+            });
+        }
+        emitToConversation(credit.conversation_id, "credit:decided", { creditId: credit.id, status: credit.status, cooldownUntil: credit.cooldown_until });
+    }
+    if (credit?.buyer_id) {
+        notifyUser(credit.buyer_id, {
+            type: "credit_decision", title: "Credit limit updated",
+            body: "Your seller has updated your monthly credit limit.",
+            link: credit.conversation_id ? `/chat/${credit.conversation_id}` : undefined,
+        });
+    }
+}
+
+// NEW — seller declines a limit-increase ask. Sets a cooldown so the buyer
+// can't immediately re-ask, mirroring how decide_credit's rejection cooldown works.
+export async function declineCreditIncrease(req, res) {
+    const { cooldownDays = 14 } = req.body || {};
+
+    const { data: credit } = await supabase.from("buyer_seller_credit").select("*").eq("id", req.params.id).maybeSingle();
+    if (!credit || !credit.limit_increase_request_message_id) {
+        return res.status(400).json({ success: false, message: "No pending limit increase request." });
+    }
+
+    const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", credit.seller_id).maybeSingle();
+    if (!sellerProfile || sellerProfile.user_id !== req.user.id) {
+        return res.status(403).json({ success: false, message: "Not authorized." });
+    }
+
+    const cooldownUntil = new Date();
+    cooldownUntil.setDate(cooldownUntil.getDate() + Number(cooldownDays));
+
+    const requestMessageId = credit.limit_increase_request_message_id;
+
+    const { error } = await supabase.from("buyer_seller_credit").update({
+        limit_increase_requested_at: null,
+        limit_increase_request_message_id: null,
+        limit_increase_cooldown_until: cooldownUntil.toISOString(),
+    }).eq("id", req.params.id);
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    const { data: msg } = await supabase.from("chat_messages").select("metadata").eq("id", requestMessageId).maybeSingle();
+    const metadataPatch = { finalStatus: "rejected" };
+    await supabase.from("chat_messages").update({ metadata: { ...(msg?.metadata || {}), ...metadataPatch } }).eq("id", requestMessageId);
+
+    const { data: updated } = await supabase.from("buyer_seller_credit").select("*").eq("id", req.params.id).single();
+
+    res.json({ success: true, credit: updated });
+
+    if (updated?.conversation_id) {
+        emitToConversation(updated.conversation_id, "message:updated", { conversationId: updated.conversation_id, messageId: requestMessageId, metadataPatch });
+        emitToConversation(updated.conversation_id, "credit:decided", {
+            creditId: updated.id, status: updated.status,
+            limitIncreaseCooldownUntil: updated.limit_increase_cooldown_until,
+        });
+    }
+    if (updated?.buyer_id) {
+        notifyUser(updated.buyer_id, {
+            type: "credit_decision", title: "Credit limit request declined",
+            body: "Your seller declined your request for a higher credit limit.",
+            link: updated.conversation_id ? `/chat/${updated.conversation_id}` : undefined,
+        });
+    }
+}
+
+export async function requestCreditIncrease(req, res) {
+    const { creditId } = req.body;
+    const { data: credit } = await supabase.from("buyer_seller_credit").select("*").eq("id", creditId).eq("buyer_id", req.user.id).maybeSingle();
+    if (!credit || credit.status !== "approved") {
+        return res.status(400).json({ success: false, message: "No active credit arrangement found." });
+    }
+
+    // NEW — only one live increase request at a time, and respect the cooldown after a decline
+    if (credit.limit_increase_request_message_id) {
+        return res.status(400).json({ success: false, code: "INCREASE_ALREADY_PENDING", message: "A request for a higher limit is already pending." });
+    }
+    if (credit.limit_increase_cooldown_until && new Date(credit.limit_increase_cooldown_until) > new Date()) {
+        return res.status(400).json({ success: false, code: "INCREASE_COOLDOWN_ACTIVE", message: "You can ask for a higher limit again after the cooldown period." });
+    }
+
+    // NEW — resolve the seller's user_id so we know who to notify
+    const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", credit.seller_id).maybeSingle();
+    if (!sellerProfile) {
+        return res.status(400).json({ success: false, message: "Couldn't find the seller for this credit arrangement." });
+    }
+
+    const { data: msg, error } = await supabase.from("chat_messages").insert({
+        conversation_id: credit.conversation_id, sender_id: req.user.id,
+        body: "Requested a higher credit limit", message_type: "credit_limit_request",
+        metadata: { creditId: credit.id },
+    }).select("*").single();
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    await supabase.from("buyer_seller_credit").update({
+        limit_increase_requested_at: new Date().toISOString(),
+        limit_increase_request_message_id: msg.id,
+    }).eq("id", creditId);
+
+    res.json({ success: true, conversationId: credit.conversation_id });
+
+    emitToConversation(credit.conversation_id, "message:new", { ...msg, status: "sent" });
+    notifyUser(sellerProfile.user_id, {
+        type: "credit_limit_request",
+        title: "Credit limit increase requested",
+        body: "A buyer has asked you to reconsider their credit limit.",
+        link: `/chat/${credit.conversation_id}`,
     });
 }
