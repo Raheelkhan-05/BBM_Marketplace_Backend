@@ -13,8 +13,35 @@ function normalizeLoc(s) {
     return (s || "").trim();
 }
 
+// Collapses internal whitespace runs down to a single space, trims edges,
+// and lowercases. Used ONLY for comparison keys — never for what gets
+// stored — so "Patel transport", "Patel transport ", and "Patel  Transport"
+// are all recognised as the same company when matching against a removed
+// row, instead of silently missing and inserting a duplicate.
+function normForCompare(s) {
+    return (s || "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
 function identityValue(mode, fields) {
     return fields?.transport_company || fields?.train_number || fields?.airline_name || "";
+}
+
+// Same as identityValue, but normalized for equality checks.
+function identityKey(mode, fields) {
+    return normForCompare(identityValue(mode, fields));
+}
+
+// Trims every string field value before it's persisted, so whatever gets
+// written to the DB is already clean — this keeps future comparisons
+// (and what buyers/sellers see rendered) free of stray whitespace, rather
+// than relying on every reader to normalize on the way out.
+function normalizeFieldValues(fields) {
+    if (!fields || typeof fields !== "object") return fields || {};
+    const out = {};
+    for (const [k, v] of Object.entries(fields)) {
+        out[k] = typeof v === "string" ? v.trim().replace(/\s+/g, " ") : v;
+    }
+    return out;
 }
 
 function validateFields(mode, fields) {
@@ -72,7 +99,7 @@ export async function getRouteSuggestions(req, res) {
     const seen = new Set();
     const suggestions = [];
     for (const row of data || []) {
-        const key = `${row.mode}::${identityValue(row.mode, row.fields).toLowerCase()}`;
+        const key = `${row.mode}::${identityKey(row.mode, row.fields)}`;
         if (seen.has(key)) continue;
         seen.add(key);
         suggestions.push({ mode: row.mode, fields: row.fields });
@@ -91,10 +118,11 @@ export async function proposeRouteOption(req, res) {
     if (!sellerId || !originState || !originCity || !destState || !destCity || !mode) {
         return res.status(400).json({ success: false, message: "Missing required fields." });
     }
-    const fieldError = validateFields(mode, fields || {});
+    const cleanFields = normalizeFieldValues(fields || {});
+    const fieldError = validateFields(mode, cleanFields);
     if (fieldError) return res.status(400).json({ success: false, message: fieldError });
 
-    const identity = identityValue(mode, fields);
+    const identity = identityKey(mode, cleanFields);
 
     const { data: existing } = await supabase
         .from("transport_route_options")
@@ -108,16 +136,22 @@ export async function proposeRouteOption(req, res) {
         .in("status", ["proposed", "approved"])
         .maybeSingle();
 
-    if (existing && identityValue(existing.mode, existing.fields).toLowerCase() === identity.toLowerCase()) {
+    if (existing && identityKey(existing.mode, existing.fields) === identity) {
         return res.json({ success: true, reused: true, option: existing });
     }
 
-    // NEW: if this exact seller+route+mode+company was previously removed
-    // by the seller, a fresh INSERT would collide with that row under the
+    // If this exact seller+route+mode+company was previously removed by
+    // the seller, a fresh INSERT would collide with that row under the
     // unique constraint. Reactivate that same row instead — but back to
     // "proposed", not "approved", since a buyer re-requesting it still
     // needs the seller to sign off again, same as any new proposal.
-    const { data: removedMatch } = await supabase
+    //
+    // Matched on trimmed/whitespace-collapsed/case-insensitive identity
+    // (identityKey) rather than a raw string compare — a stray trailing
+    // space or different casing in how the company name was typed this
+    // time around must not stop this from finding the old row, or a
+    // duplicate silently gets created instead of a reactivation.
+    const { data: removedCandidates } = await supabase
         .from("transport_route_options")
         .select("*")
         .eq("seller_id", sellerId)
@@ -126,15 +160,18 @@ export async function proposeRouteOption(req, res) {
         .ilike("origin_state", normalizeLoc(originState))
         .ilike("origin_city", normalizeLoc(originCity))
         .ilike("dest_state", normalizeLoc(destState))
-        .ilike("dest_city", normalizeLoc(destCity))
-        .maybeSingle();
+        .ilike("dest_city", normalizeLoc(destCity));
 
-    if (removedMatch && identityValue(removedMatch.mode, removedMatch.fields).toLowerCase() === identity.toLowerCase()) {
+    const removedMatch = (removedCandidates || []).find(
+        (row) => identityKey(row.mode, row.fields) === identity
+    );
+
+    if (removedMatch) {
         const { data: reactivated, error: reactivateError } = await supabase
             .from("transport_route_options")
             .update({
                 status: "proposed",
-                fields: fields || {},
+                fields: cleanFields,
                 removed_at: null,
                 approved_at: null,
                 proposed_by_buyer_id: buyerId,
@@ -164,7 +201,7 @@ export async function proposeRouteOption(req, res) {
             seller_id: sellerId,
             origin_state: normalizeLoc(originState), origin_city: normalizeLoc(originCity),
             dest_state: normalizeLoc(destState), dest_city: normalizeLoc(destCity),
-            mode, fields: fields || {}, status: "proposed",
+            mode, fields: cleanFields, status: "proposed",
             proposed_by_buyer_id: buyerId, proposal_note: note?.trim() || null,
         })
         .select()
@@ -198,7 +235,6 @@ export async function proposeRouteOption(req, res) {
 }
 
 // POST /api/transport-library/proposals/:id/approve  (seller only)
-// POST /api/transport-library/proposals/:id/approve  (seller only)
 export async function approveProposal(req, res) {
     const { data: row } = await supabase.from("transport_route_options").select("*").eq("id", req.params.id).maybeSingle();
     if (!row) return res.status(404).json({ success: false, message: "Proposal not found." });
@@ -211,13 +247,13 @@ export async function approveProposal(req, res) {
         .eq("id", req.params.id);
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    // NEW: the buyer may have chosen "continue to order" while this was
-    // still pending, which explicitly saved a "no preference for now"
-    // decision (mode: null) to buyer_seller_transport_preferences. Now
-    // that the seller has approved exactly what the buyer proposed,
-    // update that saved decision to point at the newly-approved option —
-    // otherwise the buyer's Buy Now form keeps reading the stale "no
-    // preference" row forever and never learns the approval happened.
+    // The buyer may have chosen "continue to order" while this was still
+    // pending, which explicitly saved a "no preference for now" decision
+    // (mode: null) to buyer_seller_transport_preferences. Now that the
+    // seller has approved exactly what the buyer proposed, update that
+    // saved decision to point at the newly-approved option — otherwise
+    // the buyer's Buy Now form keeps reading the stale "no preference"
+    // row forever and never learns the approval happened.
     if (row.proposed_by_buyer_id) {
         await supabase
             .from("buyer_seller_transport_preferences")
@@ -245,7 +281,6 @@ export async function approveProposal(req, res) {
 }
 
 // POST /api/transport-library/proposals/:id/reject  (seller only)
-// POST /api/transport-library/proposals/:id/reject  (seller only)
 export async function rejectProposal(req, res) {
     const { reason } = req.body || {};
     const { data: row } = await supabase.from("transport_route_options").select("*").eq("id", req.params.id).maybeSingle();
@@ -259,7 +294,7 @@ export async function rejectProposal(req, res) {
         .eq("id", req.params.id);
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    // NEW: mark this rejection as unacknowledged on the buyer's saved
+    // Mark this rejection as unacknowledged on the buyer's saved
     // preference row. Unlike approval, there's no option to point at
     // here — so this is the only way the buyer's Buy Now form (possibly
     // in a fresh session later) can learn "your proposal was declined"
@@ -293,35 +328,41 @@ export async function rejectProposal(req, res) {
 }
 
 // GET /api/transport-library/mine  (seller manage page)
-// GET /api/transport-library/mine  (seller manage page)
 export async function listMyRouteOptions(req, res) {
     const { data, error } = await supabase
         .from("transport_route_options")
         .select("*")
         .eq("seller_id", req.sellerId)
-        .neq("status", "removed")   // NEW
+        .neq("status", "removed")
         .order("created_at", { ascending: false });
     if (error) return res.status(500).json({ success: false, message: error.message });
     res.json({ success: true, options: data || [] });
 }
 
 // POST /api/transport-library/options  (seller adds their own — no approval step)
-// POST /api/transport-library/options  (seller adds their own — no approval step)
 export async function createOwnRouteOption(req, res) {
     const { originState, originCity, destState, destCity, mode, fields } = req.body || {};
     if (!originState || !originCity || !destState || !destCity || !mode) {
         return res.status(400).json({ success: false, message: "Missing required fields." });
     }
-    const fieldError = validateFields(mode, fields || {});
+    const cleanFields = normalizeFieldValues(fields || {});
+    const fieldError = validateFields(mode, cleanFields);
     if (fieldError) return res.status(400).json({ success: false, message: fieldError });
 
-    const identity = identityValue(mode, fields || {});
+    const identity = identityKey(mode, cleanFields);
 
     // If this seller previously removed this exact route+mode+company,
     // reactivate that same row instead of inserting a new one — keeps
     // one historical record instead of forking into two, and sidesteps
     // the active-rows unique constraint entirely.
-    const { data: removedMatch } = await supabase
+    //
+    // Matched on identityKey (trimmed/whitespace-collapsed/lowercased)
+    // rather than a raw equality check — this is what was silently
+    // failing before: a re-typed company name that differed only by a
+    // stray space or letter casing from the original never matched the
+    // removed row, so a duplicate got inserted instead of the old one
+    // being brought back.
+    const { data: removedCandidates } = await supabase
         .from("transport_route_options")
         .select("*")
         .eq("seller_id", req.sellerId)
@@ -330,13 +371,16 @@ export async function createOwnRouteOption(req, res) {
         .ilike("origin_state", normalizeLoc(originState))
         .ilike("origin_city", normalizeLoc(originCity))
         .ilike("dest_state", normalizeLoc(destState))
-        .ilike("dest_city", normalizeLoc(destCity))
-        .maybeSingle();
+        .ilike("dest_city", normalizeLoc(destCity));
 
-    if (removedMatch && identityValue(removedMatch.mode, removedMatch.fields).toLowerCase() === identity.toLowerCase()) {
+    const removedMatch = (removedCandidates || []).find(
+        (row) => identityKey(row.mode, row.fields) === identity
+    );
+
+    if (removedMatch) {
         const { data: reactivated, error: reactivateError } = await supabase
             .from("transport_route_options")
-            .update({ status: "approved", fields: fields || {}, removed_at: null, approved_at: new Date().toISOString() })
+            .update({ status: "approved", fields: cleanFields, removed_at: null, approved_at: new Date().toISOString() })
             .eq("id", removedMatch.id)
             .select().single();
         if (reactivateError) return res.status(500).json({ success: false, message: reactivateError.message });
@@ -349,7 +393,7 @@ export async function createOwnRouteOption(req, res) {
             seller_id: req.sellerId,
             origin_state: normalizeLoc(originState), origin_city: normalizeLoc(originCity),
             dest_state: normalizeLoc(destState), dest_city: normalizeLoc(destCity),
-            mode, fields: fields || {}, status: "approved", approved_at: new Date().toISOString(),
+            mode, fields: cleanFields, status: "approved", approved_at: new Date().toISOString(),
         })
         .select().single();
 
@@ -367,15 +411,15 @@ export async function updateOwnRouteOption(req, res) {
     if (!row) return res.status(404).json({ success: false, message: "Not found." });
     if (row.seller_id !== req.sellerId) return res.status(403).json({ success: false, message: "Not your listing." });
 
-    const fieldError = validateFields(row.mode, fields || {});
+    const cleanFields = normalizeFieldValues(fields || {});
+    const fieldError = validateFields(row.mode, cleanFields);
     if (fieldError) return res.status(400).json({ success: false, message: fieldError });
 
-    const { error } = await supabase.from("transport_route_options").update({ fields }).eq("id", req.params.id);
+    const { error } = await supabase.from("transport_route_options").update({ fields: cleanFields }).eq("id", req.params.id);
     if (error) return res.status(500).json({ success: false, message: error.message });
     res.json({ success: true });
 }
 
-// DELETE /api/transport-library/options/:id  (seller only)
 // DELETE /api/transport-library/options/:id  (seller only)
 // Soft-delete: this row may be referenced by past orders
 // (orders.transport_route_option_id) and is meant to be retained history
@@ -438,14 +482,11 @@ export async function listPendingProposals(req, res) {
     res.json({ success: true, proposals: data || [] });
 }
 
-// GET /api/transport-library/buyer-preference?sellerId=&destState=&destCity=
+// GET /api/transport-library/buyer-preference?sellerId=&destState=&destCity=&checkProposalId=
 // Whether THIS buyer has already decided a transport preference for THIS
 // seller ON THIS ROUTE (their selected address's city/state) — not just
 // "this seller in general". A buyer with two addresses in different
 // cities can have two different decisions for the same seller.
-// GET /api/transport-library/buyer-preference?sellerId=&destState=&destCity=
-// GET /api/transport-library/buyer-preference?sellerId=&destState=&destCity=
-// GET /api/transport-library/buyer-preference?sellerId=&destState=&destCity=&checkProposalId=
 export async function getBuyerSellerTransportPreference(req, res) {
     const buyerId = req.user.id;
     const { sellerId, destState, destCity, checkProposalId } = req.query;
@@ -486,7 +527,7 @@ export async function getBuyerSellerTransportPreference(req, res) {
         .maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    // NEW: an unacknowledged rejection takes priority in the response
+    // An unacknowledged rejection takes priority in the response
     // regardless of what else is (or isn't) saved — it's independent of
     // whether a decision/pending proposal exists, since rejection wipes
     // out the thing the buyer would otherwise be shown.
@@ -540,8 +581,8 @@ export async function setBuyerSellerTransportPreference(req, res) {
         route_option_id: preference?.routeOptionId || null,
         mode: preference?.mode || null,
         fields: preference?.fields || null,
-        // NEW: any explicit save — including Skip — acknowledges and
-        // clears a pending rejection notice.
+        // Any explicit save — including Skip — acknowledges and clears a
+        // pending rejection notice.
         rejected_route_option_id: null,
         rejected_mode: null,
         rejected_fields: null,
