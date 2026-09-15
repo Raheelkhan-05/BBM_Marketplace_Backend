@@ -170,3 +170,36 @@ export async function getBrandItemsFeed(req, res) {
     }
     return res.json({ success: true, ...data });
 }
+
+// catalog.controller.js
+export async function getBrandItemSellerOffer(req, res) {
+    const { brandItemId } = req.params;
+    const { shopSlug } = req.query;
+    if (!shopSlug) return res.status(400).json({ success: false, message: "shopSlug is required." });
+
+    const { data, error } = await supabaseAdmin.rpc("catalog_brand_item_seller_offer", {
+        p_brand_item_id: brandItemId,
+        p_shop_slug: shopSlug,
+    });
+
+    if (error) {
+        console.error("[catalog] getBrandItemSellerOffer failed:", error.message);
+        return res.status(500).json({ success: false, message: "Couldn't load this offer right now." });
+    }
+    if (!data?.item) return res.status(404).json({ success: false, message: "Product not found." });
+    if (!data.found) return res.status(404).json({ success: false, message: "This seller no longer has this listing available." });
+    return res.json({ success: true, item: data.item, offer: data.offer });
+}
+
+export async function getSharedProductLink(req, res) {
+    const { submissionId } = req.params;
+    const { data, error } = await supabaseAdmin.rpc("catalog_shared_product_link", {
+        p_submission_id: submissionId,
+    });
+    if (error) {
+        console.error("[catalog] getSharedProductLink failed:", error.message);
+        return res.status(500).json({ success: false, message: "Couldn't load this link right now." });
+    }
+    if (!data) return res.status(404).json({ success: false, message: "This product link is no longer available." });
+    return res.json({ success: true, ...data });
+}

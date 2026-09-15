@@ -12,6 +12,8 @@ import {
     getBrandItemSellers,
     getGenericProductsFeed,
     getBrandItemsFeed,
+    getBrandItemSellerOffer,
+    getSharedProductLink
 } from "../controllers/catalog.controller.js";
 
 const router = Router();
@@ -22,6 +24,9 @@ router.get("/generic-products/:genericProductId/brands", getGenericProductBrands
 router.get("/brand-items/:brandItemId", getBrandItemDetail);
 router.get("/brand-items-feed", getBrandItemsFeed);
 router.get("/brand-items/:brandItemId/sellers", getBrandItemSellers);
+
+router.get("/brand-items/:brandItemId/seller-offer", getBrandItemSellerOffer);
+router.get("/shared/:submissionId", getSharedProductLink);
 
 export default router;
 
