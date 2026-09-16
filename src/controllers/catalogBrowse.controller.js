@@ -34,8 +34,15 @@ export async function browseCatalog(req, res) {
         offset = 0,
     } = req.query;
 
+    console.log("browseCatalog auth debug:", { sellerId: req.sellerId, buyerId: req.buyerId, hasAuthHeader: !!req.headers.authorization });
+
+
     const lim = Math.min(Math.max(Number(limit) || 24, 1), 60);
     const off = Math.max(Number(offset) || 0, 0);
+
+    console.log("req.sellerId", req.sellerId);
+    console.log("req.buyerId", req.buyerId);
+
 
     const { data, error } = await supabase.rpc("catalog_browse", {
         p_category_id: categoryId || null,
@@ -47,6 +54,7 @@ export async function browseCatalog(req, res) {
         p_limit: lim,
         p_offset: off,
         p_seller_id: req.sellerId || null, // added
+        p_buyer_id: req.buyerId || null,
     });
 
     if (error) return res.status(500).json({ success: false, message: error.message });

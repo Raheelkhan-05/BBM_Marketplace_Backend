@@ -6,6 +6,7 @@
 
 import { Router } from "express";
 import { optionalAuth } from "../middleware/optionalAuth.middleware.js";
+import { requireAuth } from "../middleware/auth.middleware.js";
 import {
     getCategoryGenericProducts,
     getGenericProductBrands,
