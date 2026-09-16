@@ -11,7 +11,16 @@ export function getSaleUnit(masterPackSize) {
 export function saleUnitLabel(masterPackSize) {
     return hasOuterPack(masterPackSize) ? "Master Pack" : "Pack";
 }
-export const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+// export const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+const SNAP_TOLERANCE = 0.011; // covers a stray ±0.01 rounding artifact
+
+export function round2(n) {
+    const num = Number(n) || 0;
+    const rounded = Math.round((num + Number.EPSILON) * 100) / 100;
+    const nearestWhole = Math.round(rounded);
+    if (Math.abs(rounded - nearestWhole) <= SNAP_TOLERANCE) return nearestWhole;
+    return rounded;
+}
 
 // How many base units (Pieces/Kg/Litres...) make up ONE sale unit.
 export function saleUnitSizeInBaseUnits(packSize, masterPackSize) {
@@ -62,13 +71,29 @@ export function priceToSaleUnitPrice(price, priceBasis, packSize, masterPackSize
 
 // Derives all three DISPLAY tiers from the one canonical price. Always
 // mutually consistent by construction — nothing to re-derive separately.
-export function deriveDisplayPrices(pricePerSaleUnit, packSize, masterPackSize) {
-    const price = Number(pricePerSaleUnit) || 0;
+export function deriveDisplayPrices(rawPricePerSaleUnit, packSize, masterPackSize) {
     const pack = Number(packSize) > 0 ? Number(packSize) : 1;
     const master = Number(masterPackSize) > 0 ? Number(masterPackSize) : 1;
     const outer = hasOuterPack(masterPackSize);
-    const perBaseUnit = price / saleUnitSizeInBaseUnits(packSize, masterPackSize);
-    const perPack = outer ? perBaseUnit * pack : price;
-    const perMasterPack = outer ? price : perBaseUnit * pack * master;
-    return { perBaseUnit, perPack, perMasterPack };
+
+    // rawPricePerSaleUnit must be the UNROUNDED canonical price — never
+    // a value that's already been through round2() — otherwise scaling
+    // it back up to a master-pack price compounds the rounding error
+    // (e.g. round(333.33) * 6 = 1999.98/1999.99 instead of 2000).
+    let perMasterPack = null, perPack, perBaseUnit;
+
+    if (outer) {
+        perMasterPack = rawPricePerSaleUnit;              // sale unit IS master pack
+        perPack = rawPricePerSaleUnit / master;
+        perBaseUnit = perPack / pack;
+    } else {
+        perPack = rawPricePerSaleUnit;                     // sale unit IS pack
+        perBaseUnit = rawPricePerSaleUnit / pack;
+    }
+
+    return {
+        perBaseUnit: round2(perBaseUnit),
+        perPack: round2(perPack),
+        perMasterPack: outer ? round2(perMasterPack) : null,
+    };
 }

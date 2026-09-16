@@ -143,7 +143,12 @@ export async function upsertCustomPricing(req, res) {
         if (item.overrideType === "fixed") {
             rows.push({
                 seller_id: sellerId, buyer_id: buyerId, submission_id: item.submissionId,
-                override_type: "fixed", discount_percent: null, fixed_price: canonicalPrice,
+                override_type: "fixed",
+                // Stored for reference/future recompute ONLY — never used to
+                // reconstruct the charged price. The charged price is always
+                // fixed_price, exactly as entered.
+                discount_percent: percentFromCustomPrice(basePrice, canonicalPrice),
+                fixed_price: canonicalPrice,
                 base_price_at_set: basePrice,
             });
         } else {
