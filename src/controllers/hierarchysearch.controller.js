@@ -12,20 +12,75 @@ function clampLimit(limit) {
 }
 
 // GET /api/search/categories?q=bearing&limit=20
+// GET /api/search/categories?q=bearing&limit=20
+// CHANGED: only returns categories that actually have at least one
+// approved brand item listed somewhere beneath them (category ->
+// subcategory -> product -> brand). Previously any category with
+// review_status !== "rejected" was returned, even if it was empty all
+// the way down — which meant the Home Page CategoryStrip could show a
+// tappable category with nothing to show once selected. The !inner
+// joins below make Postgres only return a category row when a matching
+// chain of children exists; the eq() filter on the nested brand's
+// review_status keeps it to *approved* items specifically (not just
+// non-rejected), since a pending_review brand item isn't buyable yet
+// either.
+// GET /api/search/categories?q=bearing
+// FIXED (final): dropped the seller/wallet-eligibility requirement
+// entirely. Confirmed against real data — e.g. "Shell R4 15W40" is
+// approved+active+sellable but has generic_product_id = null (unmapped,
+// so it can't belong to any category), while "Yonex Nanoflare" IS mapped
+// to Sports & Fitness but both its submissions are rejected/inactive —
+// yet it still shows up in the product listing page (with blank
+// pricing), because that page's own query (catalog_browse) LEFT JOINs
+// seller submissions rather than requiring one. A category should
+// appear here under the same rule the listing page uses: it has at
+// least one approved, non-deleted brand item that resolves to it
+// through generic_product -> subcategory -> category, regardless of
+// whether anyone is currently selling it.
 export async function searchCategories(req, res) {
-    const { q = "", limit } = req.query;
+    const { q = "" } = req.query;
+
+    const { data: brands, error: brandErr } = await supabase
+        .from("hs_generic_product_brands")
+        .select(`
+            id,
+            generic_product:hs_generic_products (
+                id, subcategory_id, deleted_at,
+                subcategory:hs_subcategories (
+                    id, category_id, deleted_at
+                )
+            )
+        `)
+        .eq("review_status", "approved")
+        .is("deleted_at", null)
+        .not("generic_product_id", "is", null);
+
+    if (brandErr) return res.status(500).json({ success: false, message: brandErr.message });
+
+    const categoryIds = [...new Set(
+        (brands || [])
+            .filter((b) => b.generic_product && !b.generic_product.deleted_at
+                && b.generic_product.subcategory && !b.generic_product.subcategory.deleted_at)
+            .map((b) => b.generic_product.subcategory.category_id)
+            .filter(Boolean)
+    )];
+
+    if (!categoryIds.length) {
+        return res.json({ success: true, level: "category", items: [] });
+    }
 
     let query = supabase
         .from("hs_categories")
         .select("id, name, slug, image")
-        .neq("review_status", "rejected")
-        .order("name")
-        .limit(clampLimit(limit));
+        .in("id", categoryIds)
+        .is("deleted_at", null)
+        .order("name");
 
     if (q.trim()) query = query.ilike("name", `%${q.trim()}%`);
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
+
     res.json({ success: true, level: "category", items: data || [] });
 }
 

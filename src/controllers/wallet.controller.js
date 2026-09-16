@@ -90,7 +90,7 @@ export async function submitWalletPayment(req, res) {
         type: "wallet_payment_submitted",
         title: `Wallet top-up submitted: ${sellerRow?.display_name || "A seller"}`,
         body: `₹${Number(amount).toFixed(2)} top-up submitted for verification.`,
-        link: `/admin/payments?queue=wallet&status=pending&highlight=${data}`,
+        link: `/payments?queue=wallet&status=pending&highlight=${data}`,
     });
     await notifyAdminPaymentsChanged();
 

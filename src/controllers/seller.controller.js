@@ -250,7 +250,7 @@ export async function submitSellerOnboarding(req, res) {
       type: "seller_edit_submitted",
       title: "Shop update pending review",
       body: `${existingSeller.display_name} updated their shop details — changes are staged, not yet live.`,
-      link: `/admin/sellers/${existingSeller.id}`,
+      link: `/sellers/${existingSeller.id}`,
       emailSubject: `Shop update pending review: ${existingSeller.display_name}`,
       emailHtml: `<p><strong>${existingSeller.display_name}</strong> edited their live shop. Changes are staged pending your review.</p><p><a href="${process.env.APP_BASE_URL}/admin/sellers/${existingSeller.id}">Review changes</a></p>`,
     }).catch((e) => console.error("[submitSellerOnboarding] notify admins failed", e));
@@ -398,7 +398,7 @@ export async function updateSellerProfile(req, res) {
       type: "seller_edit_submitted",
       title: "Shop update pending review",
       body: `${seller.display_name} updated their shop details — changes are staged, not yet live.`,
-      link: `/admin/sellers/${seller.id}`,
+      link: `/sellers/${seller.id}`,
       emailSubject: `Shop update pending review: ${seller.display_name}`,
       emailHtml: `<p><strong>${seller.display_name}</strong> edited their live shop. Changes are staged pending your review.</p><p><a href="${process.env.APP_BASE_URL}/admin/sellers/${seller.id}">Review changes</a></p>`,
     }).catch((e) => console.error("[updateSellerProfile] notify admins failed", e));

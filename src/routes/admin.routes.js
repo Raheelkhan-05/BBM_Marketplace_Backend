@@ -6,13 +6,15 @@ import { requireAdmin } from "../middleware/adminAuth.middleware.js";
 import { authWriteLimiter } from "../middleware/rateLimiter.js";
 import {
   listSellers, getSellerDetail, updateSellerAsAdmin, approveSeller, rejectSeller,
-  searchUsers, listAdmins, promoteToAdmin, demoteAdmin
+  searchUsers, listAdmins, createAdmin, demoteAdmin
 } from "../controllers/admin.controller.js";
 import {
   listCatalogEntries, getCatalogEntry, updateCatalogEntry,
   approveCatalogEntry, rejectCatalogEntry, getMappingOptions,
   createMappingOption, createCatalogEntry, deleteCatalogEntry,
   adminListCatalog, adminCreateCatalogEntry,
+  searchCatalogEverywhere,
+  listUnmappedCatalogEntries, getUnmappedCatalogCounts
 } from "../controllers/adminCatalog.controller.js";
 import multer from "multer";
 import { downloadCatalogTemplate, bulkUploadCatalog } from "../controllers/adminCatalogBulk.controller.js";
@@ -37,6 +39,9 @@ router.use(adminDbRoutes);
 router.use(productCommissionRoutes);
 
 router.get("/sellers", requireAuth, requireAdmin, listSellers);
+router.get("/catalog/search", requireAuth, requireAdmin, searchCatalogEverywhere);
+router.get("/catalog/unmapped/counts", requireAuth, requireAdmin, getUnmappedCatalogCounts); // NEW — before /unmapped
+router.get("/catalog/unmapped", requireAuth, requireAdmin, listUnmappedCatalogEntries); // NEW — before /:level/:id
 router.get("/sellers/:id", requireAuth, requireAdmin, getSellerDetail);
 router.patch("/sellers/:id", requireAuth, requireAdmin, authWriteLimiter, updateSellerAsAdmin);
 router.post("/sellers/:id/approve", requireAuth, requireAdmin, authWriteLimiter, approveSeller);
@@ -44,7 +49,7 @@ router.post("/sellers/:id/reject", requireAuth, requireAdmin, authWriteLimiter, 
 
 router.get("/users/search", requireAuth, requireAdmin, searchUsers);
 router.get("/admins", requireAuth, requireAdmin, listAdmins);
-router.post("/admins/promote", requireAuth, requireAdmin, authWriteLimiter, promoteToAdmin);
+router.post("/admins/create", requireAuth, requireAdmin, authWriteLimiter, createAdmin);
 router.post("/admins/demote", requireAuth, requireAdmin, authWriteLimiter, demoteAdmin);
 
 // router.get("/catalog", requireAuth, requireAdmin, adminListCatalog);

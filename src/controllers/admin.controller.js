@@ -176,41 +176,95 @@ export async function searchUsers(req, res) {
   res.json({ success: true, users: data });
 }
 
+// Creates a brand-new, dedicated admin profile row. Does NOT touch any
+// existing buyer/seller account, even if the same phone/email already
+// has one — that's exactly what the new partial-unique-index design
+// (profiles_phone_admin_uniq / profiles_email_admin_uniq) allows.
+export async function createAdmin(req, res) {
+  const { phone, email, name } = req.body || {};
+  if (!phone?.trim() && !email?.trim()) {
+    return res.status(400).json({ success: false, message: "Provide a phone number or an email address." });
+  }
+  if (!name?.trim()) {
+    return res.status(400).json({ success: false, message: "Name is required." });
+  }
+  if (phone && !/^[6-9]\d{9}$/.test(phone.trim())) {
+    return res.status(400).json({ success: false, message: "Enter a valid 10-digit mobile number." });
+  }
+  const normalizedEmail = email ? email.trim().toLowerCase() : null;
+  if (normalizedEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    return res.status(400).json({ success: false, message: "Enter a valid email address." });
+  }
+
+  const { data, error } = await supabase
+    .from("profiles")
+    .insert({
+      phone: phone?.trim() || null,
+      phone_verified: !!phone, // trusted: an existing admin is vouching for this identity
+      email: normalizedEmail,
+      email_verified: !!normalizedEmail,
+      name: name.trim(),
+      role: "admin",
+      onboarding_step: "done", // admins skip onboarding entirely
+    })
+    .select("id, name, phone, email, role, created_at")
+    .single();
+
+  if (error) {
+    // Hits profiles_phone_admin_uniq or profiles_email_admin_uniq —
+    // there's already an active admin with this phone/email.
+    if (error.code === "23505") {
+      return res.status(409).json({ success: false, message: "An admin already exists with this phone number or email." });
+    }
+    return res.status(500).json({ success: false, message: error.message });
+  }
+
+  res.json({ success: true, admin: data });
+}
+
 export async function listAdmins(req, res) {
   const { data, error } = await supabase
     .from("profiles")
     .select("id, name, phone, email, role, created_at")
     .eq("role", "admin")
+    .is("deleted_at", null)
     .order("created_at", { ascending: true });
 
   if (error) return res.status(500).json({ success: false, message: error.message });
   res.json({ success: true, admins: data });
 }
 
-export async function promoteToAdmin(req, res) {
-  const { userId } = req.body;
-  if (!userId) return res.status(400).json({ success: false, message: "userId is required." });
-
-  const { data, error } = await supabase.from("profiles").update({ role: "admin" }).eq("id", userId).select("id, name, email, phone, role").single();
-  if (error) return res.status(500).json({ success: false, message: error.message });
-  res.json({ success: true, profile: data });
-}
-
+// CHANGED: demote now soft-deletes the admin's dedicated row (deleted_at
+// timestamp) instead of flipping role back to 'user' — this admin
+// identity was purpose-built, not converted from a buyer account, so
+// revoking it means retiring the row, not repurposing it. This also
+// sidesteps any collision with profiles_phone_user_uniq/
+// profiles_email_user_uniq if the same phone/email happens to already
+// back a separate active buyer/seller account.
 export async function demoteAdmin(req, res) {
-  const { userId } = req.body;
-  if (!userId) return res.status(400).json({ success: false, message: "userId is required." });
+  const { adminId } = req.body;
+  if (!adminId) return res.status(400).json({ success: false, message: "adminId is required." });
 
-  // Prevent an admin from demoting themselves and locking everyone out if
-  // they're the only one — and prevent removing the last admin entirely.
-  if (userId === req.user.id) {
+  if (adminId === req.user.id) {
     return res.status(400).json({ success: false, message: "You can't remove your own admin access." });
   }
-  const { count } = await supabase.from("profiles").select("id", { count: "exact", head: true }).eq("role", "admin");
+
+  const { count } = await supabase
+    .from("profiles").select("id", { count: "exact", head: true })
+    .eq("role", "admin").is("deleted_at", null);
   if (count <= 1) {
     return res.status(400).json({ success: false, message: "At least one admin must remain." });
   }
 
-  const { data, error } = await supabase.from("profiles").update({ role: "user" }).eq("id", userId).select("id, name, email, phone, role").single();
+  const { data, error } = await supabase
+    .from("profiles")
+    .update({ deleted_at: new Date().toISOString() })
+    .eq("id", adminId)
+    .eq("role", "admin")
+    .select("id, name")
+    .single();
+
   if (error) return res.status(500).json({ success: false, message: error.message });
-  res.json({ success: true, profile: data });
+  if (!data) return res.status(404).json({ success: false, message: "Admin not found." });
+  res.json({ success: true });
 }

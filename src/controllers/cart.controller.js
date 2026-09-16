@@ -259,7 +259,7 @@ export async function submitGroupPaymentProof(req, res) {
         type: "payment_proof_submitted",
         title: `Payment proof submitted: Group ${groupRow?.group_number || groupId}`,
         body: "Buyer submitted a payment reference covering this cart's orders — needs review.",
-        link: `/admin/payments?queue=orders&status=pending&highlight=${data}`,
+        link: `/payments?queue=orders&status=pending&highlight=${data}`,
     });
     await notifyAdminPaymentsChanged();
 

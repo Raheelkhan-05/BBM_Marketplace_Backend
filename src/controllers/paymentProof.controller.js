@@ -161,7 +161,7 @@ export async function submitPaymentProof(req, res) {
         type: "payment_proof_submitted",
         title: `Payment proof submitted: ${orderRow?.order_number || req.params.id}`,
         body: `Buyer submitted a ${paymentMethod.toUpperCase()} payment reference for review.`,
-        link: `/admin/payments?queue=orders&status=pending&highlight=${data}`,
+        link: `/payments?queue=orders&status=pending&highlight=${data}`,
     });
     await notifyAdminPaymentsChanged();
 

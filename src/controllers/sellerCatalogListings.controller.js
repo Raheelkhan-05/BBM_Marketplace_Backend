@@ -155,10 +155,10 @@ const SUBMISSION_LIST_COLUMNS = `
     product_name, brand_name, image, price, base_price, moq, unit,
     pack_size, units_per_master_pack,
     stock_type, stock_quantity, production_lead_time_days,
-    hs_generic_product_brands ( id, name, brand_name, image, images )
+    hs_generic_product_brands!inner ( id, name, brand_name, image, images, deleted_at )
 `;
 
-const SUBMISSION_DETAIL_COLUMNS = `*, hs_generic_product_brands ( id, name, brand_name, image, images, brand_not_applicable )`;
+const SUBMISSION_DETAIL_COLUMNS = `*, hs_generic_product_brands ( id, name, brand_name, image, images, brand_not_applicable, deleted_at )`;
 
 /* ------------------------- brand resolution ------------------------- */
 // Unit / pack size / master pack size are now a fixed property of the
@@ -179,6 +179,7 @@ async function findExistingBrandItem({ productName, brandName, brandNotApplicabl
     let query = supabase
         .from("hs_generic_product_brands")
         .select(`id, name, brand_name, review_status, ${BRAND_PACKAGING_COLS}`)
+        .is("deleted_at", null)
         .ilike("name", trimmedProduct);
     query = brandNotApplicable ? query.is("brand_name", null) : query.ilike("brand_name", brandName.trim());
     const { data } = await query.maybeSingle();
@@ -469,7 +470,7 @@ export async function createSubmission(req, res) {
                 type: "seller_submission",
                 title: "New product live — needs category mapping",
                 message: `${brand.brand_name || "(No brand)"} — ${brand.name} is live for buyers now. Map it to a category when you get a chance.`,
-                link: `/admin/listings?highlight=${inserted.id}`,
+                link: `/listings?highlight=${inserted.id}`,
             });
             await notifyAdminSubmissionsChanged();
         }
@@ -478,7 +479,7 @@ export async function createSubmission(req, res) {
             type: "seller_submission",
             title: "Listing resubmitted for review",
             message: `${brand.brand_name || "(No brand)"} — ${brand.name} was resubmitted after rejection.`,
-            link: `/admin/listings?highlight=${inserted.id}`,
+            link: `/listings?highlight=${inserted.id}`,
         });
         await notifyAdminSubmissionsChanged();
     }
@@ -576,7 +577,9 @@ export async function createListingForExistingBrand(req, res) {
     const { data: brand, error: brandErr } = await supabase
         .from("hs_generic_product_brands")
         .select(`id, name, brand_name, image, images, review_status, ${BRAND_PACKAGING_COLS}`)
-        .eq("id", genericProductBrandId).maybeSingle();
+        .eq("id", genericProductBrandId)
+        .is("deleted_at", null)
+        .maybeSingle();
     if (brandErr) return res.status(500).json({ success: false, message: brandErr.message });
     if (!brand) return res.status(400).json({ success: false, message: "That item wasn't found." });
     if (brand.review_status !== "approved") return res.status(400).json({ success: false, message: "This item isn't available to list under yet." });
@@ -664,7 +667,7 @@ export async function createListingForExistingBrand(req, res) {
             type: "seller_submission",
             title: "Listing resubmitted for review",
             message: `A seller resubmitted "${effectiveBrand.name}" after rejection.`,
-            link: `/admin/listings?highlight=${result.id}`,
+            link: `/listings?highlight=${result.id}`,
         });
         await notifyAdminSubmissionsChanged();
     }
@@ -679,6 +682,15 @@ export async function createListingForExistingBrand(req, res) {
             : `You're now listing "${effectiveBrand.name}" again. We'll notify you once it's approved.`,
     });
 }
+
+// Exact string written by deleteCatalogEntry's cascade when a brand
+// item's underlying catalog product is removed (see
+// adminCatalog.controller.js). Submissions rejected with this reason
+// aren't a normal "fix your listing" rejection — there's nothing left
+// for the seller to fix, the product itself is gone. They're filtered
+// out of every seller-facing view below rather than shown as a
+// rejected listing.
+export const CATALOG_REMOVED_REJECTION_REASON = "Underlying product was removed from the catalog.";
 
 /* ------------------------- list / detail / update / active ------------------------- */
 
@@ -695,6 +707,13 @@ export async function listMySubmissions(req, res) {
         .from("seller_product_submissions")
         .select(SUBMISSION_LIST_COLUMNS, { count: "exact" })
         .eq("seller_id", sellerId)
+        .is("hs_generic_product_brands.deleted_at", null)
+        // NEW — a rejection with this exact reason means the underlying
+        // catalog product was removed by admin, not that the seller's
+        // listing itself needs fixing. There's nothing actionable for
+        // them here, so it's excluded outright rather than shown as a
+        // normal "Rejected" row.
+        .neq("rejection_reason", CATALOG_REMOVED_REJECTION_REASON)
         .order("created_at", { ascending: false })
         .range(from, to);
 
@@ -738,6 +757,18 @@ export async function getSubmissionDetail(req, res) {
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!data) return res.status(404).json({ success: false, message: "Submission not found." });
 
+    if (data.hs_generic_product_brands?.deleted_at) {
+        return res.status(404).json({ success: false, message: "This product is no longer available." });
+    }
+
+    // NEW — same reasoning as listMySubmissions: this specific rejection
+    // reason means the product was removed from the catalog, not that
+    // there's something for the seller to fix. Treat it as not found
+    // rather than showing rejection details for a dead product.
+    if (data.rejection_reason === CATALOG_REMOVED_REJECTION_REASON) {
+        return res.status(404).json({ success: false, message: "This product is no longer available." });
+    }
+
     const { hs_generic_product_brands, ...rest } = data;
     const submission = { ...rest, brand: hs_generic_product_brands || null };
 
@@ -751,10 +782,22 @@ export async function updateSubmission(req, res) {
 
     const { data: existing, error: fetchErr } = await supabase
         .from("seller_product_submissions")
-        .select(`*, hs_generic_product_brands ( ${BRAND_PACKAGING_COLS} )`)
+        .select(`*, hs_generic_product_brands ( ${BRAND_PACKAGING_COLS}, deleted_at )`)
         .eq("id", id).eq("seller_id", sellerId).maybeSingle();
     if (fetchErr) return res.status(500).json({ success: false, message: fetchErr.message });
     if (!existing) return res.status(404).json({ success: false, message: "Submission not found." });
+
+    // NEW — same reasoning as getSubmissionDetail: don't let a seller
+    // "save changes" on a listing whose underlying catalog product was
+    // soft-deleted by admin.
+    if (existing.hs_generic_product_brands?.deleted_at) {
+        return res.status(404).json({ success: false, message: "This product is no longer available and can't be edited." });
+    }
+
+    // NEW — same guard as getSubmissionDetail.
+    if (existing.rejection_reason === CATALOG_REMOVED_REJECTION_REASON) {
+        return res.status(404).json({ success: false, message: "This product is no longer available and can't be edited." });
+    }
 
     const brandPackaging = existing.hs_generic_product_brands || {
         unit: existing.unit, pack_size: existing.pack_size, units_per_master_pack: existing.units_per_master_pack,
@@ -835,7 +878,7 @@ export async function updateSubmission(req, res) {
             type: "seller_submission",
             title: "Listing edited and resubmitted for review",
             message: `${existing.brand_name || "(No brand)"} — ${existing.product_name} was edited and needs review.`,
-            link: `/admin/listings?highlight=${updated.id}`,
+            link: `/listings?highlight=${updated.id}`,
         });
         await notifyAdminSubmissionsChanged();
     }

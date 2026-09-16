@@ -28,6 +28,7 @@ import contactsRoutes from "./routes/contacts.routes.js";
 import buyerBusinessProfileRoutes from "./routes/buyerBusinessProfile.routes.js";
 import helpRoutes from "./routes/help.routes.js";
 import transportLibraryRoutes from "./routes/transportLibrary.routes.js";
+import adminAuthRoutes from "./routes/adminAuth.routes.js";
 
 export function createApp() {
   const app = express();
@@ -78,6 +79,7 @@ export function createApp() {
   app.use("/api/seller/wallet", sellerWalletRoutes);
   app.use("/api/admin/seller-submissions", adminSellerSubmissionsRouter);
   app.use("/api/seller", sellerRoutes);
+  app.use("/api/admin/auth", adminAuthRoutes);
   app.use("/api/admin", adminRoutes);
   app.use("/api/notifications", notificationRoutes);
   app.use("/api/shop", shopRoutes);

@@ -167,7 +167,7 @@ export async function getCatalogEntry(req, res) {
         .maybeSingle();
 
     if (error) return res.status(500).json({ success: false, message: error.message });
-    if (!data) return res.status(404).json({ success: false, message: "Not found." });
+    if (!data || data.deleted_at) return res.status(404).json({ success: false, message: "Not found." });
 
     let ancestors = {};
     if (level === "subcategory") {
@@ -331,49 +331,96 @@ export async function rejectCatalogEntry(req, res) {
     res.json({ success: true, entry: data });
 }
 
+// Walks down the hierarchy from `level`/`id` and collects every
+// descendant id, grouped by table, so we can stamp deleted_at on
+// the whole subtree in one shot.
+async function collectDescendantIds(level, id) {
+    const ids = { category: [], subcategory: [], generic_product: [], brand_item: [] };
+    ids[level] = [id];
+
+    if (level === "category") {
+        const { data, error } = await supabase.from("hs_subcategories").select("id").eq("category_id", id);
+        if (error) throw error;
+        ids.subcategory = (data || []).map((r) => r.id);
+    }
+
+    if (level === "category" || level === "subcategory") {
+        const subIds = level === "category" ? ids.subcategory : [id];
+        if (subIds.length) {
+            const { data, error } = await supabase.from("hs_generic_products").select("id").in("subcategory_id", subIds);
+            if (error) throw error;
+            ids.generic_product = (data || []).map((r) => r.id);
+        }
+    }
+
+    if (level === "category" || level === "subcategory" || level === "generic_product") {
+        const gpIds = level === "generic_product" ? [id] : ids.generic_product;
+        if (gpIds.length) {
+            const { data, error } = await supabase.from("hs_generic_product_brands").select("id").in("generic_product_id", gpIds);
+            if (error) throw error;
+            ids.brand_item = (data || []).map((r) => r.id);
+        }
+    }
+
+    return ids;
+}
+
 // DELETE /api/admin/catalog/:level/:id
+// Soft-delete: stamps deleted_at on this entry AND every descendant
+// (category -> subcategory -> generic_product -> brand_item). Nothing
+// is actually removed from the DB, and list/detail queries filter out
+// deleted_at IS NOT NULL rows, so it just disappears from the UI.
+// DELETE /api/admin/catalog/:level/:id
+// FIXED: brand_item rows were never getting deleted_at stamped — the
+// code correctly collected ids.brand_item via collectDescendantIds, and
+// correctly rejected/deactivated their seller_product_submissions, but
+// never touched hs_generic_product_brands itself. That left every
+// descendant brand item fully "live" (deleted_at still null) even after
+// deleting its category/subcategory/generic_product ancestor — anything
+// downstream that only filters on deleted_at IS NULL (e.g. the Home Page
+// category strip, catalog_browse, etc.) would still surface it as if
+// nothing happened. Added the missing update below.
 export async function deleteCatalogEntry(req, res) {
     const { level, id } = req.params;
-    const cfg = cfgFor(level, res);
-    if (!cfg) return;
+    const cfg = TABLES[level];
+    if (!cfg) return res.status(400).json({ success: false, message: `Invalid level "${level}".` });
 
-    const childInfo = CHILD_LEVEL_OF[level];
-    if (childInfo) {
-        const childCfg = LEVEL_CONFIG[childInfo.level];
-        const { count, error: countErr } = await supabase
-            .from(childCfg.table)
-            .select("id", { count: "exact", head: true })
-            .eq(childInfo.field, id);
-        if (countErr) return res.status(500).json({ success: false, message: countErr.message });
-        if (count > 0) {
-            return res.status(409).json({
-                success: false,
-                message: `Can't delete — ${count} item${count === 1 ? "" : "s"} still live under this. Delete those first.`,
-            });
+    try {
+        const ids = await collectDescendantIds(level, id);
+        const now = new Date().toISOString();
+
+        const ops = [];
+        if (ids.category.length) ops.push(supabase.from("hs_categories").update({ deleted_at: now }).in("id", ids.category));
+        if (ids.subcategory.length) ops.push(supabase.from("hs_subcategories").update({ deleted_at: now }).in("id", ids.subcategory));
+        if (ids.generic_product.length) ops.push(supabase.from("hs_generic_products").update({ deleted_at: now }).in("id", ids.generic_product));
+        // NEW — this was missing entirely. Every brand item under the
+        // deleted subtree needs its own deleted_at stamped, not just its
+        // seller submissions rejected.
+        if (ids.brand_item.length) ops.push(supabase.from("hs_generic_product_brands").update({ deleted_at: now }).in("id", ids.brand_item));
+
+        if (ids.brand_item.length) {
+            await supabase
+                .from("seller_product_submissions")
+                .update({
+                    review_status: "rejected",
+                    rejection_reason: "Underlying product was removed from the catalog.",
+                    is_active: false,
+                    reviewed_at: new Date().toISOString(),
+                    reviewed_by: null,
+                })
+                .in("generic_product_brand_id", ids.brand_item)
+                .neq("review_status", "rejected");
         }
-    }
 
-    // brand_item has one more dependent to check that isn't a catalog
-    // "level" in LEVEL_CONFIG: real seller listings pointing at it via
-    // generic_product_brand_id. Deleting it out from under an active
-    // seller listing would either FK-violate or silently orphan them.
-    if (level === "brand_item") {
-        const { count, error: countErr } = await supabase
-            .from("seller_product_submissions")
-            .select("id", { count: "exact", head: true })
-            .eq("generic_product_brand_id", id);
-        if (countErr) return res.status(500).json({ success: false, message: countErr.message });
-        if (count > 0) {
-            return res.status(409).json({
-                success: false,
-                message: `Can't delete — ${count} seller listing${count === 1 ? " is" : "s are"} still linked to this item.`,
-            });
-        }
-    }
+        const results = await Promise.all(ops);
+        const failed = results.find((r) => r.error);
+        if (failed) throw failed.error;
 
-    const { error } = await supabase.from(cfg.table).delete().eq("id", id);
-    if (error) return res.status(500).json({ success: false, message: error.message });
-    res.json({ success: true });
+        const deletedCount = ids.category.length + ids.subcategory.length + ids.generic_product.length + ids.brand_item.length;
+        res.json({ success: true, deletedCount });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
 }
 
 // GET /api/admin/catalog/options?pickerLevel=category|subcategory|product|generic_product&parentId=&q=
@@ -382,7 +429,10 @@ export async function getMappingOptions(req, res) {
     const picker = PICKER_CONFIG[pickerLevel];
     if (!picker) return res.status(400).json({ success: false, message: "Invalid pickerLevel." });
 
-    let query = supabase.from(picker.table).select("id, name").neq("review_status", "rejected").order("name").limit(30);
+    let query = supabase.from(picker.table).select("id, name")
+        .neq("review_status", "rejected")
+        .is("deleted_at", null)
+        .order("name").limit(30);
 
     if (picker.parentField) {
         if (!parentId) return res.json({ success: true, options: [] });
@@ -498,7 +548,8 @@ export async function adminListCatalog(req, res) {
     const table = LEVEL_TABLE[level];
     if (!table) return res.status(400).json({ success: false, message: "Invalid level." });
 
-    let query = supabase.from(table).select("id, name, review_status").order("name").limit(30);
+
+    let query = supabase.from(table).select("id, name, review_status").is("deleted_at", null).order("name").limit(30);
     // Show both approved AND pending here — admin should see a seller's
     // already-proposed node so they reuse it, not just approved ones.
     query = query.in("review_status", ["approved", "pending_review"]);
@@ -565,13 +616,13 @@ export async function listCatalogEntries(req, res) {
         ? "id, name, image, images, brand_name, review_status, is_ai_generated, unit, pack_size, units_per_master_pack"
         : "id, name, image, review_status, is_ai_generated";
 
-    let query = supabase.from(cfg.table).select(selectCols).order("name").limit(200);
+    let query = supabase.from(cfg.table).select(selectCols).is("deleted_at", null).order("name").limit(200);
     if (cfg.parentCol) query = query.eq(cfg.parentCol, parentId);
     if (q.trim()) query = query.ilike("name", `%${q.trim()}%`);
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
-    res.json({ success: true, entries: data || [] });   // ← renamed to entries
+    res.json({ success: true, entries: data || [] });
 }
 
 // POST /api/admin/catalog/:level  { name, parentId }
@@ -656,4 +707,177 @@ export async function updateCatalogEntry(req, res) {
     }
     if (!data) return res.status(404).json({ success: false, message: "Not found." });
     res.json({ success: true, entry: data });
+}
+
+// GET /api/admin/catalog/search?q=...
+// Searches name (and brand_name, for brand_item) across every level at
+// once — category, subcategory, generic_product, brand_item — instead of
+// being scoped to whatever level the admin currently has open. Each hit
+// carries its full ancestor chain so the frontend can jump straight to
+// it in context (same "path" shape AdminCatalogReviewPage already uses
+// for its breadcrumbs), rather than the admin having to drill down
+// manually level by level to find where a match actually lives.
+// Excludes soft-deleted rows at every level, same as listCatalogEntries.
+export async function searchCatalogEverywhere(req, res) {
+    const { q = "" } = req.query;
+    const trimmed = q.trim();
+    if (trimmed.length < 2) {
+        return res.json({ success: true, results: [] });
+    }
+
+    try {
+        const [categories, subcategories, genericProducts, brandItems] = await Promise.all([
+            supabase
+                .from("hs_categories")
+                .select("id, name, image, review_status")
+                .is("deleted_at", null)
+                .ilike("name", `%${trimmed}%`)
+                .limit(15),
+
+            supabase
+                .from("hs_subcategories")
+                .select("id, name, image, review_status, category_id, hs_categories(id, name)")
+                .is("deleted_at", null)
+                .ilike("name", `%${trimmed}%`)
+                .limit(15),
+
+            supabase
+                .from("hs_generic_products")
+                .select("id, name, image, review_status, subcategory_id, hs_subcategories(id, name, category_id, hs_categories(id, name))")
+                .is("deleted_at", null)
+                .ilike("name", `%${trimmed}%`)
+                .limit(15),
+
+            supabase
+                .from("hs_generic_product_brands")
+                .select("id, name, brand_name, image, review_status, generic_product_id, hs_generic_products(id, name, subcategory_id, hs_subcategories(id, name, category_id, hs_categories(id, name)))")
+                .is("deleted_at", null)
+                .or(`name.ilike.%${trimmed}%,brand_name.ilike.%${trimmed}%`)
+                .limit(15),
+        ]);
+
+        for (const r of [categories, subcategories, genericProducts, brandItems]) {
+            if (r.error) throw r.error;
+        }
+
+        const results = [
+            ...categories.data.map((row) => ({
+                level: "category",
+                id: row.id,
+                name: row.name,
+                image: row.image,
+                review_status: row.review_status,
+                path: [],
+            })),
+
+            ...subcategories.data.map((row) => ({
+                level: "subcategory",
+                id: row.id,
+                name: row.name,
+                image: row.image,
+                review_status: row.review_status,
+                path: row.hs_categories
+                    ? [{ level: "category", id: row.hs_categories.id, name: row.hs_categories.name }]
+                    : [],
+            })),
+
+            ...genericProducts.data.map((row) => {
+                const sc = row.hs_subcategories;
+                const c = sc?.hs_categories;
+                const path = [];
+                if (c) path.push({ level: "category", id: c.id, name: c.name });
+                if (sc) path.push({ level: "subcategory", id: sc.id, name: sc.name });
+                return {
+                    level: "generic_product",
+                    id: row.id,
+                    name: row.name,
+                    image: row.image,
+                    review_status: row.review_status,
+                    path,
+                };
+            }),
+
+            ...brandItems.data.map((row) => {
+                const gp = row.hs_generic_products;
+                const sc = gp?.hs_subcategories;
+                const c = sc?.hs_categories;
+                const path = [];
+                if (c) path.push({ level: "category", id: c.id, name: c.name });
+                if (sc) path.push({ level: "subcategory", id: sc.id, name: sc.name });
+                if (gp) path.push({ level: "generic_product", id: gp.id, name: gp.name });
+                return {
+                    level: "brand_item",
+                    id: row.id,
+                    name: row.brand_name ? `${row.name} — ${row.brand_name}` : row.name,
+                    image: row.image,
+                    review_status: row.review_status,
+                    path,
+                };
+            }),
+        ];
+
+        res.json({ success: true, results });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+}
+
+
+// GET /api/admin/catalog/unmapped?level=subcategory|generic_product|brand_item&q=
+// Lists rows at a level that have NO parent set at all — category_id is
+// null for a subcategory, subcategory_id is null for a generic_product,
+// generic_product_id is null for a brand_item. These can never show up
+// under any parentId-scoped listCatalogEntries() call (there's no
+// parentId that matches "no parent"), so they were invisible to the
+// normal drill-down UI even though they're live, undeleted rows —
+// mainly brand items sellers create directly (see createBrandItem in
+// sellerCatalogListings.controller.js, which leaves generic_product_id
+// null on purpose; mapping happens later as a separate admin task).
+const UNMAPPED_CONFIG = {
+    subcategory: { table: "hs_subcategories", parentCol: "category_id" },
+    generic_product: { table: "hs_generic_products", parentCol: "subcategory_id" },
+    brand_item: { table: "hs_generic_product_brands", parentCol: "generic_product_id" },
+};
+
+export async function listUnmappedCatalogEntries(req, res) {
+    const { level, q = "" } = req.query;
+    const cfg = UNMAPPED_CONFIG[level];
+    if (!cfg) return res.status(400).json({ success: false, message: `Invalid level "${level}" for unmapped lookup.` });
+
+    const selectCols = level === "brand_item"
+        ? "id, name, image, images, brand_name, review_status, is_ai_generated, created_at"
+        : "id, name, image, review_status, is_ai_generated, created_at";
+
+    let query = supabase
+        .from(cfg.table)
+        .select(selectCols)
+        .is(cfg.parentCol, null)
+        .is("deleted_at", null)
+        .order("created_at", { ascending: false })
+        .limit(200);
+    if (q.trim()) query = query.ilike("name", `%${q.trim()}%`);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    res.json({ success: true, entries: data || [] });
+}
+
+// GET /api/admin/catalog/unmapped/counts — small badge counts for the
+// three levels, so the frontend can show "Unmapped (12)" without the
+// admin having to open each tab to find out if there's anything there.
+export async function getUnmappedCatalogCounts(req, res) {
+    try {
+        const [sub, gp, brand] = await Promise.all([
+            supabase.from("hs_subcategories").select("id", { count: "exact", head: true }).is("category_id", null).is("deleted_at", null),
+            supabase.from("hs_generic_products").select("id", { count: "exact", head: true }).is("subcategory_id", null).is("deleted_at", null),
+            supabase.from("hs_generic_product_brands").select("id", { count: "exact", head: true }).is("generic_product_id", null).is("deleted_at", null),
+        ]);
+        for (const r of [sub, gp, brand]) if (r.error) throw r.error;
+        res.json({
+            success: true,
+            counts: { subcategory: sub.count || 0, generic_product: gp.count || 0, brand_item: brand.count || 0 },
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
 }
