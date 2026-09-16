@@ -36,15 +36,13 @@ function checkStockLimit(submission, purchaseQty, purchaseBasis) {
     return `Only ${available} ${unitLabel}${available === 1 ? "" : "s"} available from this seller. Please reduce the quantity.`;
 }
 
+
 export async function getCart(req, res) {
     const { data, error } = await supabase.rpc("cart_list", { p_buyer_id: req.user.id });
     if (error) return res.status(500).json({ success: false, message: error.message });
 
     const items = data || [];
 
-    // cart_list doesn't carry live stock info — enrich each row with the
-    // seller's current stock_type/stock_quantity so the buyer sees an
-    // up-to-date cap even if it changed after the item was added.
     const submissionIds = [...new Set(items.map((i) => i.submission_id).filter(Boolean))];
     if (submissionIds.length) {
         const { data: stockRows } = await supabase

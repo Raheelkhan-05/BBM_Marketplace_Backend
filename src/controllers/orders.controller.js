@@ -3,6 +3,7 @@ import { supabase } from "../config/supabase.js";
 import { notifyUser, notifyOrderChanged, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
 import { sendOrderUpdateWhatsApp } from "../services/whatsapp.service.js";
 import { notifyIfWalletJustBlocked } from "../services/walletNotifications.service.js";
+import { fetchCustomPriceMap, resolveEffectiveBasePrice } from "../../shared/customPricing.js";
 
 import { getRoadDistanceKm } from "../services/pincodeDistance.js";
 import { purchaseQtyToSaleUnitQty, saleUnitQtyToBaseUnits, getSaleUnit, saleUnitLabel, round2 } from "../../shared/packUnits.js";
@@ -299,6 +300,11 @@ export async function getOrderQuote(req, res) {
         return res.status(404).json({ success: false, message: "Listing not available." });
     }
 
+    const customPriceMap = req.user?.id
+        ? await fetchCustomPriceMap(supabase, req.user.id, [submission.id])
+        : new Map();
+    const customOverride = customPriceMap.get(submission.id) || null;
+
     // Everything below is independent of everything else below it —
     // run it all at once instead of one-after-another.
     let blockMsg, addressResult, commissionResult;
@@ -388,8 +394,17 @@ export async function getOrderQuote(req, res) {
     }
 
     const pricePerSaleUnit = Number(submission.price);
-    const { price: slabPrice, slab: appliedSlab } = resolveSlabUnitPrice(submission.price_slabs, saleQty, pricePerSaleUnit);
-    const { percent: discountPercent, tier: discountTier } = resolveDiscountPercent(submission.quantity_discounts, saleQty);
+
+    let slabPrice, appliedSlab, discountPercent, discountTier;
+    if (customOverride) {
+        slabPrice = resolveEffectiveBasePrice(pricePerSaleUnit, customOverride);
+        appliedSlab = null;
+        discountPercent = 0;
+        discountTier = null;
+    } else {
+        ({ price: slabPrice, slab: appliedSlab } = resolveSlabUnitPrice(submission.price_slabs, saleQty, pricePerSaleUnit));
+        ({ percent: discountPercent, tier: discountTier } = resolveDiscountPercent(submission.quantity_discounts, saleQty));
+    }
     const unitPrice = round2(slabPrice * (1 - discountPercent / 100));
 
     const subtotal = round2(unitPrice * saleQty);
@@ -415,6 +430,7 @@ export async function getOrderQuote(req, res) {
         platformFeePercent: commissionPercent, platformFeeAmount: platformFee, sellerPayoutAmount: subtotal - platformFee,
         meetsMoq: saleQty >= Number(submission.moq),
         exceedsStock,
+        isCustomPriced: !!customOverride,
         outOfStock,
         ...acceptanceInfo,
     });

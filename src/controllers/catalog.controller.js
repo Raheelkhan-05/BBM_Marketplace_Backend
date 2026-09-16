@@ -87,6 +87,7 @@ export async function getGenericProductBrands(req, res) {
         p_limit: limit,
         p_offset: offset,
         p_seller_id: req.sellerProfileId || null,
+        p_buyer_id: req.user?.id || null,
     });
 
     if (error) {
@@ -101,6 +102,7 @@ export async function getBrandItemDetail(req, res) {
     const { brandItemId } = req.params;
     const { data, error } = await supabaseAdmin.rpc("catalog_brand_item_detail", {
         p_brand_item_id: brandItemId,
+        p_buyer_id: req.user?.id || null,
     });
 
     if (error) {
@@ -115,21 +117,18 @@ export async function getBrandItemDetail(req, res) {
 // let invocationCount = 0;
 
 export async function getBrandItemSellers(req, res) {
-    // invocationCount++;
-    // console.log(`[timing] invocation #${invocationCount} (pid ${process.pid})`);
     const { brandItemId } = req.params;
     const { sort = "relevance" } = req.query;
     const limit = parseIntSafe(req.query.limit, 24);
     const offset = parseIntSafe(req.query.offset, 0);
 
-    // const t0 = Date.now(); // temporary
     const { data, error } = await supabaseAdmin.rpc("catalog_brand_item_sellers", {
         p_brand_item_id: brandItemId,
         p_sort: sort,
         p_limit: limit,
         p_offset: offset,
+        p_buyer_id: req.user?.id || null,   // NEW
     });
-    // console.log(`[timing] RPC call: ${Date.now() - t0}ms`); // temporary
 
     if (error) {
         console.error("[catalog] getBrandItemSellers failed:", error.message);
@@ -162,6 +161,7 @@ export async function getBrandItemsFeed(req, res) {
         p_limit: limit,
         p_offset: offset,
         p_seller_id: req.sellerProfileId || null,
+        p_buyer_id: req.user?.id || null,
     });
 
     if (error) {
@@ -180,6 +180,7 @@ export async function getBrandItemSellerOffer(req, res) {
     const { data, error } = await supabaseAdmin.rpc("catalog_brand_item_seller_offer", {
         p_brand_item_id: brandItemId,
         p_shop_slug: shopSlug,
+        p_buyer_id: req.user?.id || null,
     });
 
     if (error) {

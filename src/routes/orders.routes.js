@@ -11,7 +11,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 *
 
 const router = Router();
 router.get("/checkout-status", optionalAuth, checkoutStatus);
-router.get("/quote", getOrderQuote); // read-only, no PII — same exposure level as your public catalog search
+router.get("/quote", optionalAuth, getOrderQuote); // read-only, no PII — same exposure level as your public catalog search
 router.get("/order-constraints", getOrderConstraints);
 router.get("/transport-options", getSellerTransportOptions);
 router.get("/", requireAuth, listMyOrders);

@@ -98,6 +98,8 @@ const GROUP_FIELD_MAP = {
     commercial_terms: ["priceBasis"],
 };
 
+
+
 async function getSellerDispatchInfo(sellerId) {
     const { data } = await supabase
         .from("seller_profiles")
@@ -713,7 +715,7 @@ export async function listMySubmissions(req, res) {
         // listing itself needs fixing. There's nothing actionable for
         // them here, so it's excluded outright rather than shown as a
         // normal "Rejected" row.
-        .neq("rejection_reason", CATALOG_REMOVED_REJECTION_REASON)
+        .or(`rejection_reason.is.null,rejection_reason.neq.${CATALOG_REMOVED_REJECTION_REASON}`)
         .order("created_at", { ascending: false })
         .range(from, to);
 

@@ -29,6 +29,7 @@ import buyerBusinessProfileRoutes from "./routes/buyerBusinessProfile.routes.js"
 import helpRoutes from "./routes/help.routes.js";
 import transportLibraryRoutes from "./routes/transportLibrary.routes.js";
 import adminAuthRoutes from "./routes/adminAuth.routes.js";
+import customPricingRoutes from "./routes/customPricing.routes.js";
 
 export function createApp() {
   const app = express();
@@ -77,6 +78,7 @@ export function createApp() {
   app.use("/api/seller/catalog", sellerCatalogListingsRouter);
   app.use("/api/seller/orders", sellerOrdersRoutes);
   app.use("/api/seller/wallet", sellerWalletRoutes);
+  app.use("/api/seller/custom-pricing", customPricingRoutes);
   app.use("/api/admin/seller-submissions", adminSellerSubmissionsRouter);
   app.use("/api/seller", sellerRoutes);
   app.use("/api/admin/auth", adminAuthRoutes);
