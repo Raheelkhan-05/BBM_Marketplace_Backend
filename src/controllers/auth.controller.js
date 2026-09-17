@@ -19,17 +19,22 @@ import { sendWelcomeEmail, sendBusinessVerifiedEmail } from "../services/mail.se
 // two (profile first, since its result decides the 401; then seller +
 // businessProfile together) is a real, repeated win, not a one-off.
 export async function getMe(req, res) {
+  console.log("[getMe] req.user.id:", req.user?.id);
+
   const { data: profile, error } = await supabaseAdmin
     .from("profiles")
     .select("id, phone, phone_verified, email, email_verified, name, onboarding_step, created_at, role")
     .eq("id", req.user.id)
-    .is("deleted_at", null)   // <-- added: a soft-deleted profile no longer resolves here
+    .eq("role", "user")
+    .is("deleted_at", null)
     .maybeSingle();
 
+  console.log("[getMe] query result:", { profile, error });
+
   if (error || !profile) {
+    console.log("[getMe] rejecting — error:", error?.message, "profile:", profile);
     return res.status(401).json({ success: false, message: "Session out of date — please log in again." });
   }
-
 
   const [sellerResult, businessResult] = await Promise.allSettled([
     supabase.from("seller_profiles").select("status, shop_slug").eq("user_id", req.user.id).maybeSingle(),
@@ -48,6 +53,45 @@ export async function getMe(req, res) {
   });
 }
 
+export async function getMeAdmin(req, res) {
+  console.log("[getMeAdmin] req.user.id:", req.user?.id);
+
+  const { data: profile, error } = await supabaseAdmin
+    .from("profiles")
+    .select("id, phone, phone_verified, email, email_verified, name, onboarding_step, created_at, role")
+    .eq("id", req.user.id)
+    .eq("role", "admin")
+    .is("deleted_at", null)
+    .maybeSingle();
+
+  console.log("[getMeAdmin] query result:", { profile, error });
+
+  if (!profile) {
+    console.log("[getMeAdmin] rejecting — no admin profile matched id:", req.user.id);
+    return res.status(401).json({ success: false, message: "Profile Not Found" });
+  }
+
+  if (error) {
+    console.log("[getMeAdmin] rejecting — query error:", error.message);
+    return res.status(401).json({ success: false, message: "Session out of date — please log in again." });
+  }
+
+  const [sellerResult, businessResult] = await Promise.allSettled([
+    supabase.from("seller_profiles").select("status, shop_slug").eq("user_id", req.user.id).maybeSingle(),
+    supabaseAdmin.from("business_profiles").select("*").eq("user_id", req.user.id).maybeSingle(),
+  ]);
+  const seller = sellerResult.status === "fulfilled" ? sellerResult.value.data : null;
+  const businessProfile = businessResult.status === "fulfilled" ? businessResult.value.data : null;
+
+  return res.json({
+    success: true,
+    profile,
+    businessProfile: businessProfile || null,
+    notificationChannel: channelTokenFor(req.user.id),
+    shop_slug: seller?.shop_slug ?? null,
+    seller_status: seller?.status ?? null,
+  });
+}
 // POST /api/auth/gst-lookup  { gstin }
 // auth.controller.js — lookupGstin
 export async function lookupGstin(req, res) {

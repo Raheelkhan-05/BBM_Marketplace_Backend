@@ -49,6 +49,8 @@ export async function verifyAdminLoginOtp(req, res) {
     if (!channel || !otp) return res.status(400).json({ success: false, message: "Invalid request." });
     const value = channel === "email" ? identifier.trim().toLowerCase() : identifier;
 
+    console.log("[verifyAdminLoginOtp] HIT — body:", req.body);
+
     // Re-check here too — not just trusting that request-otp already
     // gated it, since these are two separate requests and the admin could
     // theoretically have been demoted in between.
