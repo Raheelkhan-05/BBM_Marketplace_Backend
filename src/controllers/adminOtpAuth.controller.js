@@ -64,6 +64,6 @@ export async function verifyAdminLoginOtp(req, res) {
     // seller login — this is what lets the existing requireAuth +
     // requireAdmin middleware, and every /api/admin/* route, work
     // completely unchanged.
-    const token = jwt.sign({ sub: admin.id }, AUTH_JWT_SECRET, { expiresIn: "12h" });
+    const token = jwt.sign({ sub: admin.id }, AUTH_JWT_SECRET, { expiresIn: "672h" });
     return res.json({ success: true, token, profile: admin });
 }

@@ -31,12 +31,12 @@ export async function getMe(req, res) {
   }
 
 
-  // These two queries are independent of each other and of the profile
-  // row above — run them concurrently instead of one after another.
-  const [{ data: seller }, { data: businessProfile }] = await Promise.all([
+  const [sellerResult, businessResult] = await Promise.allSettled([
     supabase.from("seller_profiles").select("status, shop_slug").eq("user_id", req.user.id).maybeSingle(),
     supabaseAdmin.from("business_profiles").select("*").eq("user_id", req.user.id).maybeSingle(),
   ]);
+  const seller = sellerResult.status === "fulfilled" ? sellerResult.value.data : null;
+  const businessProfile = businessResult.status === "fulfilled" ? businessResult.value.data : null;
 
   return res.json({
     success: true,

@@ -13,11 +13,14 @@ function assertConfigured() {
 // user who started signup on one channel can log back in on the other and
 // land on the same account, rather than getting a fresh blank one.
 async function findOrCreateProfile(channel, value) {
-  const { data: profile } = await supabaseAdmin
+  const { data: profile, error } = await supabaseAdmin
     .from("profiles").select("*")
     .or(`phone.eq.${value},email.eq.${value}`)
-    .is("deleted_at", null)   // <-- added: a soft-deleted profile is never "found" — treat as a brand new signup
+    .eq("role", "user")
+    .is("deleted_at", null)
     .maybeSingle();
+
+  if (error) throw error;
 
   if (profile) {
     const column = channel === "phone" ? "phone" : "email";
@@ -30,18 +33,18 @@ async function findOrCreateProfile(channel, value) {
     return { profile, isNewUser: profile.onboarding_step !== "done" };
   }
 
-  const insertPatch = channel === "phone" ? { phone: value, phone_verified: true } : { email: value, email_verified: true };
-  const { data: created, error } = await supabaseAdmin.from("profiles").insert(insertPatch).select("*").single();
-  if (error) {
-    if (error.code === "23505") {
-      // Same race, same fix: only re-fetch if an ACTIVE profile now exists
-      // with this value (another concurrent signup) — a deleted one racing
-      // in should never be returned here either.
-      const { data: existing } = await supabaseAdmin.from("profiles").select("*")
-        .or(`phone.eq.${value},email.eq.${value}`).is("deleted_at", null).maybeSingle();
+  const insertPatch = channel === "phone"
+    ? { phone: value, phone_verified: true, role: "user" }
+    : { email: value, email_verified: true, role: "user" };
+  const { data: created, error: insertErr } = await supabaseAdmin.from("profiles").insert(insertPatch).select("*").single();
+  if (insertErr) {
+    if (insertErr.code === "23505") {
+      const { data: existing, error: refetchErr } = await supabaseAdmin.from("profiles").select("*")
+        .or(`phone.eq.${value},email.eq.${value}`).eq("role", "user").is("deleted_at", null).maybeSingle();
+      if (refetchErr) throw refetchErr;
       if (existing) return { profile: existing, isNewUser: existing.onboarding_step !== "done" };
     }
-    throw error;
+    throw insertErr;
   }
   return { profile: created, isNewUser: true };
 }
