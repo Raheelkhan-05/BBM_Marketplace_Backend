@@ -155,7 +155,7 @@ const SUBMISSION_LIST_COLUMNS = `
     id, created_at, updated_at, review_status, rejection_reason,
     reviewed_at, is_active, generic_product_brand_id,
     product_name, brand_name, image, price, base_price, moq, unit,
-    pack_size, units_per_master_pack,
+    pack_size, units_per_master_pack, marketing_commission_percent,
     stock_type, stock_quantity, production_lead_time_days,
     hs_generic_product_brands!inner ( id, name, brand_name, image, images, deleted_at )
 `;
@@ -264,6 +264,8 @@ function validateListingPayload(body) {
     if (!PRICE_BASES.includes(body.priceBasis)) missing.push("Price basis (per unit / pack / master pack)");
     if (typeof body.gstInclusive !== "boolean") missing.push("Whether price includes GST");
     if (typeof body.freightIncluded !== "boolean") missing.push("Whether freight is included");
+    const mcp = Number(body.marketingCommissionPercent);
+    if (!(mcp >= 0.25 && mcp <= 100)) missing.push("Marketing commission %");
 
     if (body.sampleAvailable) {
         if (!(Number(body.sampleQuantity) > 0)) missing.push("Sample quantity");
@@ -322,6 +324,7 @@ function toListingRow(body, brand, sellerDispatch) {
         price_basis: body.priceBasis,
         gst_inclusive_input: Boolean(body.gstInclusive),
         freight_included: Boolean(body.freightIncluded),
+        marketing_commission_percent: Number(body.marketingCommissionPercent),
 
         pack_size: packSize,
         units_per_master_pack: masterPackSize,
@@ -819,6 +822,7 @@ export async function updateSubmission(req, res) {
         priceBasis: body.priceBasis ?? existing.price_basis,
         gstInclusive: body.gstInclusive ?? existing.gst_inclusive_input,
         freightIncluded: body.freightIncluded ?? existing.freight_included,
+        marketingCommissionPercent: body.marketingCommissionPercent ?? existing.marketing_commission_percent,
 
         sampleAvailable: body.sampleAvailable ?? existing.sample_available,
         sampleQuantity: body.sampleQuantity ?? existing.sample_quantity,

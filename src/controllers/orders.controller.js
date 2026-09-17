@@ -288,6 +288,7 @@ export async function getOrderQuote(req, res) {
             id, price, moq, unit, lead_time, stock_quantity, review_status, price_slabs, quantity_discounts,
             stock_type, dispatch_time_days, production_lead_time_days, pack_size, units_per_master_pack,
             sample_available, sample_quantity, sample_price, generic_product_brand_id,
+            marketing_commission_percent,
             seller_id,
             seller:seller_profiles!seller_product_submissions_seller_id_fkey (
                 working_days, order_acceptance_start, order_acceptance_end, holidays,
@@ -345,7 +346,9 @@ export async function getOrderQuote(req, res) {
     const addressPincode = addressResult.data?.pincode || destPincode || null;
     const addressState = addressResult.data?.state || destState || null;
 
-    const commissionPercent = Number(commissionResult.data ?? 0.25);
+    const commissionPercent = submission.marketing_commission_percent != null
+        ? Number(submission.marketing_commission_percent)
+        : Number(commissionResult.data ?? 0.25); // legacy fallback — pre-migration listing, never edited since
 
     const saleQty = purchaseQtyToSaleUnitQty(qty, purchaseBasis, submission.pack_size, submission.units_per_master_pack);
     const baseQty = saleUnitQtyToBaseUnits(saleQty, submission.pack_size, submission.units_per_master_pack);
