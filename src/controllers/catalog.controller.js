@@ -144,7 +144,8 @@ export async function getBrandItemSellers(req, res) {
 // product picked yet. categoryId omitted = browse everything.
 // GET /api/catalog/brand-items-feed?categoryId=&q=&sort=&limit=&offset=
 export async function getBrandItemsFeed(req, res) {
-    console.log("feed buyer id:", req.user?.id);
+    // console.log("feed buyer id:", req.user?.id);
+    // console.log("feed seller profile id:", req.seller_id);
 
     const { categoryId = "", q = "", sort = "relevance" } = req.query;
     const limit = parseIntSafe(req.query.limit, 24);
