@@ -881,3 +881,98 @@ export async function getUnmappedCatalogCounts(req, res) {
         res.status(500).json({ success: false, message: error.message });
     }
 }
+
+// GET /api/admin/brands?q=
+// Groups hs_generic_product_brands by brand_name, returning one row per
+// brand with a representative image/brand_image and how many items use it.
+// Rows with brand_not_applicable = true or brand_name null are excluded —
+// there's nothing to manage for those.
+export async function listBrands(req, res) {
+    const { q = "" } = req.query;
+
+    let query = supabase
+        .from("hs_generic_product_brands")
+        .select("brand_name, brand_image")
+        .is("deleted_at", null)
+        .not("brand_name", "is", null)
+        .eq("brand_not_applicable", false);
+
+    if (q.trim()) query = query.ilike("brand_name", `%${q.trim()}%`);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    // Group in memory — brand_name isn't its own table, so there's no
+    // GROUP BY to push down to postgres here.
+    const byName = new Map();
+    for (const row of data || []) {
+        const key = row.brand_name.trim();
+        if (!byName.has(key)) byName.set(key, { brand_name: key, brand_image: row.brand_image || null, item_count: 0 });
+        const entry = byName.get(key);
+        entry.item_count += 1;
+        if (!entry.brand_image && row.brand_image) entry.brand_image = row.brand_image;
+    }
+
+    const brands = [...byName.values()].sort((a, b) => a.brand_name.localeCompare(b.brand_name));
+    res.json({ success: true, brands });
+}
+
+// PATCH /api/admin/brands/:brandName   { newName, brandImage }
+// Bulk-updates every hs_generic_product_brands row currently carrying
+// brandName (case-insensitive match) — renaming it and/or swapping the
+// logo everywhere at once, instead of per-item.
+export async function updateBrand(req, res) {
+    const { brandName } = req.params;
+    const { newName, brandImage } = req.body || {};
+
+    const decodedName = decodeURIComponent(brandName).trim();
+    if (!decodedName) return res.status(400).json({ success: false, message: "Missing brand name." });
+
+    const update = {};
+    if (newName !== undefined) {
+        const trimmed = newName.trim();
+        if (trimmed.length < 2) return res.status(400).json({ success: false, message: "Brand name must be at least 2 characters." });
+        update.brand_name = trimmed;
+    }
+    if (brandImage !== undefined) update.brand_image = brandImage || null;
+
+    if (!Object.keys(update).length) {
+        return res.status(400).json({ success: false, message: "Nothing to update." });
+    }
+
+    // If renaming, check the target name doesn't already exist as a
+    // *different* brand — otherwise this silently merges two brands
+    // together, which the admin should confirm explicitly rather than
+    // have happen by accident.
+    if (update.brand_name && update.brand_name.toLowerCase() !== decodedName.toLowerCase()) {
+        const { data: clash } = await supabase
+            .from("hs_generic_product_brands")
+            .select("id")
+            .ilike("brand_name", update.brand_name)
+            .is("deleted_at", null)
+            .limit(1)
+            .maybeSingle();
+        if (clash && !req.body.confirmMerge) {
+            return res.status(409).json({
+                success: false,
+                mergeConflict: true,
+                message: `"${update.brand_name}" already exists as a brand. Renaming will merge these two brands — confirm to proceed.`,
+            });
+        }
+    }
+
+    const { data, error, count } = await supabase
+        .from("hs_generic_product_brands")
+        .update(update)
+        .ilike("brand_name", decodedName)
+        .is("deleted_at", null)
+        .select("id", { count: "exact" });
+
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    res.json({
+        success: true,
+        updatedCount: count ?? data?.length ?? 0,
+        brand: { brand_name: update.brand_name || decodedName, brand_image: update.brand_image !== undefined ? update.brand_image : undefined },
+    });
+}

@@ -14,7 +14,8 @@ import {
   createMappingOption, createCatalogEntry, deleteCatalogEntry,
   adminListCatalog, adminCreateCatalogEntry,
   searchCatalogEverywhere,
-  listUnmappedCatalogEntries, getUnmappedCatalogCounts
+  listUnmappedCatalogEntries, getUnmappedCatalogCounts,
+  listBrands, updateBrand
 } from "../controllers/adminCatalog.controller.js";
 import multer from "multer";
 import { downloadCatalogTemplate, bulkUploadCatalog } from "../controllers/adminCatalogBulk.controller.js";
@@ -53,6 +54,8 @@ router.post("/admins/create", requireAuth, requireAdmin, authWriteLimiter, creat
 router.post("/admins/demote", requireAuth, requireAdmin, authWriteLimiter, demoteAdmin);
 
 // router.get("/catalog", requireAuth, requireAdmin, adminListCatalog);
+router.get("/brands", requireAuth, requireAdmin, listBrands);
+router.patch("/brands/:brandName", requireAuth, requireAdmin, updateBrand);
 router.post("/catalog", requireAuth, requireAdmin, adminCreateCatalogEntry);
 router.get("/catalog", requireAuth, requireAdmin, listCatalogEntries);
 router.get("/catalog/options", requireAuth, requireAdmin, getMappingOptions);
