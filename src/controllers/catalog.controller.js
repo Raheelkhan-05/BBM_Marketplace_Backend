@@ -206,3 +206,44 @@ export async function getSharedProductLink(req, res) {
     if (!data) return res.status(404).json({ success: false, message: "This product link is no longer available." });
     return res.json({ success: true, ...data });
 }
+
+// GET /api/seller-listing/lowest-price/:genericProductBrandId
+// Returns the lowest active price for this brand item, normalized to
+// "per Pack" so the frontend dial always seeds in the same unit the
+// price field is edited in — regardless of what basis each individual
+// seller happens to store their own price in.
+export async function getLowestPriceForBrandItem(req, res) {
+    const { genericProductBrandId } = req.params;
+    if (!genericProductBrandId) return res.status(400).json({ success: false, message: "Missing genericProductBrandId." });
+
+    const { data, error } = await supabaseAdmin
+        .from("seller_product_submissions")
+        .select("price, price_basis, pack_size, units_per_master_pack, gst_percent")
+        .eq("generic_product_brand_id", genericProductBrandId)
+        .eq("review_status", "approved")
+        .eq("is_active", true)
+        .not("price", "is", null);
+
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    if (!data?.length) return res.json({ success: true, lowestPricePerPack: null, sellerCount: 0 });
+
+    // Normalize every row to "price per Pack" so they're comparable
+    // regardless of what basis (per_unit / per_pack / per_master_pack)
+    // that particular seller entered their price in.
+    const perPackPrices = data.map((row) => {
+        const price = Number(row.price) || 0;
+        const pack = Number(row.pack_size) > 0 ? Number(row.pack_size) : 1;
+        const master = Number(row.units_per_master_pack) > 0 ? Number(row.units_per_master_pack) : 1;
+        if (row.price_basis === "per_unit") return price * pack;
+        if (row.price_basis === "per_master_pack") return price / master;
+        return price; // per_pack
+    }).filter((p) => p > 0);
+
+    if (!perPackPrices.length) return res.json({ success: true, lowestPricePerPack: null, sellerCount: 0 });
+
+    res.json({
+        success: true,
+        lowestPricePerPack: Math.round(Math.min(...perPackPrices) * 100) / 100,
+        sellerCount: perPackPrices.length,
+    });
+}
