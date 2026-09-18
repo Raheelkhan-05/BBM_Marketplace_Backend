@@ -265,7 +265,7 @@ function validateListingPayload(body) {
     if (typeof body.gstInclusive !== "boolean") missing.push("Whether price includes GST");
     if (typeof body.freightIncluded !== "boolean") missing.push("Whether freight is included");
     const mcp = Number(body.marketingCommissionPercent);
-    if (!(mcp >= 0.25 && mcp <= 100)) missing.push("Marketing Budget %");
+    if (!(mcp >= 0.25 && mcp <= 100)) missing.push("Promotion & Visibility Budget %");
 
     if (body.sampleAvailable) {
         if (!(Number(body.sampleQuantity) > 0)) missing.push("Sample quantity");
