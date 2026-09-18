@@ -12,22 +12,50 @@ function assertConfigured() {
 // Finds a profile by EITHER phone or email matching the given value, so a
 // user who started signup on one channel can log back in on the other and
 // land on the same account, rather than getting a fresh blank one.
+// src/controllers/otpAuth.controller.js
+
+// Finds a profile owning this phone/email. Verified ownership always
+// wins: if some profile has actually verified this value, that's the
+// one returned, full stop — even if other unverified rows also happen
+// to carry the same value (abandoned signups, typos, etc.). Only when
+// NO profile has verified it yet do we fall back to an unverified match,
+// picking exactly one (most recently created) so a half-finished signup
+// resumes on the same profile instead of spawning a duplicate.
 async function findOrCreateProfile(channel, value) {
-  const { data: profile, error } = await supabaseAdmin
+  const column = channel === "phone" ? "phone" : "email";
+  const verifiedColumn = channel === "phone" ? "phone_verified" : "email_verified";
+
+  // 1) Verified match, if any — this is authoritative ownership.
+  const { data: verifiedProfile, error: verifiedErr } = await supabaseAdmin
     .from("profiles").select("*")
-    .or(`phone.eq.${value},email.eq.${value}`)
+    .eq(column, value)
+    .eq(verifiedColumn, true)
     .eq("role", "user")
     .is("deleted_at", null)
     .maybeSingle();
+  if (verifiedErr) throw verifiedErr;
 
-  if (error) throw error;
+  let profile = verifiedProfile;
+
+  // 2) No one has verified this value yet — fall back to an unverified
+  // row, but only ONE: the most recently created, so this is
+  // deterministic even if several stale rows share the value.
+  if (!profile) {
+    const { data: unverifiedMatches, error: unverifiedErr } = await supabaseAdmin
+      .from("profiles").select("*")
+      .eq(column, value)
+      .eq(verifiedColumn, false)
+      .eq("role", "user")
+      .is("deleted_at", null)
+      .order("created_at", { ascending: false })
+      .limit(1);
+    if (unverifiedErr) throw unverifiedErr;
+    profile = unverifiedMatches?.[0] || null;
+  }
 
   if (profile) {
-    const column = channel === "phone" ? "phone" : "email";
-    const verifiedColumn = channel === "phone" ? "phone_verified" : "email_verified";
-    if (!profile[column]) {
+    if (!profile[verifiedColumn]) {
       await supabaseAdmin.from("profiles").update({ [column]: value, [verifiedColumn]: true }).eq("id", profile.id);
-      profile[column] = value;
       profile[verifiedColumn] = true;
     }
     return { profile, isNewUser: profile.onboarding_step !== "done" };
@@ -39,10 +67,14 @@ async function findOrCreateProfile(channel, value) {
   const { data: created, error: insertErr } = await supabaseAdmin.from("profiles").insert(insertPatch).select("*").single();
   if (insertErr) {
     if (insertErr.code === "23505") {
-      const { data: existing, error: refetchErr } = await supabaseAdmin.from("profiles").select("*")
-        .or(`phone.eq.${value},email.eq.${value}`).eq("role", "user").is("deleted_at", null).maybeSingle();
-      if (refetchErr) throw refetchErr;
-      if (existing) return { profile: existing, isNewUser: existing.onboarding_step !== "done" };
+      // Someone else just verified this value in the race window —
+      // re-run the same verified-first lookup rather than re-querying
+      // the old broad OR.
+      const { data: raced, error: racedErr } = await supabaseAdmin
+        .from("profiles").select("*")
+        .eq(column, value).eq(verifiedColumn, true).eq("role", "user").is("deleted_at", null).maybeSingle();
+      if (racedErr) throw racedErr;
+      if (raced) return { profile: raced, isNewUser: raced.onboarding_step !== "done" };
     }
     throw insertErr;
   }
