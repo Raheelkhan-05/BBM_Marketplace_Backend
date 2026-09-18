@@ -18,11 +18,14 @@ export async function requestContactOtp(req, res) {
   const verifiedField =
     field === "email" ? "email_verified" : "phone_verified";
 
+  // Only block if someone else has ALREADY VERIFIED this value.
+  // Unverified duplicates from other (possibly abandoned) accounts are fine —
+  // they don't actually own the contact until they verify it themselves.
   const { data: taken } = await supabaseAdmin
     .from("profiles")
     .select("id")
     .eq(field, normalized)
-    .eq(verifiedField, false)
+    .eq(verifiedField, true)
     .eq("role", "user")
     .neq("id", req.user.id)
     .is("deleted_at", null)
@@ -57,6 +60,8 @@ export async function verifyContactOtp(req, res) {
   const patch = field === "email" ? { email: normalized, email_verified: true } : { phone: normalized, phone_verified: true };
   const { error } = await supabaseAdmin.from("profiles").update(patch).eq("id", req.user.id);
   if (error) {
+    // With the verified-only unique index, this now only fires when someone
+    // else genuinely already verified this exact value in the meantime (a real race).
     if (error.code === "23505") return res.status(409).json({ success: false, message: "This is already linked to another account." });
     return res.status(500).json({ success: false, message: "Couldn't verify. Try again." });
   }
