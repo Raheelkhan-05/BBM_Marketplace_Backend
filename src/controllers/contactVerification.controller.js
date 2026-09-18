@@ -15,13 +15,19 @@ export async function requestContactOtp(req, res) {
     return res.status(400).json({ success: false, message: "Enter a valid 10-digit mobile number." });
   }
 
+  const verifiedField =
+    field === "email" ? "email_verified" : "phone_verified";
+
   const { data: taken } = await supabaseAdmin
-    .from("profiles").select("id")
+    .from("profiles")
+    .select("id")
     .eq(field, normalized)
+    .eq(verifiedField, true)
     .eq("role", "user")
     .neq("id", req.user.id)
-    .is("deleted_at", null)   // <-- added: a deleted account's old email/phone shouldn't block someone else from claiming it
+    .is("deleted_at", null)
     .maybeSingle();
+
   if (taken) {
     return res.status(409).json({
       success: false,
