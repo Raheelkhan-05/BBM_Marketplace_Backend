@@ -13,10 +13,10 @@ export async function listCustomPricingForBuyer(req, res) {
         supabase
             .from("seller_product_submissions")
             .select(`
-                id, product_name, brand_name, image, price, unit, price_basis, review_status, is_active,
-                pack_size, units_per_master_pack, rejection_reason,
-                hs_generic_product_brands!inner ( deleted_at )
-            `)
+            id, product_name, brand_name, image, price, unit, price_basis, review_status, is_active,
+            pack_size, units_per_master_pack, rejection_reason, gst_percent,
+            hs_generic_product_brands!inner ( deleted_at )
+        `)
             .eq("seller_id", sellerId)
             .eq("review_status", "approved")
             .is("hs_generic_product_brands.deleted_at", null)
@@ -50,6 +50,7 @@ export async function listCustomPricingForBuyer(req, res) {
             masterPackSize: Number(s.units_per_master_pack) || 1,
             hasMasterPack: hasOuterPack(s.units_per_master_pack),
             isActive: s.is_active,
+            gstPercent: Number(s.gst_percent) || 0,
             defaultPrice,
             effectivePrice,
             // NEW — full unit/pack/master-pack breakdown for BOTH the
