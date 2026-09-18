@@ -354,3 +354,41 @@ async function populateCitiesForState(stateRow) {
         Array.from(seenDistricts).map((districtName) => ensureDistrictCity(stateRow.id, districtName, null))
     );
 }
+
+// GET /api/geo/buyer-fallback-location
+// Used only when a buyer has no saved address at all (see
+// fetchBuyerAddresses returning empty in the frontend). Falls back to
+// whatever pincode their GST business profile carries — dispatch_pincode
+// if they ship from somewhere other than their registered address,
+// otherwise the registered pincode — and resolves it the exact same way
+// a manual pincode entry would, so the result is the normal
+// { state, district } shape callers already expect.
+export async function getBuyerFallbackLocation(req, res) {
+    const userId = req.user.id;
+
+    const { data: business, error } = await supabase
+        .from("business_profiles")
+        .select("dispatch_same_as_registered, dispatch_pincode, pincode")
+        .eq("user_id", userId)
+        .maybeSingle();
+
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    if (!business) return res.json({ success: false, message: "No business profile on file." });
+
+    const pincode = business.dispatch_same_as_registered
+        ? business.pincode
+        : (business.dispatch_pincode || business.pincode);
+
+    if (!pincode || !/^\d{6}$/.test(pincode)) {
+        return res.json({ success: false, message: "No usable pincode on the business profile." });
+    }
+
+    try {
+        const resolved = await resolvePincode(pincode);
+        if (!resolved.success) return res.json(resolved);
+        res.json({ success: true, state: resolved.state, district: resolved.district, pincode, source: "business_profile" });
+    } catch (err) {
+        console.error("[getBuyerFallbackLocation]", err.message);
+        res.status(502).json({ success: false, message: "Couldn't reach the pincode lookup service." });
+    }
+}
