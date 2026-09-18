@@ -18,6 +18,7 @@ export async function requestContactOtp(req, res) {
   const { data: taken } = await supabaseAdmin
     .from("profiles").select("id")
     .eq(field, normalized)
+    .eq("role", "user")
     .neq("id", req.user.id)
     .is("deleted_at", null)   // <-- added: a deleted account's old email/phone shouldn't block someone else from claiming it
     .maybeSingle();
