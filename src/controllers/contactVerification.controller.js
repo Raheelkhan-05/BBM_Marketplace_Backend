@@ -22,7 +22,7 @@ export async function requestContactOtp(req, res) {
     .from("profiles")
     .select("id")
     .eq(field, normalized)
-    .eq(verifiedField, true)
+    .eq(verifiedField, false)
     .eq("role", "user")
     .neq("id", req.user.id)
     .is("deleted_at", null)
