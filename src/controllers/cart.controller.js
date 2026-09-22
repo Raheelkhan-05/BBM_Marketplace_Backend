@@ -57,6 +57,31 @@ export async function getCart(req, res) {
         }
     }
 
+    // NEW: attach each seller's dispatch location + which transport modes
+    // they offer, so the cart page can drive the same per-seller
+    // "Preferred transport" flow BuyNowModal drives for a single seller
+    // (see components/transport/TransportPreferenceModal.jsx, which needs
+    // seller.dispatchOrigin / seller.dispatchState / seller.transportOptions).
+    // Mirrors resolveSellerDispatchLocation's state-resolution rule from
+    // orders.controller.js: dispatch_state when the seller has a distinct
+    // dispatch location, otherwise their registered state. There's no
+    // separate dispatch-city column anywhere in this schema, so the
+    // registered city is used as the origin city in both cases.
+    const sellerIds = [...new Set(items.map((i) => i.seller_id).filter(Boolean))];
+    if (sellerIds.length) {
+        const { data: sellerRows } = await supabase
+            .from("seller_profiles")
+            .select("id, display_name, city, state, dispatch_state, dispatch_same_as_registered, transport_options")
+            .in("id", sellerIds);
+        const sellerById = new Map((sellerRows || []).map((r) => [r.id, r]));
+        for (const item of items) {
+            const seller = sellerById.get(item.seller_id);
+            item.seller_dispatch_city = seller?.city || null;
+            item.seller_dispatch_state = (seller?.dispatch_same_as_registered === false ? seller?.dispatch_state : seller?.state) || seller?.state || null;
+            item.seller_transport_options = Array.isArray(seller?.transport_options) ? seller.transport_options : [];
+        }
+    }
+
     res.json({ success: true, items });
 }
 
@@ -130,7 +155,7 @@ export async function removeCartItem(req, res) {
 }
 
 export async function checkoutCart(req, res) {
-    const { shippingAddressId, notes } = req.body || {};
+    const { shippingAddressId, notes, transportPreferences } = req.body || {};
 
     const { data: cartItems } = await supabase.rpc("cart_list", { p_buyer_id: req.user.id });
     const sellerIds = [...new Set((cartItems || []).map((i) => i.seller_id))];
@@ -195,8 +220,45 @@ export async function checkoutCart(req, res) {
         }
     }
 
+    // NEW: validate any per-seller transport preferences the buyer chose
+    // in the cart UI — exactly the same rule placeOrder() applies for a
+    // single seller: a buyer can only lock in a route option that seller
+    // actually has approved. Invalid entries fail the whole checkout
+    // rather than silently falling back to "no preference", so the buyer
+    // isn't surprised later by a transport choice they didn't actually
+    // get.
+    let transportBySeller = {};
+    if (Array.isArray(transportPreferences) && transportPreferences.length) {
+        const routeOptionIds = transportPreferences.map((t) => t?.routeOptionId).filter(Boolean);
+        const { data: routeRows } = routeOptionIds.length
+            ? await supabase
+                .from("transport_route_options")
+                .select("id, seller_id, mode, fields, status")
+                .in("id", routeOptionIds)
+            : { data: [] };
+        const routeById = new Map((routeRows || []).map((r) => [r.id, r]));
+
+        for (const pref of transportPreferences) {
+            if (!pref?.routeOptionId || !pref?.sellerId) continue;
+            const route = routeById.get(pref.routeOptionId);
+            if (!route || route.seller_id !== pref.sellerId || route.status !== "approved") {
+                return res.status(400).json({
+                    success: false, code: "INVALID_TRANSPORT_OPTION",
+                    message: "One of your selected transport options is no longer valid — please pick another.",
+                });
+            }
+            transportBySeller[pref.sellerId] = {
+                route_option_id: route.id,
+                mode: route.mode,
+                fields: route.fields,
+                source: "buyer_selected_approved",
+            };
+        }
+    }
+
     const { data, error } = await supabase.rpc("place_cart_order", {
         p_buyer_id: req.user.id, p_shipping_address_id: shippingAddressId, p_buyer_notes: notes || null,
+        p_transport_preferences: transportBySeller,
     }).single();
 
     if (error) {
