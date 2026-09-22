@@ -75,26 +75,97 @@ function mapGstResponse(d) {
 export async function fetchGstinDetails(gstin) {
   if (!GST_API_KEY) {
     console.error("[gst] GST_VERIFY_API_KEY is not set.");
-    return { verified: false, reason: "GST verification isn't configured." };
+    return {
+      verified: false,
+      reason: "GST verification isn't configured.",
+    };
   }
 
-  let json;
   try {
     console.log("[gst] Fetching details for:", gstin);
+
     const res = await fetch(`${GST_API_BASE}/${gstin}`, {
-      headers: { "X-API-Key": GST_API_KEY },
+      headers: {
+        "X-API-Key": GST_API_KEY,
+        Accept: "application/json",
+      },
     });
-    console.log("[gst] provider response:", res);
-    json = await res.json();
+
+    console.log("[gst] provider response:", {
+      status: res.status,
+      statusText: res.statusText,
+      contentType: res.headers.get("content-type"),
+      cfMitigated: res.headers.get("cf-mitigated"),
+    });
+
+    // Handle HTTP errors before attempting JSON parsing
+    if (!res.ok) {
+      const contentType = res.headers.get("content-type") || "";
+
+      if (res.status === 403) {
+        if (res.headers.get("cf-mitigated") === "challenge") {
+          console.error("[gst] Provider blocked request with Cloudflare challenge.");
+          return {
+            verified: false,
+            reason: "GST verification provider blocked the request.",
+          };
+        }
+
+        return {
+          verified: false,
+          reason: "GST verification provider returned 403 Forbidden.",
+        };
+      }
+
+      // Optionally capture a small amount of non-JSON response for debugging
+      const body = contentType.includes("application/json")
+        ? await res.text()
+        : "";
+
+      console.error("[gst] Provider HTTP error:", res.status, body.slice(0, 500));
+
+      return {
+        verified: false,
+        reason: `GST verification provider returned HTTP ${res.status}.`,
+      };
+    }
+
+    const contentType = res.headers.get("content-type") || "";
+
+    if (!contentType.includes("application/json")) {
+      console.error(
+        "[gst] Provider returned non-JSON response:",
+        contentType
+      );
+
+      return {
+        verified: false,
+        reason: "GST verification provider returned an invalid response.",
+      };
+    }
+
+    const json = await res.json();
+
+    if (!json.success) {
+      return {
+        verified: false,
+        reason: json.message || "GSTIN lookup failed.",
+      };
+    }
+
+    const mapped = mapGstResponse(json.data);
+
+    return {
+      verified: mapped.gstin_status === "Active",
+      mapped,
+      raw: json.data,
+    };
   } catch (e) {
-    console.error("[gst] provider request failed:", e.message);
-    return { verified: false, reason: "Couldn't reach the GST verification service." };
-  }
+    console.error("[gst] provider request failed:", e);
 
-  if (!json.success) {
-    return { verified: false, reason: json.message || "GSTIN lookup failed." };
+    return {
+      verified: false,
+      reason: "Couldn't reach the GST verification service.",
+    };
   }
-
-  const mapped = mapGstResponse(json.data);
-  return { verified: mapped.gstin_status === "Active", mapped, raw: json.data };
 }
