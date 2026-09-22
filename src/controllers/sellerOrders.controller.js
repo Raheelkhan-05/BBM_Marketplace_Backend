@@ -171,26 +171,26 @@ export async function confirmOrder(req, res) {
         return res.status(400).json({ success: false, message: "This order isn't awaiting confirmation." });
     }
 
-    if (!order.transport_mode) {
-        const { mode } = req.body || {};
-        if (!mode) {
-            return res.status(400).json({ success: false, code: "TRANSPORT_MODE_REQUIRED", message: "Please select a transport method for this order before confirming." });
-        }
-        const optionSchema = getTransportOption(mode);
-        if (!optionSchema) return res.status(400).json({ success: false, message: "Unrecognised transport method." });
+    // if (!order.transport_mode) {
+    //     const { mode } = req.body || {};
+    //     if (!mode) {
+    //         return res.status(400).json({ success: false, code: "TRANSPORT_MODE_REQUIRED", message: "Please select a transport method for this order before confirming." });
+    //     }
+    //     const optionSchema = getTransportOption(mode);
+    //     if (!optionSchema) return res.status(400).json({ success: false, message: "Unrecognised transport method." });
 
-        const { data: sellerProfile } = await supabase.from("seller_profiles").select("transport_options").eq("id", req.sellerId).maybeSingle();
-        const offered = Array.isArray(sellerProfile?.transport_options) ? sellerProfile.transport_options : [];
-        if (!offered.includes(mode)) {
-            return res.status(400).json({ success: false, message: "You haven't enabled this transport method — update it from Shop Settings." });
-        }
+    //     const { data: sellerProfile } = await supabase.from("seller_profiles").select("transport_options").eq("id", req.sellerId).maybeSingle();
+    //     const offered = Array.isArray(sellerProfile?.transport_options) ? sellerProfile.transport_options : [];
+    //     if (!offered.includes(mode)) {
+    //         return res.status(400).json({ success: false, message: "You haven't enabled this transport method — update it from Shop Settings." });
+    //     }
 
-        const { error: updateErr } = await supabase
-            .from("orders")
-            .update({ transport_mode: mode, transport_source: "seller_choice" })
-            .eq("id", orderId);
-        if (updateErr) return res.status(500).json({ success: false, message: updateErr.message });
-    }
+    //     const { error: updateErr } = await supabase
+    //         .from("orders")
+    //         .update({ transport_mode: mode, transport_source: "seller_choice" })
+    //         .eq("id", orderId);
+    //     if (updateErr) return res.status(500).json({ success: false, message: updateErr.message });
+    // }
 
     return runConfirmTransition(req, res);
 }
