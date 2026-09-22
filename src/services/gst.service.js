@@ -70,6 +70,7 @@ function mapGstResponse(d) {
   };
 }
 
+
 // Real lookup. Returns { verified, mapped, raw } or { verified: false, reason }.
 export async function fetchGstinDetails(gstin) {
   if (!GST_API_KEY) {
@@ -79,9 +80,11 @@ export async function fetchGstinDetails(gstin) {
 
   let json;
   try {
+    console.log("[gst] Fetching details for:", gstin);
     const res = await fetch(`${GST_API_BASE}/${gstin}`, {
       headers: { "X-API-Key": GST_API_KEY },
     });
+    console.log("[gst] provider response:", res);
     json = await res.json();
   } catch (e) {
     console.error("[gst] provider request failed:", e.message);
