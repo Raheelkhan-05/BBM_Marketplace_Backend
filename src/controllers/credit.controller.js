@@ -76,12 +76,12 @@ export async function getCreditStatus(req, res) {
         // Neither direction has a row yet — still tell a seller-viewer who they'd be
         // approving, even before any request exists, so the UI is consistent
         // whenever a credit row does eventually appear.
+        if (meAsSeller) {
+            const buyerInfo = await getBuyerInfoForSeller(otherUserId);
+            return res.json({ success: true, credit: null, viewerRole: "seller", buyerInfo });
+        }
         if (otherAsSeller) {
             return res.json({ success: true, credit: null, viewerRole: "buyer" });
-        }
-        if (meAsSeller) {
-            const buyerInfo = await getBuyerInfoForSeller(otherUserId); // NEW
-            return res.json({ success: true, credit: null, viewerRole: "seller", buyerInfo });
         }
         return res.json({ success: true, credit: null, viewerRole: null });
     }
