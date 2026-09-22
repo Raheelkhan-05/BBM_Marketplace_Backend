@@ -6,6 +6,15 @@
 // controller, merge these three handlers in; only getBrandItemDetail and
 // getBrandItemSellers are new, getGenericProductBrands is your existing
 // catalog_browse just called with a fixed p_generic_product_ids filter.
+//
+// CHANGED (this revision): getBrandItemSellers now forwards the buyer's
+// destination pincode/state through to catalog_brand_item_sellers, and
+// accepts a wider set of `sort` values ('moq_asc', 'fastest_delivery' —
+// in addition to the existing 'relevance'/'price_asc'/'price_desc').
+// The actual sorting/ordering across ALL matching sellers now happens
+// inside the SQL function itself, not in the frontend — see that
+// function's own comments for why (pagination-stable "fastest delivery"
+// ordering).
 
 import { supabaseAdmin } from "../config/supabase.js";
 
@@ -113,12 +122,20 @@ export async function getBrandItemDetail(req, res) {
     return res.json({ success: true, item: data });
 }
 
-// GET /api/catalog/brand-items/:brandItemId/sellers?sort=&limit=&offset=
-// let invocationCount = 0;
-
+// GET /api/catalog/brand-items/:brandItemId/sellers?sort=&limit=&offset=&destPincode=&destState=
+//
+// `sort` accepts: 'relevance' (default), 'price_asc', 'price_desc',
+// 'moq_asc', or 'fastest_delivery'. The last one requires destPincode +
+// destState (the buyer's saved delivery address) — without both, the SQL
+// function simply can't compute a delivery estimate and 'fastest_delivery'
+// silently behaves like 'relevance' (every seller ties, so the stable
+// submission_id tiebreaker applies). destPincode/destState are optional
+// for every other sort value too, but when present they're used to
+// compute and return each seller's `total_delivery_days` so the frontend
+// can DISPLAY an estimate even while sorting by price or MOQ.
 export async function getBrandItemSellers(req, res) {
     const { brandItemId } = req.params;
-    const { sort = "relevance" } = req.query;
+    const { sort = "relevance", destPincode, destState } = req.query;
     const limit = parseIntSafe(req.query.limit, 24);
     const offset = parseIntSafe(req.query.offset, 0);
 
@@ -127,7 +144,9 @@ export async function getBrandItemSellers(req, res) {
         p_sort: sort,
         p_limit: limit,
         p_offset: offset,
-        p_buyer_id: req.user?.id || null,   // NEW
+        p_buyer_id: req.user?.id || null,
+        p_dest_pincode: destPincode || null,
+        p_dest_state: destState || null,
     });
 
     if (error) {
@@ -144,19 +163,14 @@ export async function getBrandItemSellers(req, res) {
 // product picked yet. categoryId omitted = browse everything.
 // GET /api/catalog/brand-items-feed?categoryId=&q=&sort=&limit=&offset=
 export async function getBrandItemsFeed(req, res) {
-    // console.log("feed buyer id:", req.user?.id);
-    // console.log("feed seller profile id:", req.seller_id);
-
     const { categoryId = "", q = "", sort = "relevance" } = req.query;
     const limit = parseIntSafe(req.query.limit, 24);
     const offset = parseIntSafe(req.query.offset, 0);
 
-    // CHANGED: was calling catalog_browse (computes 3 facet aggregations
-    // + seller_count per row) — the home feed never reads either. Uses
-    // catalog_browse_feed instead: identical item shape the frontend
-    // actually consumes, without the wasted work. If you need facets or
-    // seller_count for some OTHER consumer of catalog_browse, that
-    // function is untouched — only this call site moved.
+    // Uses catalog_browse_feed instead of catalog_browse: identical item
+    // shape the frontend actually consumes here, without the wasted
+    // facet-aggregation work catalog_browse also does (that stays used
+    // by whatever DOES need facets — this call site is untouched).
     const { data, error } = await supabaseAdmin.rpc("catalog_browse_feed", {
         p_category_id: categoryId || null,
         p_q: q,
