@@ -214,6 +214,26 @@ async function fetchFromGstVerify(gstin) {
   }
 }
 
+// gstinapi.in often returns district as null. Best-effort lookup from the
+// pincode via India Post's public API. Never throws and never blocks the
+// verification: on any failure we just leave district null.
+async function districtFromPincode(pincode) {
+  if (!pincode || !/^\d{6}$/.test(pincode)) return null;
+  try {
+    const res = await fetch(`https://api.postalpincode.in/pincode/${pincode}`, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const office = json?.[0]?.PostOffice?.[0];
+    return office?.District || null;
+  } catch (e) {
+    console.warn("[gst] pincode->district lookup failed:", e.message);
+    return null;
+  }
+}
+
 async function fetchFromGstinApi(gstin) {
   if (!GSTINAPI_KEY) {
     console.error("[gst:gstinapi] GSTINAPI_API_KEY is not set.");
@@ -261,6 +281,9 @@ async function fetchFromGstinApi(gstin) {
     }
 
     const mapped = mapGstinApiResponse(json.data, gstin);
+    if (!mapped.district) {
+      mapped.district = await districtFromPincode(mapped.pincode);
+    }
     return { verified: mapped.gstin_status === "Active", mapped, raw: json.data, source: "gstinapi" };
   } catch (e) {
     console.error("[gst:gstinapi] request failed:", e);
