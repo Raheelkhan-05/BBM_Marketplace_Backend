@@ -11,7 +11,7 @@
 // provider. Falls back to a direct call if the env var isn't set, so
 // this keeps working locally without any proxy.
 
-import { HttpsProxyAgent } from "https-proxy-agent";
+import { ProxyAgent } from "undici";
 
 const GSTIN_CODES = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const GSTIN_FORMAT = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
@@ -19,7 +19,7 @@ const GST_API_BASE = "https://gstverify.co.in/api/v1/verify";
 const GST_API_KEY = process.env.GST_VERIFY_API_KEY;
 const STATIC_PROXY_URL = process.env.STATIC_PROXY_URL;
 
-const proxyAgent = STATIC_PROXY_URL ? new HttpsProxyAgent(STATIC_PROXY_URL) : null;
+const proxyAgent = STATIC_PROXY_URL ? new ProxyAgent(STATIC_PROXY_URL) : null;
 
 export function isValidGSTINFormat(gstin) {
   return GSTIN_FORMAT.test(gstin);
@@ -115,6 +115,7 @@ export async function fetchGstinDetails(gstin) {
       cfMitigated: res.headers.get("cf-mitigated"),
     });
 
+    // Handle HTTP errors before attempting JSON parsing
     if (!res.ok) {
       const contentType = res.headers.get("content-type") || "";
 
@@ -133,6 +134,7 @@ export async function fetchGstinDetails(gstin) {
         };
       }
 
+      // Optionally capture a small amount of non-JSON response for debugging
       const body = contentType.includes("application/json")
         ? await res.text()
         : "";
@@ -148,7 +150,10 @@ export async function fetchGstinDetails(gstin) {
     const contentType = res.headers.get("content-type") || "";
 
     if (!contentType.includes("application/json")) {
-      console.error("[gst] Provider returned non-JSON response:", contentType);
+      console.error(
+        "[gst] Provider returned non-JSON response:",
+        contentType
+      );
 
       return {
         verified: false,
