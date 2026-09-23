@@ -57,21 +57,11 @@ export async function getCart(req, res) {
         }
     }
 
-    // NEW: attach each seller's dispatch location + which transport modes
-    // they offer, so the cart page can drive the same per-seller
-    // "Preferred transport" flow BuyNowModal drives for a single seller
-    // (see components/transport/TransportPreferenceModal.jsx, which needs
-    // seller.dispatchOrigin / seller.dispatchState / seller.transportOptions).
-    // Mirrors resolveSellerDispatchLocation's state-resolution rule from
-    // orders.controller.js: dispatch_state when the seller has a distinct
-    // dispatch location, otherwise their registered state. There's no
-    // separate dispatch-city column anywhere in this schema, so the
-    // registered city is used as the origin city in both cases.
     const sellerIds = [...new Set(items.map((i) => i.seller_id).filter(Boolean))];
     if (sellerIds.length) {
         const { data: sellerRows } = await supabase
             .from("seller_profiles")
-            .select("id, display_name, city, state, dispatch_state, dispatch_same_as_registered, transport_options")
+            .select("id, display_name, city, state, dispatch_district, dispatch_state, dispatch_same_as_registered, transport_options")
             .in("id", sellerIds);
         const sellerById = new Map((sellerRows || []).map((r) => [r.id, r]));
         for (const item of items) {
@@ -79,6 +69,14 @@ export async function getCart(req, res) {
             item.seller_dispatch_city = seller?.city || null;
             item.seller_dispatch_state = (seller?.dispatch_same_as_registered === false ? seller?.dispatch_state : seller?.state) || seller?.state || null;
             item.seller_transport_options = Array.isArray(seller?.transport_options) ? seller.transport_options : [];
+
+            // NEW — real "ships from" for the detail modal's seller-terms
+            // panel, resolved the same way BuyNowModal's dispatchOrigin is
+            // (registered location unless the seller set a distinct
+            // dispatch location).
+            const dispatchCity = seller?.dispatch_same_as_registered === false ? seller?.dispatch_district : seller?.city;
+            const dispatchState = seller?.dispatch_same_as_registered === false ? seller?.dispatch_state : seller?.state;
+            item.dispatch_origin = [dispatchCity, dispatchState].filter(Boolean).join(", ") || null;
         }
     }
 
