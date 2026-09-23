@@ -73,6 +73,14 @@ export function createApp() {
   app.use(express.json({ limit: "6mb" }));
 
   app.get("/health", (req, res) => res.json({ ok: true }));
+  app.get("/api/my-ip", async (req, res) => {
+    const response = await fetch("https://api.ipify.org?format=json");
+    const data = await response.json();
+
+    res.json({
+      ip: data.ip
+    });
+  });
 
   app.use("/api/auth", authRoutes);
   app.use("/api/seller/catalog", sellerCatalogListingsRouter);

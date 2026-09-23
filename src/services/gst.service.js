@@ -3,23 +3,11 @@
 // Checksum validation stays local (no need to spend an API credit on
 // something that's obviously malformed). The actual lookup now hits a
 // real provider — gstverify.co.in — instead of the old stub.
-//
-// NOTE: Vercel's shared outbound IPs get Cloudflare-challenged by this
-// provider (403 + cf-mitigated: challenge), even though the exact same
-// request works fine from localhost. Routing through a static-IP proxy
-// (STATIC_PROXY_URL) fixes this once that IP is allowlisted with the
-// provider. Falls back to a direct call if the env var isn't set, so
-// this keeps working locally without any proxy.
-
-import { fetch as undiciFetch, ProxyAgent } from "undici";
 
 const GSTIN_CODES = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const GSTIN_FORMAT = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
 const GST_API_BASE = "https://gstverify.co.in/api/v1/verify";
 const GST_API_KEY = process.env.GST_VERIFY_API_KEY;
-const STATIC_PROXY_URL = process.env.STATIC_PROXY_URL;
-
-const proxyAgent = STATIC_PROXY_URL ? new ProxyAgent(STATIC_PROXY_URL) : null;
 
 export function isValidGSTINFormat(gstin) {
   return GSTIN_FORMAT.test(gstin);
@@ -82,6 +70,7 @@ function mapGstResponse(d) {
   };
 }
 
+
 // Real lookup. Returns { verified, mapped, raw } or { verified: false, reason }.
 export async function fetchGstinDetails(gstin) {
   if (!GST_API_KEY) {
@@ -93,19 +82,16 @@ export async function fetchGstinDetails(gstin) {
   }
 
   try {
-    console.log("[gst] Fetching details for:", gstin, proxyAgent ? "(via static proxy)" : "(direct)");
+    console.log("[gst] Fetching details for:", gstin);
 
-    const res = await undiciFetch(`${GST_API_BASE}/${gstin}`, {
+    const res = await fetch(`${GST_API_BASE}/${gstin}`, {
       headers: {
         "X-API-Key": GST_API_KEY,
         "Accept": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
+
       },
-      // Node's fetch (undici) accepts a custom dispatcher via this key for
-      // proxying. If no proxy is configured, this is simply omitted and
-      // the request goes out directly — same behavior as before.
-      ...(proxyAgent ? { dispatcher: proxyAgent } : {}),
     });
 
     console.log("[gst] provider response:", {
