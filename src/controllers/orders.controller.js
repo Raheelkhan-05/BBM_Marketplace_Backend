@@ -288,7 +288,7 @@ export async function getOrderQuote(req, res) {
             id, price, moq, unit, lead_time, stock_quantity, review_status, price_slabs, quantity_discounts,
             stock_type, dispatch_time_days, production_lead_time_days, pack_size, units_per_master_pack,
             sample_available, sample_quantity, sample_price, generic_product_brand_id,
-            marketing_commission_percent,
+            marketing_commission_percent, gst_percent,
             seller_id,
             seller:seller_profiles!seller_product_submissions_seller_id_fkey (
                 working_days, order_acceptance_start, order_acceptance_end, holidays,
@@ -418,10 +418,17 @@ export async function getOrderQuote(req, res) {
         && submission.stock_quantity != null
         && Number(submission.stock_quantity) <= 0;
 
+    const gstPercent = Number(submission.gst_percent) || 0;
+    const taxableValue = gstPercent > 0 ? round2(subtotal / (1 + gstPercent / 100)) : subtotal;
+    const gstAmount = round2(subtotal - taxableValue);
+
     res.json({
         success: true,
         orderType: "standard",
         unitPrice, basePriceApplied: slabPrice, appliedSlab, discountPercent, discountTier,
+        grossSubtotal: round2(slabPrice * saleQty),        // NEW — pre-discount, for the UI's "before discount" row
+        discountAmount: round2(slabPrice * saleQty - subtotal), // NEW
+        gstPercent, taxableValue, gstAmount,
         unit: submission.unit, moq: submission.moq,
         saleUnit: getSaleUnit(submission.units_per_master_pack),
         saleUnitLabel: saleUnitLabel(submission.units_per_master_pack),
