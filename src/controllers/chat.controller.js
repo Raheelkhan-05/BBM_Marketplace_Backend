@@ -76,37 +76,27 @@ export async function listConversations(req, res) {
         .order("last_message_at", { ascending: false, nullsFirst: false });
     if (convErr) return res.status(500).json({ success: false, message: convErr.message });
 
-    // actual unread MESSAGE counts, not just a boolean. We already have
-    // each conversation's last_read_at watermark from myRows above —
-    // fetch every message in these conversations NOT sent by this user,
-    // then bucket-count per conversation against that watermark.
-    const { data: candidateMessages } = await supabase
-        .from("chat_messages")
-        .select("conversation_id, created_at")
-        .in("conversation_id", convIds)
-        .neq("sender_id", userId)
-        .is("deleted_at", null);
-
-    const lastReadById = Object.fromEntries(myRows.map((r) => [r.conversation_id, r.last_read_at]));
-    const unreadCountById = {};
-    for (const m of candidateMessages || []) {
-        const threshold = lastReadById[m.conversation_id];
-        if (!threshold || new Date(m.created_at) > new Date(threshold)) {
-            unreadCountById[m.conversation_id] = (unreadCountById[m.conversation_id] || 0) + 1;
-        }
-    }
-
     const otherUserIds = [...new Set(
         convs.flatMap((c) => (c.is_group ? [] : [c.direct_user_a, c.direct_user_b]).filter((id) => id !== userId))
     )];
-    // IMPORTANT: no `.is("deleted_at", null)` filter here — unlike the
-    // browse/search paths, a chat with a since-deleted seller still needs
-    // to render (shop name intact) so the buyer's message history isn't
+
+    // IMPORTANT: no `.is("deleted_at", null)` filter on the seller lookup —
+    // unlike the browse/search paths, a chat with a since-deleted seller still
+    // needs to render (shop name intact) so the buyer's message history isn't
     // wiped or replaced with "Unknown seller". We fetch deleted_at instead
     // so the UI can show the name AND flag it as deleted.
-    const { data: otherSellerProfiles } = otherUserIds.length
-        ? await supabase.from("seller_profiles").select("user_id, display_name, logo_url, deleted_at").in("user_id", otherUserIds)
-        : { data: [] };
+    //
+    // Unread counts and seller profiles are independent, so they run in
+    // parallel. Unread counting happens in the database (chat_unread_counts
+    // SQL function) instead of downloading every received message.
+    const [{ data: unreadRows }, { data: otherSellerProfiles }] = await Promise.all([
+        supabase.rpc("chat_unread_counts", { p_user_id: userId }),
+        otherUserIds.length
+            ? supabase.from("seller_profiles").select("user_id, display_name, logo_url, deleted_at").in("user_id", otherUserIds)
+            : Promise.resolve({ data: [] }),
+    ]);
+
+    const unreadCountById = Object.fromEntries((unreadRows || []).map((r) => [r.conversation_id, Number(r.unread_count)]));
     const shopById = Object.fromEntries((otherSellerProfiles || []).map((p) => [p.user_id, p]));
 
     const conversations = convs.map((c) => {
@@ -120,7 +110,7 @@ export async function listConversations(req, res) {
             otherShopName: c.is_group ? undefined : (otherShop?.display_name || "Unknown seller"),
             otherShopLogo: c.is_group ? undefined : (otherShop?.logo_url || null),
             otherUserId: otherId,
-            otherIsDeletedSeller: c.is_group ? false : !!otherShop?.deleted_at, // NEW
+            otherIsDeletedSeller: c.is_group ? false : !!otherShop?.deleted_at,
             lastMessagePreview: c.last_message_preview,
             lastMessageIsMine: c.last_message_sender_id === userId,
             lastMessageAt: c.last_message_at,
@@ -139,35 +129,52 @@ export async function listMessages(req, res) {
     const { conversationId } = req.params;
     const before = req.query.before; // ISO timestamp cursor for "load older"
 
-    if (!(await assertParticipant(conversationId, userId))) {
-        return res.status(403).json({ success: false, message: "Not a participant." });
-    }
-
-    let query = supabase
+    let msgQuery = supabase
         .from("chat_messages")
         .select("id, conversation_id, sender_id, body, attachment_url, created_at, edited_at, deleted_at, client_message_id, message_type, metadata")
         .eq("conversation_id", conversationId)
         .order("created_at", { ascending: false })
         .limit(MESSAGE_PAGE_SIZE);
-    if (before) query = query.lt("created_at", before);
+    if (before) msgQuery = msgQuery.lt("created_at", before);
 
-    const { data: rows, error } = await query;
+    // messages + participants in parallel (used to be 5 sequential queries)
+    const [{ data: rows, error }, { data: participants }] = await Promise.all([
+        msgQuery,
+        supabase
+            .from("chat_participants")
+            .select("user_id, last_delivered_at, last_read_at")
+            .eq("conversation_id", conversationId),
+    ]);
     if (error) return res.status(500).json({ success: false, message: error.message });
+
+    // participant check still happens before anything is returned
+    if (!(participants || []).some((p) => p.user_id === userId)) {
+        return res.status(403).json({ success: false, message: "Not a participant." });
+    }
+    const others = participants.filter((p) => p.user_id !== userId);
+
+    // Only look up deletions for the messages actually in this page (used to
+    // load every deletion the user ever made), and check the seller's
+    // deleted status at the same time.
+    const [{ data: myDeletions }, deletion] = await Promise.all([
+        rows.length
+            ? supabase
+                .from("chat_message_deletions")
+                .select("message_id")
+                .eq("user_id", userId)
+                .in("message_id", rows.map((r) => r.id))
+            : Promise.resolve({ data: [] }),
+        others.length === 1 ? getSellerDeletionStatus(others[0].user_id) : Promise.resolve({ isDeleted: false }),
+    ]);
+    const deletedForMeIds = new Set((myDeletions || []).map((d) => d.message_id));
+
+    // Tells the client whether sending is currently allowed in this
+    // conversation, so the composer can disable itself proactively.
+    // Only meaningful for 1:1 chats.
+    const canSend = !deletion.isDeleted;
 
     const hasMore = rows.length === MESSAGE_PAGE_SIZE;
     const oldestInPage = rows.length ? rows[rows.length - 1].created_at : null;
-
-    const { data: participants } = await supabase
-        .from("chat_participants")
-        .select("user_id, last_delivered_at, last_read_at")
-        .eq("conversation_id", conversationId);
-    const others = (participants || []).filter((p) => p.user_id !== userId);
-
-    const { data: myDeletions } = await supabase
-        .from("chat_message_deletions")
-        .select("message_id")
-        .eq("user_id", userId);
-    const deletedForMeIds = new Set((myDeletions || []).map((d) => d.message_id));
 
     const messages = rows
         .filter((m) => !deletedForMeIds.has(m.id))
@@ -178,16 +185,6 @@ export async function listMessages(req, res) {
     const otherWatermarks = others.length === 1
         ? { deliveredAt: others[0].last_delivered_at, readAt: others[0].last_read_at }
         : null;
-
-    // NEW: tell the client whether sending is currently allowed in this
-    // conversation, so the composer can disable itself proactively
-    // instead of only finding out on a failed send. Only meaningful for
-    // 1:1 chats — groups aren't gated by a single "other party" status.
-    let canSend = true;
-    if (others.length === 1) {
-        const { isDeleted } = await getSellerDeletionStatus(others[0].user_id);
-        canSend = !isDeleted;
-    }
 
     res.json({ success: true, messages, hasMore, oldestCursor: oldestInPage, otherWatermarks, canSend });
 }
@@ -248,20 +245,22 @@ export async function sendMessage(req, res) {
     const { body, attachmentUrl, clientMessageId } = req.body;
 
     if (!body?.trim() && !attachmentUrl) return res.status(400).json({ success: false, message: "Empty message." });
-    if (!(await assertParticipant(conversationId, userId))) return res.status(403).json({ success: false, message: "Not a participant." });
 
-    // NEW: block sending into a conversation where the other party (for
-    // 1:1 chats) is a deleted seller. Checked on BOTH sides — a buyer
-    // can't message a deleted seller, and if a deleted seller's session
-    // somehow still tries to send, that's blocked too, since their own
-    // account is what's deleted.
-    const otherUserId = await getOtherParticipantId(conversationId, userId);
+    const [isParticipant, otherUserId] = await Promise.all([
+        assertParticipant(conversationId, userId),
+        getOtherParticipantId(conversationId, userId),
+    ]);
+    if (!isParticipant) return res.status(403).json({ success: false, message: "Not a participant." });
+
     if (otherUserId) {
-        const [otherStatus, selfStatus] = await Promise.all([
-            getSellerDeletionStatus(otherUserId),
-            getSellerDeletionStatus(userId),
-        ]);
-        if (otherStatus.isDeleted || selfStatus.isDeleted) {
+        // Block sending when either side is a deleted seller — one query
+        // instead of two.
+        const { data: deletedRows } = await supabase
+            .from("seller_profiles")
+            .select("user_id")
+            .in("user_id", [userId, otherUserId])
+            .not("deleted_at", "is", null);
+        if (deletedRows?.length) {
             return res.status(403).json({
                 success: false,
                 code: "SELLER_DELETED",
@@ -277,46 +276,49 @@ export async function sendMessage(req, res) {
         .single();
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    const preview = body?.trim() ? (body.trim().length > 80 ? body.trim().slice(0, 80) + "…" : body.trim()) : "📎 Attachment";
+    const payload = { ...message, status: "sent" };
 
-    await Promise.all([
+    // Fan out to the other person immediately, answer the sender immediately.
+    emitToConversation(conversationId, "message:new", payload).catch((e) => console.error("[chat] emit failed:", e.message));
+    res.json({ success: true, message: payload });
+
+    // Everything else happens after the response.
+    postSendTasks({ userId, conversationId, message }).catch((e) => console.error("[chat] post-send failed:", e.message));
+}
+
+async function postSendTasks({ userId, conversationId, message }) {
+    const body = message.body;
+    const preview = body ? (body.length > 80 ? body.slice(0, 80) + "…" : body) : "📎 Attachment";
+
+    const [, , { data: recipients }, { data: senderShop }, { data: senderProfile }] = await Promise.all([
         supabase.from("chat_conversations").update({ last_message_id: message.id, last_message_preview: preview, last_message_sender_id: userId, last_message_at: message.created_at }).eq("id", conversationId),
         supabase.from("chat_participants").update({ last_read_at: message.created_at, last_delivered_at: message.created_at }).eq("conversation_id", conversationId).eq("user_id", userId),
+        supabase.from("chat_participants").select("user_id, is_muted").eq("conversation_id", conversationId).neq("user_id", userId),
+        supabase.from("seller_profiles").select("display_name").eq("user_id", userId).is("deleted_at", null).maybeSingle(),
+        supabase.from("profiles").select("name").eq("id", userId).single(),
     ]);
 
-    const payload = { ...message, status: "sent" };
-    await emitToConversation(conversationId, "message:new", payload);
+    await emitToConversation(conversationId, "conversation:updated", { conversationId }, { excludeUserId: userId });
 
-    const { data: recipients } = await supabase.from("chat_participants").select("user_id, is_muted").eq("conversation_id", conversationId).neq("user_id", userId);
     const deliveredTo = (recipients || []).filter((r) => isOnline(r.user_id)).map((r) => r.user_id);
     if (deliveredTo.length) {
         const { data: dRow, error: dErr } = await supabase
             .rpc("mark_participants_delivered_for_conversation", { p_conversation_id: conversationId, p_user_ids: deliveredTo })
             .single();
-        if (dErr) {
-            console.error("[chat] delivered-on-send update failed:", dErr.message);
-        } else {
-            await emitToConversation(conversationId, "message:status", { conversationId, deliveredAt: dRow.delivered_at, byUserIds: deliveredTo });
-        }
+        if (dErr) console.error("[chat] delivered-on-send update failed:", dErr.message);
+        else await emitToConversation(conversationId, "message:status", { conversationId, deliveredAt: dRow.delivered_at, byUserIds: deliveredTo });
     }
 
-    await emitToConversation(conversationId, "conversation:updated", { conversationId }, { excludeUserId: userId });
-
     const toNotify = (recipients || []).filter((r) => !r.is_muted);
-    const [{ data: senderShop }, { data: senderProfile }] = await Promise.all([
-        supabase.from("seller_profiles").select("display_name").eq("user_id", userId).is("deleted_at", null).maybeSingle(),
-        supabase.from("profiles").select("name").eq("id", userId).single(),
-    ]);
-    const notificationTitle = senderShop?.display_name || senderProfile?.name || "New message";
-
     if (toNotify.length) {
-        const { data: inserted } = await supabase.from("notifications").insert(
-            toNotify.map((r) => ({ user_id: r.user_id, type: "message", title: notificationTitle, body: preview, link: `/chat/${conversationId}`, read: false }))
-        ).select("id, user_id, title, body, link, created_at");
+        const title = senderShop?.display_name || senderProfile?.name || "New message";
+        const { data: inserted } = await supabase
+            .from("notifications")
+            .insert(toNotify.map((r) => ({ user_id: r.user_id, type: "message", title, body: preview, link: `/chat/${conversationId}`, read: false })))
+            .select("id, user_id, title, body, link, created_at");
         const io = getIO();
         (inserted || []).forEach((n) => io.to(`user:${n.user_id}`).emit("notification:new", n));
     }
-    res.json({ success: true, message: payload });
 }
 
 export async function markRead(req, res) {
