@@ -24,11 +24,25 @@ export async function createAddress(req, res) {
         norm(a.address_line1) === norm(body.address_line1) &&
         norm(a.pincode) === norm(body.pincode)
     );
-    if (dup) return res.json({ success: true, address: dup, deduped: true });
+    if (dup) {
+        // The buyer asked for this address to become the default — honour that
+        // even though we're reusing the existing row.
+        if (body.is_default && !dup.is_default) {
+            const { error: defErr } = await supabase.rpc("set_default_buyer_address", { p_user_id: req.user.id, p_address_id: dup.id });
+            if (!defErr) dup.is_default = true;
+        }
+        return res.json({ success: true, address: dup, deduped: true });
+    }
 
-    const { count } = await supabase.from("buyer_addresses").select("id", { count: "exact", head: true }).eq("user_id", req.user.id);
-    const isFirst = !count;
+    const isFirst = !(existingRows || []).length;
+    const wantsDefault = !!body.is_default || isFirst;
 
+    // IMPORTANT: always insert as NOT default. The table has a unique index
+    // allowing only one default address per user
+    // (buyer_addresses_one_default_per_user), so inserting a second row with
+    // is_default = true fails while the old default still exists. The
+    // set_default_buyer_address RPC below demotes the old default and
+    // promotes this one in a single step.
     const { data, error } = await supabase
         .from("buyer_addresses")
         .insert({
@@ -36,12 +50,16 @@ export async function createAddress(req, res) {
             contact_name: body.contact_name.trim(), contact_phone: body.contact_phone.trim(),
             address_line1: body.address_line1.trim(), address_line2: body.address_line2?.trim() || null,
             city: body.city.trim(), state: body.state.trim(), pincode: body.pincode.trim(),
-            is_default: !!body.is_default || isFirst,
+            is_default: false,
         })
         .select("*").single();
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    if (data.is_default) await supabase.rpc("set_default_buyer_address", { p_user_id: req.user.id, p_address_id: data.id });
+    if (wantsDefault) {
+        const { error: defErr } = await supabase.rpc("set_default_buyer_address", { p_user_id: req.user.id, p_address_id: data.id });
+        if (defErr) console.error("[addresses] set default after create failed:", defErr.message);
+        else data.is_default = true;
+    }
     res.json({ success: true, address: data });
 }
 
