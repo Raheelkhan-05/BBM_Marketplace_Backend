@@ -681,10 +681,15 @@ export async function listMyOrders(req, res) {
       id, order_number, status, order_type, sample_order_id, stock_shortfall,
       order_group_id,
       order_group:order_groups ( group_number ),
-      subtotal_amount, total_amount, payment_status, created_at, updated_at,
+      subtotal_amount, total_amount, payment_status, payment_method, created_at, updated_at,
       buyer_transport_mode, transport_mode, transport_fields, transport_notes, transport_proof_url, transport_confirmed_at, transport_source,
       seller:seller_profiles ( id, display_name, shop_slug, logo_url, city, state ),
-      items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied, discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )
+      items:order_items (
+        id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied,
+        discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total,
+        seller_product_submission_id,
+        submission:seller_product_submissions ( freight_terms )
+      )
     `)
         .eq("buyer_id", req.user.id).order("created_at", { ascending: false });
     if (status) query = query.eq("status", status);
@@ -716,7 +721,10 @@ export async function getMyOrder(req, res) {
         id, display_name, shop_slug, logo_url, city, state,
         business:business_profiles!seller_profiles_business_profile_id_fkey ( gstin )
       ),
-      items:order_items ( * )
+      items:order_items (
+        *,
+        submission:seller_product_submissions ( freight_terms )
+      )
     `)
         .eq("id", req.params.id).eq("buyer_id", req.user.id).maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });

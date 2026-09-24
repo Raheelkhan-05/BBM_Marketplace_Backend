@@ -42,12 +42,17 @@ export async function listSellerOrders(req, res) {
       order_group_id,
       order_group:order_groups ( group_number ),
       subtotal_amount, platform_fee_percent, platform_fee_amount, seller_payout_amount, total_amount,
-      payment_status, buyer_contact_name, buyer_contact_phone, buyer_contact_email,
+      payment_status, payment_method, buyer_contact_name, buyer_contact_phone, buyer_contact_email,
       buyer_gstin, buyer_business_name, buyer_gst_verified,
       shipping_address_snapshot, buyer_notes, created_at, updated_at,
       buyer_transport_mode, transport_mode, transport_fields, transport_route_option_id,
       ship_lr_number, ship_bill_url, ship_details_confirmed_at,
-      items:order_items ( id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied, discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total )
+      items:order_items (
+        id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied,
+        discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total,
+        seller_product_submission_id,
+        submission:seller_product_submissions ( freight_terms )
+      )
     `)
         .eq("seller_id", req.sellerId).neq("status", "awaiting_payment").order("created_at", { ascending: false });
     if (status) query = query.eq("status", status);
@@ -61,6 +66,7 @@ export async function listSellerOrders(req, res) {
 }
 
 // GET /api/seller/orders/:id
+// GET /api/seller/orders/:id
 export async function getSellerOrder(req, res) {
     const { data: order, error } = await supabase
         .from("orders")
@@ -70,7 +76,10 @@ export async function getSellerOrder(req, res) {
         id, display_name, shop_slug, logo_url, city, state,
         business:business_profiles!seller_profiles_business_profile_id_fkey ( gstin )
       ),
-      items:order_items ( * )
+      items:order_items (
+        *,
+        submission:seller_product_submissions ( freight_terms )
+      )
     `)
         .eq("id", req.params.id).eq("seller_id", req.sellerId).neq("status", "awaiting_payment").maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
