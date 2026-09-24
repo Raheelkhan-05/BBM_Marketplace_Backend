@@ -44,6 +44,13 @@ async function getOtherParticipantId(conversationId, userId) {
     return data.direct_user_a === userId ? data.direct_user_b : data.direct_user_a;
 }
 
+// Best available business name from a business_profiles row. Only business
+// names are ever used (never the person's own name), so a buyer without a
+// shop still shows up under their business instead of "Unknown".
+function businessName(bp) {
+    return bp?.display_name?.trim() || bp?.trade_name?.trim() || bp?.legal_name?.trim() || null;
+}
+
 // derive sent/delivered/read for a message given the OTHER
 // participants' watermarks (group-safe: "read" only once every other
 // participant's last_read_at has passed the message).
@@ -89,15 +96,23 @@ export async function listConversations(req, res) {
     // Unread counts and seller profiles are independent, so they run in
     // parallel. Unread counting happens in the database (chat_unread_counts
     // SQL function) instead of downloading every received message.
-    const [{ data: unreadRows }, { data: otherSellerProfiles }] = await Promise.all([
+    //
+    // Buyers usually have no seller_profiles row, so their business profile
+    // is fetched too and used as the name fallback (e.g. when a seller opens
+    // a chat with a buyer from an order).
+    const [{ data: unreadRows }, { data: otherSellerProfiles }, { data: otherBusinessProfiles }] = await Promise.all([
         supabase.rpc("chat_unread_counts", { p_user_id: userId }),
         otherUserIds.length
             ? supabase.from("seller_profiles").select("user_id, display_name, logo_url, deleted_at").in("user_id", otherUserIds)
+            : Promise.resolve({ data: [] }),
+        otherUserIds.length
+            ? supabase.from("business_profiles").select("user_id, display_name, trade_name, legal_name").in("user_id", otherUserIds)
             : Promise.resolve({ data: [] }),
     ]);
 
     const unreadCountById = Object.fromEntries((unreadRows || []).map((r) => [r.conversation_id, Number(r.unread_count)]));
     const shopById = Object.fromEntries((otherSellerProfiles || []).map((p) => [p.user_id, p]));
+    const businessById = Object.fromEntries((otherBusinessProfiles || []).map((p) => [p.user_id, p]));
 
     const conversations = convs.map((c) => {
         const otherId = c.is_group ? null : (c.direct_user_a === userId ? c.direct_user_b : c.direct_user_a);
@@ -107,7 +122,7 @@ export async function listConversations(req, res) {
             id: c.id,
             isGroup: c.is_group,
             title: c.is_group ? c.title : undefined,
-            otherShopName: c.is_group ? undefined : (otherShop?.display_name || "Unknown seller"),
+            otherShopName: c.is_group ? undefined : (otherShop?.display_name || businessName(businessById[otherId]) || "Unknown seller"),
             otherShopLogo: c.is_group ? undefined : (otherShop?.logo_url || null),
             otherUserId: otherId,
             otherIsDeletedSeller: c.is_group ? false : !!otherShop?.deleted_at,
@@ -290,11 +305,12 @@ async function postSendTasks({ userId, conversationId, message }) {
     const body = message.body;
     const preview = body ? (body.length > 80 ? body.slice(0, 80) + "…" : body) : "📎 Attachment";
 
-    const [, , { data: recipients }, { data: senderShop }, { data: senderProfile }] = await Promise.all([
+    const [, , { data: recipients }, { data: senderShop }, { data: senderBusiness }, { data: senderProfile }] = await Promise.all([
         supabase.from("chat_conversations").update({ last_message_id: message.id, last_message_preview: preview, last_message_sender_id: userId, last_message_at: message.created_at }).eq("id", conversationId),
         supabase.from("chat_participants").update({ last_read_at: message.created_at, last_delivered_at: message.created_at }).eq("conversation_id", conversationId).eq("user_id", userId),
         supabase.from("chat_participants").select("user_id, is_muted").eq("conversation_id", conversationId).neq("user_id", userId),
         supabase.from("seller_profiles").select("display_name").eq("user_id", userId).is("deleted_at", null).maybeSingle(),
+        supabase.from("business_profiles").select("display_name, trade_name, legal_name").eq("user_id", userId).maybeSingle(),
         supabase.from("profiles").select("name").eq("id", userId).single(),
     ]);
 
@@ -311,7 +327,7 @@ async function postSendTasks({ userId, conversationId, message }) {
 
     const toNotify = (recipients || []).filter((r) => !r.is_muted);
     if (toNotify.length) {
-        const title = senderShop?.display_name || senderProfile?.name || "New message";
+        const title = senderShop?.display_name || businessName(senderBusiness) || senderProfile?.name || "New message";
         const { data: inserted } = await supabase
             .from("notifications")
             .insert(toNotify.map((r) => ({ user_id: r.user_id, type: "message", title, body: preview, link: `/chat/${conversationId}`, read: false })))
