@@ -15,7 +15,8 @@
 const GSTIN_CODES = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const GSTIN_FORMAT = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
 
-const GSTVERIFY_BASE = "https://gstverify.co.in/api/v1/verify";
+// const GSTVERIFY_BASE = "https://gstverify.co.in/api/v1/verify";
+const GSTVERIFY_BASE = "https://gstin.cloud/api/v1/verify";
 const GSTVERIFY_KEY = process.env.GST_VERIFY_API_KEY;
 
 const GSTINAPI_BASE = "https://www.gstinapi.in/v1/gstin";
