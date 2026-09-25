@@ -37,12 +37,7 @@ export async function computeMarketplaceFigures(finalPrice) {
     const commissionPercent = await getCommissionPercent();
     const commissionAmount = round2(Number(finalPrice) * (commissionPercent / 100));
     const sellerPayout = round2(Number(finalPrice) - commissionAmount);
-    return {
-        commissionPercent,
-        commissionAmount,
-        sellerPayout,
-        bbmSellingPrice: Number(finalPrice), // marketplace doesn't mark up over the seller's listed price
-    };
+    return { commissionPercent, commissionAmount, sellerPayout, bbmSellingPrice: Number(finalPrice) };
 }
 
 // Anchors on the SALE UNIT now (Pack, or Master Pack if the listing has
@@ -52,25 +47,26 @@ export async function computeMarketplaceFigures(finalPrice) {
 // so nobody has to re-scale by packSize/masterPackSize ever again.
 export function normalizeEnteredPrice(basePrice, gstPercent, gstInclusive, priceBasis, packSize, masterPackSize) {
     const gst = Number(gstPercent) || 0;
-    const perSaleUnit = priceToSaleUnitPrice(basePrice, priceBasis, packSize, masterPackSize);
+    const perSaleUnit = priceToSaleUnitPrice(basePrice, priceBasis, packSize, masterPackSize); // full precision, no rounding
 
     let basePricePerSaleUnit, gstAmount, subtotalAfterGst;
     if (gstInclusive) {
-        subtotalAfterGst = round2(perSaleUnit);
-        basePricePerSaleUnit = round2(subtotalAfterGst / (1 + gst / 100));
-        gstAmount = round2(subtotalAfterGst - basePricePerSaleUnit);
+        subtotalAfterGst = perSaleUnit; // don't round yet
+        basePricePerSaleUnit = subtotalAfterGst / (1 + gst / 100);
+        gstAmount = subtotalAfterGst - basePricePerSaleUnit;
     } else {
-        basePricePerSaleUnit = round2(perSaleUnit);
-        gstAmount = round2(basePricePerSaleUnit * (gst / 100));
-        subtotalAfterGst = round2(basePricePerSaleUnit + gstAmount);
+        basePricePerSaleUnit = perSaleUnit;
+        gstAmount = basePricePerSaleUnit * (gst / 100);
+        subtotalAfterGst = basePricePerSaleUnit + gstAmount;
     }
 
-    // Keep your existing commission composition on subtotalAfterGst
-    // exactly as before — only the anchor changed, not the GST/commission
-    // math itself.
-    // ... existing commission logic, applied to subtotalAfterGst ...
-
-    return { basePricePerSaleUnit, gstAmount, subtotalAfterGst /*, finalPricePerSaleUnit */ };
+    // Round ONLY at the boundary — this is what actually gets stored/returned.
+    return {
+        basePricePerSaleUnit: round2(basePricePerSaleUnit),
+        gstAmount: round2(gstAmount),
+        subtotalAfterGst: round2(subtotalAfterGst),
+        finalPricePerSaleUnit: round2(subtotalAfterGst),
+    };
 }
 
 /**
