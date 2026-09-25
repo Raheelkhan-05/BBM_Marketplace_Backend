@@ -3,12 +3,13 @@ import { Router } from "express";
 import { requireAuth } from "../middleware/auth.middleware.js";
 import { requireApprovedSeller } from "../middleware/requireApprovedSeller.js";
 import {
-    listCustomPricingForBuyer, upsertCustomPricing, deleteCustomPricing, bulkClearCustomPricing,
+    listCustomPricingForBuyer, listCustomPricingForSubmission, upsertCustomPricing, deleteCustomPricing, bulkClearCustomPricing,
 } from "../controllers/customPricing.controller.js";
 
 const router = Router();
 router.use(requireAuth, requireApprovedSeller);
 
+router.get("/by-submission/:submissionId", listCustomPricingForSubmission);
 router.get("/:buyerId", listCustomPricingForBuyer);
 router.post("/:buyerId", upsertCustomPricing);
 router.delete("/:buyerId/:submissionId", deleteCustomPricing);

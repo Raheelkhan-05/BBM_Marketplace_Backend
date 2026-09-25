@@ -73,6 +73,69 @@ export async function listCustomPricingForBuyer(req, res) {
     res.json({ success: true, items, customPricedCount: items.filter((i) => i.override).length });
 }
 
+// GET /api/seller/custom-pricing/by-submission/:submissionId
+// Product-centric counterpart to listCustomPricingForBuyer — for ONE
+// listing, every buyer who has a custom price on it. Buyer identity
+// (name/logo) is intentionally NOT joined here; the frontend resolves it
+// from the seller's own chat conversation list, since custom pricing only
+// ever makes sense for a buyer the seller is already talking to.
+export async function listCustomPricingForSubmission(req, res) {
+    const sellerId = req.sellerId;
+    const { submissionId } = req.params;
+
+    const { data: submission, error: subErr } = await supabase
+        .from("seller_product_submissions")
+        .select(`
+            id, product_name, brand_name, image, price, unit,
+            pack_size, units_per_master_pack, gst_percent,
+            hs_generic_product_brands!inner ( deleted_at )
+        `)
+        .eq("id", submissionId)
+        .eq("seller_id", sellerId)
+        .is("hs_generic_product_brands.deleted_at", null)
+        .maybeSingle();
+    if (subErr) return res.status(500).json({ success: false, message: subErr.message });
+    if (!submission) return res.status(404).json({ success: false, message: "Listing not found." });
+
+    const { data: overrides, error: ovErr } = await supabase
+        .from("buyer_seller_custom_prices")
+        .select("buyer_id, override_type, discount_percent, fixed_price, base_price_at_set, updated_at")
+        .eq("seller_id", sellerId)
+        .eq("submission_id", submissionId)
+        .order("updated_at", { ascending: false });
+    if (ovErr) return res.status(500).json({ success: false, message: ovErr.message });
+
+    const defaultPrice = Number(submission.price);
+    const product = {
+        submissionId: submission.id,
+        name: submission.product_name,
+        brandName: submission.brand_name,
+        image: submission.image,
+        unit: submission.unit,
+        packSize: Number(submission.pack_size) || 1,
+        masterPackSize: Number(submission.units_per_master_pack) || 1,
+        hasMasterPack: hasOuterPack(submission.units_per_master_pack),
+        gstPercent: Number(submission.gst_percent) || 0,
+        defaultPrice,
+        defaultBreakdown: derivePriceBreakdown(defaultPrice, submission.pack_size, submission.units_per_master_pack),
+    };
+
+    const buyers = (overrides || []).map((o) => {
+        const effectivePrice = resolveEffectiveBasePrice(defaultPrice, o);
+        return {
+            buyerId: o.buyer_id,
+            overrideType: o.override_type,
+            discountPercent: o.discount_percent,
+            fixedPrice: o.fixed_price,
+            basePriceAtSet: o.base_price_at_set,
+            updatedAt: o.updated_at,
+            effectivePrice,
+            effectiveBreakdown: derivePriceBreakdown(effectivePrice, submission.pack_size, submission.units_per_master_pack),
+        };
+    });
+
+    res.json({ success: true, product, buyers });
+}
 
 // POST /api/seller/custom-pricing/:buyerId
 // body: { items: [{ submissionId, overrideType: 'percent'|'fixed', value }] }
@@ -84,8 +147,6 @@ export async function listCustomPricingForBuyer(req, res) {
 // raw percent — see toDiscountPercent below — so the seller can just
 // type "₹450" and get percent-mode storage (the relation-preserving
 // path) without doing math themselves.
-// controllers/customPricing.controller.js
-
 export async function upsertCustomPricing(req, res) {
     const sellerId = req.sellerId;
     const { buyerId } = req.params;

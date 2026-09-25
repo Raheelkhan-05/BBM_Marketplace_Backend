@@ -101,3 +101,7 @@ export function violatesMinUnitPrice(canonicalPrice, packSize, masterPackSize) {
     const perUnit = unitPriceFor(canonicalPrice, packSize, masterPackSize);
     return perUnit == null || perUnit < MIN_UNIT_PRICE;
 }
+
+export const LEVEL_LABEL = { unit: (u) => u || "unit", pack: () => "pack", master_pack: () => "master pack" };
+export const LEVEL_FIELD = { unit: "perBaseUnit", pack: "perPack", master_pack: "perMasterPack" };
+export function levelsFor(row) { return row.hasMasterPack ? ["unit", "pack", "master_pack"] : ["unit", "pack"]; }
