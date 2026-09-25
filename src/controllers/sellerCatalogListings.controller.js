@@ -169,7 +169,7 @@ const SUBMISSION_DETAIL_COLUMNS = `*, hs_generic_product_brands ( id, name, bran
 // one establishing this catalog entry for the first time. Every seller
 // who lists an already-existing brand item inherits these values as-is.
 
-const BRAND_PACKAGING_COLS = "unit, pack_size, units_per_master_pack";
+const BRAND_PACKAGING_COLS = "unit, pack_size, units_per_master_pack, gst_percent";
 
 // review_status ADDED to both queries below — this is what lets
 // createSubmission / createListingForExistingBrand tell whether the
@@ -192,7 +192,9 @@ function validateNewBrandPackaging(body) {
     const missing = [];
     if (!body.unit || !ALLOWED_UNITS.includes(body.unit)) missing.push("Unit of measurement");
     if (!(Number(body.packSize) > 0)) missing.push("Pack size");
-    // if (!(Number(body.masterPackSize) > 0)) missing.push("Master pack size");
+    // GST % is now fixed on the PRODUCT, same as Unit/Pack size — only
+    // required once, while establishing a brand-new product.
+    if (body.gstPercent === undefined || body.gstPercent === null || Number(body.gstPercent) < 0) missing.push("GST %");
     return missing;
 }
 
@@ -201,7 +203,7 @@ function validateNewBrandPackaging(body) {
 // stays null — mapping happens later, independently, via
 // adminUpdateCatalogEntry("brand_item", ..., { parentId }) ("Fix mapping"
 // in the admin UI), not as a precondition of being live for buyers.
-async function createBrandItem({ productName, brandName, brandImage, brandNotApplicable, images, unit, packSize, masterPackSize }) {
+async function createBrandItem({ productName, brandName, brandImage, brandNotApplicable, images, unit, packSize, masterPackSize, gstPercent }) {
     const trimmedProduct = productName.trim();
     const insertRow = {
         generic_product_id: null,
@@ -215,14 +217,11 @@ async function createBrandItem({ productName, brandName, brandImage, brandNotApp
         unit,
         pack_size: Number(packSize),
         units_per_master_pack: Number(masterPackSize),
+        gst_percent: Number(gstPercent),
         is_ai_generated: false,
-        // Was "pending_review" — a brand-new product now goes live for
-        // buyers immediately once the seller submits it. Category mapping
-        // is a separate, non-blocking admin task tracked via the
-        // "Needs mapping" tab (generic_product_id is left null on purpose).
         review_status: "pending_review",
         reviewed_at: new Date().toISOString(),
-        reviewed_by: null, // system auto-approval, not a specific admin
+        reviewed_by: null,
     };
 
     const { data: created, error } = await supabase
@@ -244,23 +243,15 @@ async function createBrandItem({ productName, brandName, brandImage, brandNotApp
 
 function validateListingPayload(body) {
     const missing = [];
-
     if (!body.productName?.trim()) missing.push("Product name");
     if (!body.brandNotApplicable && !body.brandName?.trim()) missing.push("Brand");
     if (!(Array.isArray(body.images) && body.images.length)) missing.push("Product image");
-
-    // NOTE: moq (like stock_quantity) is expressed in the listing's
-    // canonical SALE UNIT — Master Pack when the listing has an outer
-    // pack (units_per_master_pack >= 2), Pack otherwise — not always
-    // literal Packs. See toListingRow() below and shared/packUnits.js.
-    // Never multiply/divide this by pack_size or units_per_master_pack
-    // when storing it — it's stored exactly as the seller/frontend sends
-    // it.
     if (!(Number(body.moq) > 0)) missing.push("MOQ");
-    // if (!body.hsnCode?.trim()) missing.push("HSN Code");
-    if (body.gstPercent === undefined || body.gstPercent === null || Number(body.gstPercent) < 0) missing.push("GST %");
-
+    // GST % removed from here — it's fixed on the product now, never
+    // submitted per listing. See validateNewBrandPackaging for where it
+    // IS still required (brand-new product only).
     if (!(Number(body.basePrice) > 0)) missing.push("Base price");
+
     if (!PRICE_BASES.includes(body.priceBasis)) missing.push("Price basis (per unit / pack / master pack)");
     if (typeof body.gstInclusive !== "boolean") missing.push("Whether price includes GST");
     if (typeof body.freightIncluded !== "boolean") missing.push("Whether freight is included");
@@ -297,9 +288,11 @@ function toListingRow(body, brand, sellerDispatch) {
     const unit = brand.unit;
     const packSize = Number(brand.pack_size);
     const masterPackSize = Number(brand.units_per_master_pack);
+    // Fixed on the product — never trust body.gstPercent here.
+    const gstPercent = Number(brand.gst_percent);
 
     const { basePricePerSaleUnit, finalPricePerSaleUnit } = normalizeEnteredPrice(
-        body.basePrice, body.gstPercent, body.gstInclusive, body.priceBasis,
+        body.basePrice, gstPercent, body.gstInclusive, body.priceBasis,
         packSize, masterPackSize
     );
     const effectiveLeadTime = body.stockType === "made_to_order"
@@ -320,7 +313,7 @@ function toListingRow(body, brand, sellerDispatch) {
         lead_time: effectiveLeadTime,
         image: images[0] || null,
 
-        gst_percent: Number(body.gstPercent),
+        gst_percent: gstPercent,
         price_basis: body.priceBasis,
         gst_inclusive_input: Boolean(body.gstInclusive),
         freight_included: Boolean(body.freightIncluded),
@@ -400,6 +393,7 @@ export async function createSubmission(req, res) {
                 unit: body.unit,
                 packSize: body.packSize,
                 masterPackSize: body.masterPackSize,
+                gstPercent: body.gstPercent,
             });
             isNewBrandItem = true;
         }
@@ -594,7 +588,8 @@ export async function createListingForExistingBrand(req, res) {
     // findBrandItemMatch and asks the seller to fill it in — so trust
     // body.unit/packSize/masterPackSize here, validate them, and BACKFILL
     // the brand item itself so this is the last time anyone has to.
-    const packagingMissing = !brand.unit || !(Number(brand.pack_size) > 0) || !(Number(brand.units_per_master_pack) > 0);
+    const packagingMissing = !brand.unit || !(Number(brand.pack_size) > 0) || !(Number(brand.units_per_master_pack) > 0)
+        || brand.gst_percent === null || brand.gst_percent === undefined;
     let effectiveBrand = brand;
     if (packagingMissing) {
         const missingFields = validateNewBrandPackaging(body);
@@ -607,6 +602,7 @@ export async function createListingForExistingBrand(req, res) {
                 unit: body.unit,
                 pack_size: Number(body.packSize),
                 units_per_master_pack: Number(body.masterPackSize),
+                gst_percent: Number(body.gstPercent), // NEW
             })
             .eq("id", brand.id)
             .select(`id, name, brand_name, image, images, review_status, ${BRAND_PACKAGING_COLS}`)
@@ -805,7 +801,9 @@ export async function updateSubmission(req, res) {
     }
 
     const brandPackaging = existing.hs_generic_product_brands || {
-        unit: existing.unit, pack_size: existing.pack_size, units_per_master_pack: existing.units_per_master_pack,
+        unit: existing.unit, pack_size: existing.pack_size,
+        units_per_master_pack: existing.units_per_master_pack,
+        gst_percent: existing.gst_percent, // NEW
     };
 
     const merged = {
@@ -813,11 +811,9 @@ export async function updateSubmission(req, res) {
         brandName: existing.brand_name,
         brandNotApplicable: !existing.brand_name,
         images: Array.isArray(body.images) && body.images.length ? body.images : [existing.image].filter(Boolean),
-
         moq: body.moq ?? existing.moq,
-        // hsnCode: body.hsnCode ?? existing.hsn_code,
-        gstPercent: body.gstPercent ?? existing.gst_percent,
-
+        // gstPercent removed — toListingRow now reads it straight off
+        // brandPackaging, so a seller can never override it through edit.
         basePrice: body.basePrice ?? existing.base_price,
         priceBasis: body.priceBasis ?? existing.price_basis,
         gstInclusive: body.gstInclusive ?? existing.gst_inclusive_input,

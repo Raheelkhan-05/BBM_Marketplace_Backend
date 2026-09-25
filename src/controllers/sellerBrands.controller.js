@@ -43,17 +43,27 @@ export async function findBrandItemMatch(req, res) {
 
     let query = supabase
         .from("hs_generic_product_brands")
-        .select("id, name, brand_name, unit, pack_size, units_per_master_pack, review_status")
+        // gst_percent ADDED — GST% is now fixed per product, same as
+        // unit/pack_size/units_per_master_pack, so a matched product must
+        // carry it back to the frontend too.
+        .select("id, name, brand_name, unit, pack_size, units_per_master_pack, gst_percent, review_status")
         .ilike("name", trimmedProduct);
     query = isNotApplicable ? query.is("brand_name", null) : query.ilike("brand_name", brandName.trim());
 
     const { data, error } = await query.maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    // Only a real match — with packaging actually set on it — counts.
-    // (A brand item somehow missing packaging shouldn't silently lock
-    // the seller into blank values.)
-    if (!data || !data.unit || !(Number(data.pack_size) > 0) || !(Number(data.units_per_master_pack) > 0)) {
+    // Only a real match — with packaging AND gst actually set on it —
+    // counts. A brand item missing either shouldn't silently lock the
+    // seller into a blank/zero value it can no longer edit.
+    if (
+        !data
+        || !data.unit
+        || !(Number(data.pack_size) > 0)
+        || !(Number(data.units_per_master_pack) > 0)
+        || data.gst_percent === null
+        || data.gst_percent === undefined
+    ) {
         return res.json({ success: true, match: null });
     }
 
@@ -64,6 +74,7 @@ export async function findBrandItemMatch(req, res) {
             unit: data.unit,
             packSize: data.pack_size,
             masterPackSize: data.units_per_master_pack,
+            gstPercent: data.gst_percent, // NEW
         },
     });
 }
