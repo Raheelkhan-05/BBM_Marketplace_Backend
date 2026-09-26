@@ -12,6 +12,7 @@
 // endpoint directly with an arbitrary id.
 import { supabase } from "../config/supabase.js";
 import { resolveEffectiveBasePrice, derivePriceBreakdown } from "../../shared/customPricing.js";
+import { hasOuterPack } from "../../shared/packUnits.js";
 
 async function loadOwnedSubmission(sellerId, submissionId, columns) {
     const { data, error } = await supabase
@@ -23,7 +24,6 @@ async function loadOwnedSubmission(sellerId, submissionId, columns) {
     return { data, error };
 }
 
-// GET /api/seller/catalog/submissions/:id/access
 export async function getListingAccess(req, res) {
     const sellerId = req.sellerId;
     const { id: submissionId } = req.params;
@@ -46,9 +46,6 @@ export async function getListingAccess(req, res) {
 
     const grantedAtByBuyer = Object.fromEntries((visRows || []).map((r) => [r.buyer_id, r.created_at]));
     const overrideByBuyer = Object.fromEntries((overrides || []).map((o) => [o.buyer_id, o]));
-    // Union of both sets — a buyer can show up here because they're on
-    // the allow-list, because they have a custom price (set back when the
-    // listing was still public), or both.
     const buyerIds = Array.from(new Set([...Object.keys(grantedAtByBuyer), ...Object.keys(overrideByBuyer)]));
 
     let profilesById = {};
@@ -65,8 +62,6 @@ export async function getListingAccess(req, res) {
     const buyers = buyerIds
         .map((buyerId) => {
             const p = profilesById[buyerId];
-            // A profile that's since been deleted never surfaces here,
-            // same rule as everywhere else a buyer identity is shown.
             if (!p || p.deleted_at) return null;
             const override = overrideByBuyer[buyerId] || null;
             const effectivePrice = override ? resolveEffectiveBasePrice(defaultPrice, override) : defaultPrice;
@@ -102,11 +97,28 @@ export async function getListingAccess(req, res) {
             brandName: submission.brand_name,
             image: submission.image,
             visibilityMode: submission.visibility_mode,
+            // NEW — these four were being selected from the DB and used to
+            // compute defaultBreakdown/effectiveBreakdown, but never actually
+            // put on the response object. BuyerPriceEditor needs the RAW
+            // values (not just the pre-derived breakdown) to convert between
+            // unit/pack/master-pack and to run GST math — without them every
+            // level silently fell back to packSize=1/masterPackSize=1 inside
+            // the shared pack-math helpers, which is why Unit and Pack
+            // collapsed to the same number, and why GST toggling did nothing
+            // (gstPercent read as 0).
+            unit: submission.unit,
+            packSize: Number(submission.pack_size) || 1,
+            masterPackSize: Number(submission.units_per_master_pack) || 1,
+            hasMasterPack: hasOuterPack(submission.units_per_master_pack),
+            gstPercent: Number(submission.gst_percent) || 0,
+            defaultPrice,
             defaultBreakdown: derivePriceBreakdown(defaultPrice, submission.pack_size, submission.units_per_master_pack),
         },
         buyers,
     });
 }
+
+// setVisibilityMode / addVisibilityBuyer / removeVisibilityBuyer / searchEligibleBuyersForSeller — unchanged
 
 // PATCH /api/seller/catalog/submissions/:id/visibility-mode  { mode }
 export async function setVisibilityMode(req, res) {
@@ -151,6 +163,12 @@ export async function addVisibilityBuyer(req, res) {
     const { id: submissionId } = req.params;
     const { buyerId } = req.body || {};
     if (!buyerId) return res.status(400).json({ success: false, message: "buyerId is required." });
+
+    // Defense in depth — search already excludes the seller's own id, but
+    // this endpoint can be hit directly with an arbitrary id.
+    if (String(buyerId) === String(sellerId)) {
+        return res.status(400).json({ success: false, message: "You can't add yourself as a buyer." });
+    }
 
     const { data: submission, error: subErr } = await loadOwnedSubmission(sellerId, submissionId, "id");
     if (subErr) return res.status(500).json({ success: false, message: subErr.message });
@@ -205,6 +223,12 @@ export async function searchEligibleBuyersForSeller(req, res) {
             .eq("submission_id", submissionId).eq("seller_id", sellerId);
         excludeIds = (existing || []).map((r) => r.buyer_id);
     }
+
+    // NEW — a seller is never a legitimate "buyer" of their own listing.
+    // search_eligible_buyers only sees search terms + an exclude list, so
+    // fold the caller's own id into that same list rather than trying to
+    // special-case it downstream.
+    if (sellerId && !excludeIds.includes(sellerId)) excludeIds.push(sellerId);
 
     const { data, error } = await supabase.rpc("search_eligible_buyers", {
         p_query: trimmed,

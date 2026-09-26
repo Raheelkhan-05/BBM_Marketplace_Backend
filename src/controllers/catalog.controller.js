@@ -147,6 +147,7 @@ export async function getBrandItemSellers(req, res) {
         p_buyer_id: req.user?.id || null,
         p_dest_pincode: destPincode || null,
         p_dest_state: destState || null,
+        p_own_seller_id: req.sellerProfileId || null,
     });
 
     if (error) {
