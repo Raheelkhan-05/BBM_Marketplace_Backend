@@ -19,7 +19,7 @@ import { sendWelcomeEmail, sendBusinessVerifiedEmail } from "../services/mail.se
 // two (profile first, since its result decides the 401; then seller +
 // businessProfile together) is a real, repeated win, not a one-off.
 export async function getMe(req, res) {
-  console.log("[getMe] req.user.id:", req.user?.id);
+  // console.log("[getMe] req.user.id:", req.user?.id);
 
   const { data: profile, error } = await supabaseAdmin
     .from("profiles")
@@ -29,7 +29,7 @@ export async function getMe(req, res) {
     .is("deleted_at", null)
     .maybeSingle();
 
-  console.log("[getMe] query result:", { profile, error });
+  // console.log("[getMe] query result:", { profile, error });
 
   if (error || !profile) {
     console.log("[getMe] rejecting — error:", error?.message, "profile:", profile);
