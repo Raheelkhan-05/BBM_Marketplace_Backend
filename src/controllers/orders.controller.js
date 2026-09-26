@@ -132,9 +132,9 @@ async function estimateTransitDayRange(originPincode, originState, destPincode, 
     if (originPrefix3 && originPrefix3 === destPrefix3) return { min: 1, max: 1 };
 
     if (!originPincode || !destPincode) {
-        console.warn("[estimateTransitDayRange] missing pincode(s), using fallback distance", {
-            originPincode, originState, destPincode, destState,
-        });
+        // console.warn("[estimateTransitDayRange] missing pincode(s), using fallback distance", {
+        //     originPincode, originState, destPincode, destState,
+        // });
         const fallbackKm = estimateFallbackKm(originPincode, originState, destPincode, destState);
         return daysFromDistance(fallbackKm);
     }
@@ -165,14 +165,14 @@ async function estimateDeliveryDate(submission, dispatchPincode, dispatchState, 
     // (neither dispatch nor registered) — a real seller-profile gap, not a
     // per-request glitch.
     if (!dispatchPincode) {
-        console.warn("[estimateDeliveryDate] seller has no resolvable dispatch pincode (checked seller_profiles dispatch + registered pincode)", {
-            submissionId: submission.id || null,
-        });
+        // console.warn("[estimateDeliveryDate] seller has no resolvable dispatch pincode (checked seller_profiles dispatch + registered pincode)", {
+        //     submissionId: submission.id || null,
+        // });
     }
     if (!buyerPincode) {
-        console.warn("[estimateDeliveryDate] no buyer/destination pincode available", {
-            submissionId: submission.id || null,
-        });
+        // console.warn("[estimateDeliveryDate] no buyer/destination pincode available", {
+        //     submissionId: submission.id || null,
+        // });
     }
 
     const { min: transitMin, max: transitMax } = await estimateTransitDayRange(
@@ -572,14 +572,14 @@ export async function placeOrder(req, res) {
         if (submissionForDelivery && shippingAddress) {
             try {
                 const dispatchLocation = resolveSellerDispatchLocation(submissionForDelivery.seller);
-                console.log("[placeOrder] delivery estimate inputs", {
-                    submissionId,
-                    shippingAddressId,
-                    dispatchPincode: dispatchLocation.pincode,
-                    dispatchState: dispatchLocation.state,
-                    buyerPincode: shippingAddress.pincode,
-                    buyerState: shippingAddress.state,
-                });
+                // console.log("[placeOrder] delivery estimate inputs", {
+                //     submissionId,
+                //     shippingAddressId,
+                //     dispatchPincode: dispatchLocation.pincode,
+                //     dispatchState: dispatchLocation.state,
+                //     buyerPincode: shippingAddress.pincode,
+                //     buyerState: shippingAddress.state,
+                // });
                 const delivery = await estimateDeliveryDate(submissionForDelivery, dispatchLocation.pincode, dispatchLocation.state, shippingAddress.pincode, shippingAddress.state, acceptanceDelayDaysUsed);
                 estDeliveryDateISO = delivery.dateMin.toISOString().slice(0, 10);
                 estDeliveryDateMaxISO = delivery.dateMax.toISOString().slice(0, 10);
