@@ -191,6 +191,7 @@ const SUBMISSION_LIST_COLUMNS = `
     product_name, brand_name, image, price, base_price, moq, unit,
     pack_size, units_per_master_pack, marketing_commission_percent,
     stock_type, stock_quantity, production_lead_time_days, visibility_mode,
+    dispatch_district, dispatch_state, return_policy_key, warranty_key,
     hs_generic_product_brands!inner ( id, name, brand_name, image, images, deleted_at )
 `;
 
