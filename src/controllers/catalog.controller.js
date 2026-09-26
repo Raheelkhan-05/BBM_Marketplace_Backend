@@ -211,14 +211,20 @@ export async function getBrandItemSellerOffer(req, res) {
 
 export async function getSharedProductLink(req, res) {
     const { submissionId } = req.params;
+    // req.user is guaranteed here — the route below now requires auth —
+    // so p_buyer_id is always a real id, never null.
     const { data, error } = await supabaseAdmin.rpc("catalog_shared_product_link", {
         p_submission_id: submissionId,
+        p_buyer_id: req.user.id,
     });
     if (error) {
         console.error("[catalog] getSharedProductLink failed:", error.message);
         return res.status(500).json({ success: false, message: "Couldn't load this link right now." });
     }
     if (!data) return res.status(404).json({ success: false, message: "This product link is no longer available." });
+    if (data.restricted) {
+        return res.status(403).json({ success: false, code: "RESTRICTED", message: "This product isn't available for your account. Ask the seller to add you." });
+    }
     return res.json({ success: true, ...data });
 }
 

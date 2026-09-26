@@ -29,7 +29,8 @@ router.get("/brand-items/:brandItemId", optionalAuth, optionalSellerProfile, get
 router.get("/brand-items-feed", optionalAuth, optionalSellerProfile, getBrandItemsFeed);
 router.get("/brand-items/:brandItemId/sellers", optionalAuth, optionalSellerProfile, getBrandItemSellers);
 router.get("/brand-items/:brandItemId/seller-offer", optionalAuth, optionalSellerProfile, getBrandItemSellerOffer);
-router.get("/shared/:submissionId", optionalSellerProfile, getSharedProductLink);
+// router.get("/shared/:submissionId", optionalSellerProfile, getSharedProductLink);
+router.get("/shared/:submissionId", requireAuth, optionalSellerProfile, getSharedProductLink);
 router.get("/seller-listing/lowest-price/:genericProductBrandId", optionalAuth, optionalSellerProfile, getLowestPriceForBrandItem);
 
 export default router;

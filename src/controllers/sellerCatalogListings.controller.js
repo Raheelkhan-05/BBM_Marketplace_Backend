@@ -156,7 +156,7 @@ const SUBMISSION_LIST_COLUMNS = `
     reviewed_at, is_active, generic_product_brand_id,
     product_name, brand_name, image, price, base_price, moq, unit,
     pack_size, units_per_master_pack, marketing_commission_percent,
-    stock_type, stock_quantity, production_lead_time_days,
+    stock_type, stock_quantity, production_lead_time_days, visibility_mode,
     hs_generic_product_brands!inner ( id, name, brand_name, image, images, deleted_at )
 `;
 

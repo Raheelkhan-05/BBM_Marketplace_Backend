@@ -20,6 +20,10 @@ import {
     deleteSubmission,
 } from "../controllers/sellerCatalogListings.controller.js";
 import {
+    getListingAccess, setVisibilityMode, addVisibilityBuyer,
+    removeVisibilityBuyer, searchEligibleBuyersForSeller,
+} from "../controllers/sellerListingVisibility.controller.js";
+import {
     listTemplates,
     listDefaultTemplates,
     createTemplate,
@@ -47,6 +51,12 @@ router.post("/listings", requireAuth, requireApprovedSeller, createListingForExi
 router.patch("/submissions/:id", requireAuth, requireApprovedSeller, updateSubmission);
 router.delete("/submissions/:id", requireAuth, requireApprovedSeller, deleteSubmission);
 router.patch("/submissions/:id/active", requireAuth, requireApprovedSeller, setSubmissionActive);
+
+router.get("/submissions/:id/access", requireAuth, requireApprovedSeller, getListingAccess);
+router.patch("/submissions/:id/visibility-mode", requireAuth, requireApprovedSeller, setVisibilityMode);
+router.post("/submissions/:id/visibility/buyers", requireAuth, requireApprovedSeller, addVisibilityBuyer);
+router.delete("/submissions/:id/visibility/buyers/:buyerId", requireAuth, requireApprovedSeller, removeVisibilityBuyer);
+router.get("/buyers/search", requireAuth, requireApprovedSeller, searchEligibleBuyersForSeller);
 
 router.get("/templates", requireAuth, requireApprovedSeller, listTemplates);
 router.get("/templates/defaults", requireAuth, requireApprovedSeller, listDefaultTemplates);
