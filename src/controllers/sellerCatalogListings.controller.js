@@ -378,7 +378,7 @@ function toListingRow(body, brand, sellerDispatch) {
         warranty_key: body.warrantyKey,
         note_to_admin: body.noteToAdmin?.trim() || null,
         quality_certificates: Array.isArray(body.qualityCertificates) ? body.qualityCertificates.filter((c) => c?.url) : [],
-        visibility_mode: body.buyerAccessDraft?.mode === "restricted" ? "restricted" : "public",
+        // visibility_mode: body.buyerAccessDraft?.mode === "restricted" ? "restricted" : "public",
     };
 }
 
@@ -459,6 +459,10 @@ export async function createSubmission(req, res) {
 
     const sellerDispatch = await getSellerDispatchInfo(sellerId);
     const row = toListingRow(body, brand, sellerDispatch);
+    // Only set at creation, from the seller's in-form draft — never
+    // recomputed on later edits (see updateSubmission, which must never
+    // touch this field at all).
+    row.visibility_mode = body.buyerAccessDraft?.mode === "restricted" ? "restricted" : "public";
     const [returnText, warrantyText] = await Promise.all([
         resolvePolicyText("return_policy", body.returnPolicyKey),
         resolvePolicyText("warranty", body.warrantyKey),
@@ -669,6 +673,7 @@ export async function createListingForExistingBrand(req, res) {
 
     const sellerDispatch = await getSellerDispatchInfo(sellerId);
     const row = toListingRow(merged, effectiveBrand, sellerDispatch);
+    row.visibility_mode = body.buyerAccessDraft?.mode === "restricted" ? "restricted" : "public";
     const [returnText, warrantyText] = await Promise.all([
         resolvePolicyText("return_policy", body.returnPolicyKey),
         resolvePolicyText("warranty", body.warrantyKey),
