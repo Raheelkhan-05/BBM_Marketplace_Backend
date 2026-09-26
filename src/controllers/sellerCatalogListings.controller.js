@@ -81,6 +81,7 @@ import {
     getCommissionPercent, computeMarketplaceFigures,
     normalizeEnteredPrice,
 } from "../services/pricing.service.js";
+import { resolveEffectiveBasePrice } from "../../shared/customPricing.js";
 
 export const ALLOWED_UNITS = [
     "Pieces", "Kg", "Grams", "Litres", "Millilitres", "Meters",
@@ -98,7 +99,40 @@ const GROUP_FIELD_MAP = {
     commercial_terms: ["priceBasis"],
 };
 
+// Applies the seller's in-form buyer-access/pricing draft right after a
+// brand-new submission row gets its real id — same tables/columns
+// getListingAccess() in sellerListingVisibility.controller.js reads back
+// from, so a listing created with a draft looks identical to one edited
+// through the live BuyerAccessPricing flow afterward.
+async function applyBuyerAccessDraft(submissionId, sellerId, draft, defaultPrice) {
+    if (!draft || !Array.isArray(draft.buyers) || !draft.buyers.length) return;
 
+    const visibilityRows = draft.buyers.map((b) => ({
+        submission_id: submissionId, seller_id: sellerId, buyer_id: b.buyerId,
+    }));
+    await supabase.from("seller_listing_visibility")
+        .upsert(visibilityRows, { onConflict: "submission_id,buyer_id", ignoreDuplicates: true });
+
+    const priceRows = draft.buyers
+        .filter((b) => b.override?.canonicalPrice != null)
+        .map((b) => {
+            const isFixed = b.override.mode === "amount";
+            return {
+                seller_id: sellerId,
+                submission_id: submissionId,
+                buyer_id: b.buyerId,
+                override_type: isFixed ? "fixed" : "percent",
+                fixed_price: isFixed ? Number(b.override.canonicalPrice) : null,
+                discount_percent: isFixed ? null : Number(b.override.percentValue),
+                base_price_at_set: defaultPrice,
+                updated_at: new Date().toISOString(),
+            };
+        });
+    if (priceRows.length) {
+        await supabase.from("buyer_seller_custom_prices")
+            .upsert(priceRows, { onConflict: "submission_id,buyer_id" });
+    }
+}
 
 async function getSellerDispatchInfo(sellerId) {
     const { data } = await supabase
@@ -344,6 +378,7 @@ function toListingRow(body, brand, sellerDispatch) {
         warranty_key: body.warrantyKey,
         note_to_admin: body.noteToAdmin?.trim() || null,
         quality_certificates: Array.isArray(body.qualityCertificates) ? body.qualityCertificates.filter((c) => c?.url) : [],
+        visibility_mode: body.buyerAccessDraft?.mode === "restricted" ? "restricted" : "public",
     };
 }
 
@@ -453,6 +488,7 @@ export async function createSubmission(req, res) {
     }
 
     await autoSaveSellerDefaults(sellerId, body);
+    await applyBuyerAccessDraft(inserted.id, sellerId, body.buyerAccessDraft, inserted.price);
 
     if (autoApprove) {
         // Product already approved (or just fast-approved as brand-new) —
@@ -660,6 +696,7 @@ export async function createListingForExistingBrand(req, res) {
     }
 
     await autoSaveSellerDefaults(sellerId, body);
+    await applyBuyerAccessDraft(result.id, sellerId, body.buyerAccessDraft, result.price);
 
     if (autoApprove) {
         await notifySellerListingLive(sellerId, result.id, effectiveBrand.name);
