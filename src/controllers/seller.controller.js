@@ -656,3 +656,13 @@ export async function saveSellerBankDetails(req, res) {
   if (error) return res.status(500).json({ success: false, message: error.message });
   res.json({ success: true, bank: data });
 }
+
+// GET /api/seller/gstin — seller's own GSTIN, for the PO/PDF documents.
+export async function getSellerOwnGstin(req, res) {
+  const { data: business } = await supabase
+    .from("business_profiles")
+    .select("gstin")
+    .eq("user_id", req.user.id)
+    .maybeSingle();
+  res.json({ success: true, gstin: business?.gstin || null });
+}

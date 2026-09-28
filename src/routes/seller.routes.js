@@ -23,6 +23,7 @@ import {
   uploadAnonymousSellerFile,
   getSellerBankDetails,
   saveSellerBankDetails,
+  getSellerOwnGstin,
 } from "../controllers/seller.controller.js";
 
 const router = Router();
@@ -42,6 +43,7 @@ router.post(
   upload.single("file"),
   uploadAnonymousSellerFile
 );
+router.get("/gstin", requireAuth, getSellerOwnGstin);
 router.post("/onboarding/whatsapp/request-otp", requireAuth, authWriteLimiter, requestSellerWhatsappOtp);
 router.post("/onboarding/whatsapp/verify-otp", requireAuth, authWriteLimiter, verifySellerWhatsappOtp);
 

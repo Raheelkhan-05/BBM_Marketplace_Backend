@@ -725,8 +725,7 @@ export async function getMyOrder(req, res) {
         .select(`
       *,
       seller:seller_profiles (
-        id, display_name, shop_slug, logo_url, city, state,
-        business:business_profiles!seller_profiles_business_profile_id_fkey ( gstin )
+        id, display_name, shop_slug, logo_url, city, state, user_id
       ),
       items:order_items (
         *,
@@ -736,6 +735,21 @@ export async function getMyOrder(req, res) {
         .eq("id", req.params.id).eq("buyer_id", req.user.id).maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!order) return res.status(404).json({ success: false, message: "Order not found." });
+
+    // seller_profiles.business_profile_id is not reliably populated for
+    // every seller (confirmed: some sellers have a real business_profiles
+    // row with a GSTIN, but business_profile_id on their seller_profiles
+    // row is null) — so look up the GSTIN via the direct, guaranteed
+    // business_profiles.user_id -> profiles.id link instead of trusting
+    // that pointer.
+    if (order.seller?.user_id) {
+        const { data: business } = await supabase
+            .from("business_profiles")
+            .select("gstin")
+            .eq("user_id", order.seller.user_id)
+            .maybeSingle();
+        order.seller.business = business || null;
+    }
 
     const { data: events } = await supabase.from("order_events").select("*").eq("order_id", order.id).order("created_at");
     res.json({ success: true, order, events: events || [] });
