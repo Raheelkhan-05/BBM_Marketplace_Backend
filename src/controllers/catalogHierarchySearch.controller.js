@@ -6,6 +6,19 @@ import { supabase } from "../config/supabase.js";
 // fly or shown pending review. This is a parallel, additive module; the
 // original AI-resolver hierarchy (hierarchysearch.controller.js) is
 // untouched and still serves whatever still points at it.
+//
+// SEPARATOR-INSENSITIVE MATCHING (this revision):
+// Searching "20w40" used to miss "20W-40" (or "20 W 40", "20w/40") because
+// ILIKE '%20w40%' needs the exact characters. Every searchable name now has
+// a normalized twin column (name_norm / brand_name_norm — see
+// search_normalization.sql) holding only lowercase letters + digits, and the
+// search term is normalized the same way in normalizeForSearch() below. So
+// "20w40", "20W-40", "20 w 40" and "20w/40" all become "20w40" and all match.
+//
+// This only ever WIDENS matches: any name that contained the raw term as a
+// substring still matches (stripping the same characters from both sides
+// preserves substring-ness). Terms with no letters/digits at all (e.g. "%")
+// fall back to the original raw ILIKE so they behave exactly as before.
 
 const DEFAULT_LIMIT = 20;
 function clampLimit(limit) {
@@ -24,7 +37,7 @@ function clampOffset(offset) {
 // "Exotes ... 200 g 8% off" has both a comma and a percent sign. Left
 // unescaped, the comma splits the .or() string into a bogus extra
 // condition and the % is read as a wildcard instead of a literal char,
-// so the search silently fails to match. These two helpers make any
+// so the search silently fails to match. These helpers make any
 // user-supplied term safe to drop into either context.
 
 // Escapes ILIKE wildcard characters so they're matched literally.
@@ -45,6 +58,40 @@ function ilikePattern(term) {
 function orIlikePattern(term) {
     const pattern = ilikePattern(term);
     return `"${pattern.replace(/"/g, '\\"')}"`;
+}
+
+// ---------------------------------------------------------------------
+// Normalized (separator-insensitive) matching
+// ---------------------------------------------------------------------
+
+// MUST stay in sync with public.search_norm() in search_normalization.sql:
+// lowercase, then drop everything except a-z, 0-9 and non-ASCII characters.
+function normalizeForSearch(term) {
+    return String(term ?? "").toLowerCase().replace(/[^a-z0-9\u0080-\uFFFF]+/g, "");
+}
+
+// '%20w40%' style pattern for the *_norm columns, or null when the term has
+// no letters/digits at all (caller then falls back to the raw ILIKE).
+// The normalized string can't contain %, _, commas, quotes or parentheses,
+// so it is safe both in .ilike() and unquoted inside .or().
+function normPattern(term) {
+    const n = normalizeForSearch(term);
+    return n ? `%${n}%` : null;
+}
+
+// Single-name-column tables (categories, subcategories, generic products).
+function whereNameMatches(query, term) {
+    const np = normPattern(term);
+    return np ? query.ilike("name_norm", np) : query.ilike("name", ilikePattern(term));
+}
+
+// Brand items match on product name OR brand name (each normalized on its
+// own, so a term can never "match across" the boundary between the two).
+function brandItemOrFilter(term) {
+    const np = normPattern(term);
+    if (np) return `name_norm.ilike.${np},brand_name_norm.ilike.${np}`;
+    const p = orIlikePattern(term);
+    return `name.ilike.${p},brand_name.ilike.${p}`;
 }
 
 // Every paginated list endpoint follows the same shape: fetch lim+1 rows
@@ -68,7 +115,7 @@ export async function searchCategoriesV2(req, res) {
         .eq("review_status", "approved")
         .order("name")
         .range(off, off + lim); // fetch lim+1 to detect hasMore
-    if (q.trim()) query = query.ilike("name", ilikePattern(q.trim()));
+    if (q.trim()) query = whereNameMatches(query, q.trim());
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
@@ -90,7 +137,7 @@ export async function searchSubcategoriesV2(req, res) {
         .eq("review_status", "approved")
         .order("name")
         .range(off, off + lim);
-    if (q.trim()) query = query.ilike("name", ilikePattern(q.trim()));
+    if (q.trim()) query = whereNameMatches(query, q.trim());
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
@@ -112,7 +159,7 @@ export async function searchGenericProductsV2(req, res) {
         .eq("review_status", "approved")
         .order("name")
         .range(off, off + lim);
-    if (q.trim()) query = query.ilike("name", ilikePattern(q.trim()));
+    if (q.trim()) query = whereNameMatches(query, q.trim());
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
@@ -140,10 +187,7 @@ export async function searchBrandItemsV2(req, res) {
         .eq("review_status", "approved")
         .order("name")
         .range(off, off + lim);
-    if (q.trim()) {
-        const p = orIlikePattern(q.trim());
-        query = query.or(`name.ilike.${p},brand_name.ilike.${p}`);
-    }
+    if (q.trim()) query = query.or(brandItemOrFilter(q.trim()));
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
@@ -264,19 +308,26 @@ export async function smartSearchV2(req, res) {
         return res.json({ success: true, exact: null, suggestions: { categories: [], subcategories: [], genericProducts: [], brandItems: [] } });
     }
     const cap = clampLimit(limit) > 10 ? 5 : clampLimit(limit);
-    const pattern = ilikePattern(term);
-    const orPattern = orIlikePattern(term);
 
     const [catRes, subRes, gpRes, biRes] = await Promise.all([
-        supabase.from("hs_categories").select("id, name, slug, image").eq("review_status", "approved").ilike("name", pattern).limit(cap),
-        supabase.from("hs_subcategories").select("id, name, slug, image, category_id, category:hs_categories(id, name, slug)").eq("review_status", "approved").ilike("name", pattern).limit(cap),
-        supabase.from("hs_generic_products").select("id, name, slug, image, subcategory_id, subcategory:hs_subcategories(id, name, slug, category_id, category:hs_categories(id, name, slug))").eq("review_status", "approved").ilike("name", pattern).limit(cap),
+        whereNameMatches(
+            supabase.from("hs_categories").select("id, name, slug, image").eq("review_status", "approved"),
+            term
+        ).limit(cap),
+        whereNameMatches(
+            supabase.from("hs_subcategories").select("id, name, slug, image, category_id, category:hs_categories(id, name, slug)").eq("review_status", "approved"),
+            term
+        ).limit(cap),
+        whereNameMatches(
+            supabase.from("hs_generic_products").select("id, name, slug, image, subcategory_id, subcategory:hs_subcategories(id, name, slug, category_id, category:hs_categories(id, name, slug))").eq("review_status", "approved"),
+            term
+        ).limit(cap),
         supabase.from("hs_generic_product_brands").select(`
             id, name, brand_name, slug, image, images, generic_product_id,
             generic_product:hs_generic_products(id, name, slug, subcategory_id,
                 subcategory:hs_subcategories(id, name, slug, category_id,
                     category:hs_categories(id, name, slug)))
-        `).eq("review_status", "approved").or(`name.ilike.${orPattern},brand_name.ilike.${orPattern}`).limit(cap),
+        `).eq("review_status", "approved").or(brandItemOrFilter(term)).limit(cap),
     ]);
 
     if (catRes.error) return res.status(500).json({ success: false, message: catRes.error.message });
@@ -289,7 +340,13 @@ export async function smartSearchV2(req, res) {
     const genericProducts = gpRes.data || [];
     const brandItems = biRes.data || [];
 
-    const isExact = (name) => (name || "").toLowerCase() === term.toLowerCase();
+    // "Exact" is separator-insensitive too, so "20w40" exactly matches "20W-40".
+    const normTerm = normalizeForSearch(term);
+    const isExact = (name) => {
+        if (!name) return false;
+        if (name.toLowerCase() === term.toLowerCase()) return true;
+        return normTerm !== "" && normalizeForSearch(name) === normTerm;
+    };
 
     const exactBrandItem = brandItems.find((b) => isExact(b.name) || isExact(b.brand_name));
     const exactGeneric = genericProducts.find((g) => isExact(g.name));
@@ -380,14 +437,12 @@ export async function searchAutocompleteV2(req, res) {
 
     const cap = Math.min(Number(limit) || 8, 10);
     const perTable = 4;
-    const pattern = ilikePattern(term);
-    const orPattern = orIlikePattern(term);
 
     const [catRes, subRes, gpRes, biRes] = await Promise.all([
-        supabase.from("hs_categories").select("id, name, slug").eq("review_status", "approved").ilike("name", pattern).order("name").limit(perTable),
-        supabase.from("hs_subcategories").select("id, name, slug").eq("review_status", "approved").ilike("name", pattern).order("name").limit(perTable),
-        supabase.from("hs_generic_products").select("id, name, slug").eq("review_status", "approved").ilike("name", pattern).order("name").limit(perTable),
-        supabase.from("hs_generic_product_brands").select("id, name, brand_name, slug").eq("review_status", "approved").or(`name.ilike.${orPattern},brand_name.ilike.${orPattern}`).order("name").limit(perTable),
+        whereNameMatches(supabase.from("hs_categories").select("id, name, slug").eq("review_status", "approved"), term).order("name").limit(perTable),
+        whereNameMatches(supabase.from("hs_subcategories").select("id, name, slug").eq("review_status", "approved"), term).order("name").limit(perTable),
+        whereNameMatches(supabase.from("hs_generic_products").select("id, name, slug").eq("review_status", "approved"), term).order("name").limit(perTable),
+        supabase.from("hs_generic_product_brands").select("id, name, brand_name, slug").eq("review_status", "approved").or(brandItemOrFilter(term)).order("name").limit(perTable),
     ]);
 
     if (catRes.error || subRes.error || gpRes.error || biRes.error) {
@@ -402,9 +457,12 @@ export async function searchAutocompleteV2(req, res) {
     ];
 
     const lowerTerm = term.toLowerCase();
+    const normTerm = normalizeForSearch(term);
     const rank = (s) => {
         const n = s.name.toLowerCase();
-        if (n.startsWith(lowerTerm)) return 0;
+        // Starts-with is checked separator-insensitively too, so "20w40"
+        // ranks "20W-40 Engine Oil" first.
+        if (n.startsWith(lowerTerm) || (normTerm && normalizeForSearch(s.name).startsWith(normTerm))) return 0;
         if (n.includes(` ${lowerTerm}`)) return 1;
         return 2;
     };
@@ -423,16 +481,6 @@ export async function searchAutocompleteV2(req, res) {
     res.json({ success: true, suggestions: deduped });
 }
 
-// GET /api/catalog-search/products-fallback?q=&limit=&offset=
-// Tiered product search for the results page: tries a direct product
-// (brand item) match first. If nothing matches at that level, widens to
-// sibling products under a matching SUBCATEGORY name. If that's also
-// empty, widens further to every product under a matching CATEGORY
-// name. Always responds 200 with `matchLevel` telling the frontend which
-// tier produced the results ("product" | "subcategory" | "category" |
-// "none") — the page stays put and shows "results from <matchedOn>"
-// instead of ever having a reason to navigate elsewhere, even on zero
-// results.
 // GET /api/catalog-search/products-merged?q=&limit=&offset=
 // Single merged, tiered result: direct product/brand-name matches first,
 // then products under a matching subcategory (excluding anything already
@@ -456,8 +504,6 @@ export async function searchProductsMergedV2(req, res) {
         return res.json({ success: true, items: [], hasMore: false, nextOffset: 0 });
     }
 
-    const pattern = ilikePattern(term);
-    const orPattern = orIlikePattern(term);
     const fetchCap = off + lim + 1;
 
     const BRAND_ITEM_SELECT = `
@@ -511,7 +557,7 @@ export async function searchProductsMergedV2(req, res) {
         .from("hs_generic_product_brands")
         .select(BRAND_ITEM_SELECT)
         .eq("review_status", "approved")
-        .or(`name.ilike.${orPattern},brand_name.ilike.${orPattern}`)
+        .or(brandItemOrFilter(term))
         .order("name")
         .limit(fetchCap);
     if (allowedGenericProductIds) directQuery = directQuery.in("generic_product_id", allowedGenericProductIds);
@@ -528,12 +574,13 @@ export async function searchProductsMergedV2(req, res) {
     // Tier 2 — products under a matching subcategory, itself restricted to
     // the selected category when one is set.
     if (tiered.length < fetchCap) {
-        let subQuery = supabase
-            .from("hs_subcategories")
-            .select("id, name")
-            .eq("review_status", "approved")
-            .ilike("name", pattern)
-            .limit(1);
+        let subQuery = whereNameMatches(
+            supabase
+                .from("hs_subcategories")
+                .select("id, name")
+                .eq("review_status", "approved"),
+            term
+        ).limit(1);
         if (categoryId) subQuery = subQuery.eq("category_id", categoryId);
 
         const { data: subMatches, error: subErr } = await subQuery;
@@ -573,12 +620,13 @@ export async function searchProductsMergedV2(req, res) {
     // one, so widening to a differently-named category would be surprising,
     // not helpful.
     if (!categoryId && tiered.length < fetchCap) {
-        const { data: catMatches, error: catErr } = await supabase
-            .from("hs_categories")
-            .select("id, name")
-            .eq("review_status", "approved")
-            .ilike("name", pattern)
-            .limit(1);
+        const { data: catMatches, error: catErr } = await whereNameMatches(
+            supabase
+                .from("hs_categories")
+                .select("id, name")
+                .eq("review_status", "approved"),
+            term
+        ).limit(1);
         if (catErr) return res.status(500).json({ success: false, message: catErr.message });
 
         if (catMatches?.length) {
