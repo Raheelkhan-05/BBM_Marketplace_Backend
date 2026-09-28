@@ -275,6 +275,7 @@ export async function approveProposal(req, res) {
             title: "Transport option approved",
             body: `The seller approved your proposed transport option for ${row.origin_city} → ${row.dest_city}. You can now select it when ordering.`,
             link: `/orders`,
+            routeOptionId: row.id,
         });
     }
     res.json({ success: true });
@@ -312,6 +313,7 @@ export async function rejectProposal(req, res) {
                 rejected_route_option_id: row.id,
                 rejected_mode: row.mode,
                 rejected_fields: row.fields,
+                rejected_reason: reason?.trim() || null,
                 updated_at: new Date().toISOString(),
             }, { onConflict: "buyer_id,seller_id,dest_state,dest_city" });
     }
@@ -322,6 +324,8 @@ export async function rejectProposal(req, res) {
             title: "Transport option declined",
             body: reason?.trim() || `The seller couldn't accept the proposed transport option for ${row.origin_city} → ${row.dest_city}.`,
             link: `/orders`,
+            routeOptionId: row.id, // NEW
+            reason: reason?.trim() || null,
         });
     }
     res.json({ success: true });
@@ -508,18 +512,20 @@ export async function getBuyerSellerTransportPreference(req, res) {
         : null;
 
     let checkedProposalStatus = null;
+    let checkedRejectedReason = null;
     if (checkProposalId) {
         const { data: checkedRow } = await supabase
             .from("transport_route_options")
-            .select("status")
+            .select("status, rejection_reason")
             .eq("id", checkProposalId)
             .maybeSingle();
         checkedProposalStatus = checkedRow?.status || "not_found";
+        checkedRejectedReason = checkedRow?.rejection_reason || null;
     }
 
     const { data, error } = await supabase
         .from("buyer_seller_transport_preferences")
-        .select("route_option_id, mode, fields, rejected_route_option_id, rejected_mode, rejected_fields")
+        .select("route_option_id, mode, fields, rejected_route_option_id, rejected_mode, rejected_fields, rejected_reason")
         .eq("buyer_id", buyerId)
         .eq("seller_id", sellerId)
         .ilike("dest_state", destState.trim())
@@ -532,13 +538,13 @@ export async function getBuyerSellerTransportPreference(req, res) {
     // whether a decision/pending proposal exists, since rejection wipes
     // out the thing the buyer would otherwise be shown.
     const rejectedNotice = data?.rejected_route_option_id
-        ? { mode: data.rejected_mode, fields: data.rejected_fields || {}, summary: routeOptionSummary(data.rejected_mode, data.rejected_fields || {}) }
+        ? { mode: data.rejected_mode, fields: data.rejected_fields || {}, reason: data.rejected_reason || null, summary: routeOptionSummary(data.rejected_mode, data.rejected_fields || {}) }
         : null;
 
-    if (!data) return res.json({ success: true, decided: false, preference: null, pendingProposal, checkedProposalStatus, rejectedNotice });
+    if (!data) return res.json({ success: true, decided: false, preference: null, pendingProposal, checkedProposalStatus, rejectedReason: checkedRejectedReason, rejectedNotice });
 
     if (!data.mode) {
-        return res.json({ success: true, decided: true, preference: null, pendingProposal, checkedProposalStatus, rejectedNotice });
+        return res.json({ success: true, decided: true, preference: null, pendingProposal, checkedProposalStatus, rejectedReason: checkedRejectedReason, rejectedNotice });
     }
 
     let stillActive = true;
@@ -552,7 +558,7 @@ export async function getBuyerSellerTransportPreference(req, res) {
     }
 
     if (!stillActive) {
-        return res.json({ success: true, decided: false, preference: null, invalidated: true, pendingProposal, checkedProposalStatus, rejectedNotice });
+        return res.json({ success: true, decided: false, preference: null, invalidated: true, pendingProposal, checkedProposalStatus, rejectedReason: checkedRejectedReason, rejectedNotice });
     }
 
     const preference = {
@@ -562,7 +568,7 @@ export async function getBuyerSellerTransportPreference(req, res) {
         summary: routeOptionSummary(data.mode, data.fields || {}),
     };
 
-    res.json({ success: true, decided: true, preference, pendingProposal, checkedProposalStatus, rejectedNotice });
+    res.json({ success: true, decided: true, preference, pendingProposal, checkedProposalStatus, rejectedReason: checkedRejectedReason, rejectedNotice });
 }
 
 // POST /api/transport-library/buyer-preference

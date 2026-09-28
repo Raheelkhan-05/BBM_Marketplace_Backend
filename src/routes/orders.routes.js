@@ -3,7 +3,7 @@ import multer from "multer";
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.middleware.js";
 import { optionalAuth } from "../middleware/optionalAuth.middleware.js";
-import { checkoutStatus, getOrderQuote, placeOrder, listMyOrders, getMyOrder, cancelMyOrder, getOrderConstraints, getSellerTransportOptions } from "../controllers/orders.controller.js";
+import { checkoutStatus, getOrderQuote, placeOrder, listMyOrders, getMyOrder, cancelMyOrder, getOfferForResume, getOrderConstraints, getSellerTransportOptions } from "../controllers/orders.controller.js";
 import { getPaymentInstructions, submitPaymentProof } from "../controllers/paymentProof.controller.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
@@ -14,6 +14,7 @@ router.get("/checkout-status", optionalAuth, checkoutStatus);
 router.get("/quote", optionalAuth, getOrderQuote); // read-only, no PII — same exposure level as your public catalog search
 router.get("/order-constraints", getOrderConstraints);
 router.get("/transport-options", getSellerTransportOptions);
+router.get("/offer-for-resume", requireAuth, getOfferForResume);
 router.get("/", requireAuth, listMyOrders);
 router.get("/:id", requireAuth, getMyOrder);
 router.post("/", requireAuth, placeOrder);

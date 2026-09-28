@@ -811,3 +811,84 @@ export async function getOrderConstraints(req, res) {
         acceptanceMessage: windowStatus.message || null,
     });
 }
+
+
+// GET /api/orders/offer-for-resume?submissionId=...
+// Returns one listing shaped for BuyNowModal — used ONLY by
+// GlobalBuyNowLauncher to relaunch a Buy Now flow after a transport
+// proposal is approved, when the buyer could be on any screen in the app
+// (BuyNowModal is page-local state in HomeProductFeed, not route-mounted,
+// so there's no page to "navigate back to" — this is what the launcher
+// fetches to rebuild the exact seller/product payload from scratch).
+export async function getOfferForResume(req, res) {
+    const { submissionId } = req.query;
+    if (!submissionId) return res.status(400).json({ success: false, message: "submissionId is required." });
+
+    const { data: submission, error } = await supabase
+        .from("seller_product_submissions")
+        .select(`
+            id, price, moq, unit, stock_quantity, review_status, price_slabs, quantity_discounts,
+            stock_type, dispatch_time_days, production_lead_time_days, pack_size, units_per_master_pack,
+            sample_available, sample_quantity, sample_price, gst_percent,
+            payment_terms, return_policy, warranty, delivery_timeline, freight_included, price_basis,
+            generic_product_brand_id, product_name, brand_name,
+            seller_id,
+            seller:seller_profiles!seller_product_submissions_seller_id_fkey (
+                id, display_name, transport_options,
+                pincode, state, dispatch_pincode, dispatch_district, dispatch_state, dispatch_same_as_registered
+            )
+        `)
+        .eq("id", submissionId)
+        .maybeSingle();
+
+    if (error) return res.status(500).json({ success: false, message: error.message });
+    if (!submission || submission.review_status !== "approved") {
+        return res.status(404).json({ success: false, message: "This listing is no longer available." });
+    }
+
+    const seller = submission.seller || {};
+    const dispatchCity = seller.dispatch_same_as_registered === false ? seller.dispatch_district : null;
+    const dispatchState = seller.dispatch_same_as_registered === false ? seller.dispatch_state : seller.state;
+
+    // Mirrors toBuyerSellerPayload() in HomeProductFeed.jsx field-for-field —
+    // keep these two in sync if either changes.
+    const sellerPayload = {
+        offerId: submission.id,
+        sellerId: submission.seller_id,
+        display_name: seller.display_name,
+        unit: submission.unit,
+        moq: submission.moq,
+        price: submission.price,
+        gstPercent: submission.gst_percent,
+        availableStock: submission.stock_quantity ?? null,
+        stockType: submission.stock_type,
+        leadTime: submission.stock_type === "made_to_order" ? submission.production_lead_time_days : submission.dispatch_time_days,
+        transportPreference: null,       // resolved fresh by BuyNowModal itself on mount
+        transportPendingProposal: null,  // same
+        dispatchTimeDays: submission.dispatch_time_days,
+        productionLeadTimeDays: submission.production_lead_time_days,
+        priceSlabs: submission.price_slabs || [],
+        quantityDiscounts: submission.quantity_discounts || [],
+        paymentTerms: submission.payment_terms,
+        returnPolicy: submission.return_policy,
+        warranty: submission.warranty,
+        deliveryTimeline: submission.delivery_timeline,
+        freightIncluded: submission.freight_included,
+        transportOptions: seller.transport_options || [],
+        priceBasis: submission.price_basis,
+        dispatchOrigin: [dispatchCity, dispatchState].filter(Boolean).join(", ") || null,
+        dispatchPincode: seller.dispatch_same_as_registered === false ? seller.dispatch_pincode : seller.pincode,
+        dispatchState,
+        packSize: submission.pack_size,
+        masterPackSize: submission.units_per_master_pack,
+        sampleAvailable: submission.sample_available || false,
+        sampleQuantity: submission.sample_quantity ?? null,
+        samplePrice: submission.sample_price ?? null,
+    };
+
+    res.json({
+        success: true,
+        seller: sellerPayload,
+        product: { id: submission.generic_product_brand_id, name: submission.product_name, brand_name: submission.brand_name },
+    });
+}
