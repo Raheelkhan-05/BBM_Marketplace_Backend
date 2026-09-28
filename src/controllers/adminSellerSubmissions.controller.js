@@ -408,7 +408,7 @@ async function autoApproveSiblingSubmissions({ brandItemId, excludeSubmissionId,
             type: "listing_approved",
             title: "Your product listing was approved",
             body: `"${displayName}" is now live on your shop.`,
-            link: `/seller/listings?highlight=${s.id}`,
+            link: `/seller/products?highlight=${s.id}`,
         });
         await notifySellerSubmissionsChanged(sellerId);
     }
@@ -490,7 +490,7 @@ export async function approveSellerSubmission(req, res) {
             type: "listing_approved",
             title: "Your product listing was approved",
             body: `"${displayName}" is now live on your shop.`,
-            link: `/seller/listings?highlight=${id}`,
+            link: `/seller/products?highlight=${id}`,
         });
         await notifySellerSubmissionsChanged(sellerRow.user_id);
     }
@@ -543,7 +543,7 @@ export async function rejectSellerSubmission(req, res) {
             type: "listing_rejected",
             title: "Your product listing needs changes",
             body: `"${displayName}" wasn't approved: ${reason.trim()}`,
-            link: "/seller/listings",
+            link: "/seller/products",
         });
         await notifySellerSubmissionsChanged(sellerRow.user_id);
     }

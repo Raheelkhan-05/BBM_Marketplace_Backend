@@ -302,7 +302,7 @@ export async function approveCatalogEntry(req, res) {
                     type: "brand_item_approved",
                     title: "Your product is live!",
                     message: `"${data.name}" has been approved and is now visible to buyers.`,
-                    link: `/seller/listings`,
+                    link: `/seller/products`,
                 });
             });
         }
