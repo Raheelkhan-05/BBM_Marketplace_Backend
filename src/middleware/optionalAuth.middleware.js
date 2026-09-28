@@ -11,7 +11,7 @@ export function optionalAuth(req, res, next) {
         req.user = verifyAuthToken(token);
         // console.log("optionalAuth: verified ok, user id:", req.user?.id);
     } catch (err) {
-        console.log("optionalAuth: verify failed:", err.message);
+        // console.log("optionalAuth: verify failed:", err.message);
         req.user = null;
     }
     next();
