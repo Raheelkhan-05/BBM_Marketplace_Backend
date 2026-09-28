@@ -1,5 +1,6 @@
 import { supabase } from "../config/supabase.js";
 import { getParticipantIds } from "./participantsCache.js";
+import { CATALOG_ROOM } from "../services/listingRealtime.service.js";
 import { emitToConversation } from "./emit.js";
 
 const onlineUsers = new Map(); // userId -> Set<socketId>
@@ -62,6 +63,7 @@ export function registerChatSocket(io) {
         const userId = socket.userId;
 
         socket.join(`user:${userId}`);
+        socket.join(CATALOG_ROOM);
 
         const justCameOnline = markOnline(userId, socket.id);
         if (justCameOnline) {

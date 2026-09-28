@@ -77,6 +77,7 @@
 import { supabase } from "../config/supabase.js";
 import { notifyAdmins, notifyAdminSubmissionsChanged, notifyUser, notifySellerSubmissionsChanged } from "../services/notifications.service.js";
 import { slugify } from "../services/slugify.js";
+import { publishListingChange, publishListingRemoved } from "../services/listingRealtime.service.js";
 import {
     getCommissionPercent, computeMarketplaceFigures,
     normalizeEnteredPrice,
@@ -494,6 +495,7 @@ export async function createSubmission(req, res) {
 
     await autoSaveSellerDefaults(sellerId, body);
     await applyBuyerAccessDraft(inserted.id, sellerId, body.buyerAccessDraft, inserted.price);
+    void publishListingChange(inserted.id);
 
     if (autoApprove) {
         // Product already approved (or just fast-approved as brand-new) —
@@ -703,6 +705,7 @@ export async function createListingForExistingBrand(req, res) {
 
     await autoSaveSellerDefaults(sellerId, body);
     await applyBuyerAccessDraft(result.id, sellerId, body.buyerAccessDraft, result.price);
+    void publishListingChange(result.id);
 
     if (autoApprove) {
         await notifySellerListingLive(sellerId, result.id, effectiveBrand.name);
@@ -917,6 +920,7 @@ export async function updateSubmission(req, res) {
     if (error) return res.status(500).json({ success: false, message: error.message });
 
     await autoSaveSellerDefaults(sellerId, body);
+    void publishListingChange(updated.id);
 
     if (!staysApproved) {
         await notifyAdmins({
@@ -956,6 +960,7 @@ export async function setSubmissionActive(req, res) {
         .select("id, is_active").maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!updated) return res.status(404).json({ success: false, message: "Submission not found." });
+    void publishListingChange(id);
 
     res.json({ success: true, submission: updated, message: isActive ? "Listing is now active." : "Listing is now inactive." });
 }
@@ -965,13 +970,12 @@ export async function deleteSubmission(req, res) {
     const { id } = req.params;
 
     const { data: deleted, error } = await supabase
-        .from("seller_product_submissions")
-        .delete()
+        .from("seller_product_submissions").delete()
         .eq("id", id).eq("seller_id", sellerId)
-        .select("id").maybeSingle();
+        .select("id, generic_product_brand_id").maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!deleted) return res.status(404).json({ success: false, message: "Submission not found." });
-
+    publishListingRemoved({ submissionId: id, brandItemId: deleted.generic_product_brand_id, sellerId });
     await notifyAdminSubmissionsChanged();
     res.json({ success: true, message: "Listing deleted." });
 }
