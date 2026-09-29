@@ -1,34 +1,78 @@
 // controllers/credit.controller.js
 import { supabase } from "../config/supabase.js";
 import { emitToConversation } from "../socket/emit.js";
+import { invalidateParticipants } from "../socket/participantsCache.js";
 import { notifyUser } from "../services/realtimeBroadcast.js";
+import { trackCreditEvent } from "../services/creditEvents.js";
 
+// Every credit notification now lands on the Credit page (not the chat).
+const CREDIT_LINK = "/credit";
+
+// ---- helpers ------------------------------------------------------------
+
+function buyerLabelOf(bp) {
+    return bp?.display_name?.trim() || bp?.trade_name?.trim() || bp?.legal_name?.trim() || null;
+}
+
+// Batched: one round of 3 queries for any number of buyers.
+async function getBuyerInfoMap(buyerIds) {
+    const ids = [...new Set((buyerIds || []).filter(Boolean))];
+    const map = new Map();
+    if (!ids.length) return map;
+
+    const [{ data: profiles }, { data: bps }, { data: sps }] = await Promise.all([
+        supabase.from("profiles").select("id, name, phone, email, created_at").in("id", ids),
+        supabase.from("business_profiles").select("user_id, display_name, legal_name, trade_name, gstin, district, state").in("user_id", ids),
+        supabase.from("seller_profiles").select("user_id, logo_url").in("user_id", ids),
+    ]);
+    const pById = new Map((profiles || []).map((p) => [p.id, p]));
+    const bpById = new Map((bps || []).map((p) => [p.user_id, p]));
+    const spById = new Map((sps || []).map((p) => [p.user_id, p]));
+
+    for (const id of ids) {
+        const profile = pById.get(id);
+        const bp = bpById.get(id);
+        const sp = spById.get(id);
+        if (!profile && !bp) continue;
+        map.set(id, {
+            name: profile?.name || null,
+            phone: profile?.phone || null,
+            email: profile?.email || null,
+            memberSince: profile?.created_at || null,
+            businessName: buyerLabelOf(bp),
+            gstin: bp?.gstin || null,
+            location: [bp?.district, bp?.state].filter(Boolean).join(", ") || null,
+            logoUrl: sp?.logo_url || null,
+        });
+    }
+    return map;
+}
 
 async function getBuyerInfoForSeller(buyerId) {
-    const [{ data: profile }, { data: bp }, { data: sp }] = await Promise.all([
-        supabase.from("profiles").select("name, phone, email, created_at").eq("id", buyerId).maybeSingle(),
-        supabase.from("business_profiles").select("legal_name, trade_name, gstin, district, state").eq("user_id", buyerId).maybeSingle(),
-        supabase.from("seller_profiles").select("logo_url").eq("user_id", buyerId).maybeSingle(), // NEW
-    ]);
-    if (!profile && !bp) return null;
+    const map = await getBuyerInfoMap([buyerId]);
+    return map.get(buyerId) || null;
+}
+
+// What a buyer is allowed to see about their own credit row.
+function pickBuyerCredit(c) {
+    if (!c) return null;
     return {
-        name: profile?.name || null,
-        phone: profile?.phone || null,
-        email: profile?.email || null,
-        memberSince: profile?.created_at || null,
-        businessName: bp?.trade_name || bp?.legal_name || null,
-        gstin: bp?.gstin || null,
-        location: [bp?.district, bp?.state].filter(Boolean).join(", ") || null,
-        logoUrl: sp?.logo_url || null, // NEW
+        id: c.id,
+        status: c.status,
+        credit_limit: c.credit_limit,
+        credit_used: c.credit_used,
+        cooldown_until: c.cooldown_until,
+        limit_increase_request_message_id: c.limit_increase_request_message_id,
+        limit_increase_cooldown_until: c.limit_increase_cooldown_until,
+        conversation_id: c.conversation_id,
     };
 }
 
-
-// GET /api/credit/status
+// ---- GET /api/credit/status (unchanged; still used by chat + BuyNowModal) ---
 // Three ways to call it:
-//   ?sellerId=<seller_profiles.id>        — buyer's perspective (BuyNowModal, where sellerId is already known)
-//   ?buyerId=<profiles.id>                — seller's perspective, resolves seller_profiles.id from req.user
-//   ?otherUserId=<profiles.id>            — role-agnostic (chat), server figures out who's who
+//   ?sellerId=<seller_profiles.id>        — buyer's perspective
+//   ?buyerId=<profiles.id>                — seller's perspective
+//   ?otherUserId=<profiles.id>            — role-agnostic, server figures out who's who
 export async function getCreditStatus(req, res) {
     const { sellerId, submissionId, buyerId, otherUserId } = req.query;
     let query = supabase.from("buyer_seller_credit").select("*");
@@ -48,7 +92,6 @@ export async function getCreditStatus(req, res) {
         if (!sp) return res.status(403).json({ success: false, message: "Not a seller." });
         query = query.eq("buyer_id", buyerId).eq("seller_id", sp.id);
         viewerRole = "seller";
-        // controllers/credit.controller.js — getCreditStatus, inside the otherUserId branch
     } else if (otherUserId) {
         const [{ data: meAsSeller }, { data: otherAsSeller }] = await Promise.all([
             supabase.from("seller_profiles").select("id").eq("user_id", req.user.id).maybeSingle(),
@@ -65,17 +108,12 @@ export async function getCreditStatus(req, res) {
         ]);
 
         if (sellerDirection.data) {
-            // NEW — this branch means req.user IS the seller, otherUserId is the buyer
             const buyerInfo = await getBuyerInfoForSeller(otherUserId);
             return res.json({ success: true, credit: sellerDirection.data, viewerRole: "seller", buyerInfo });
         }
         if (buyerDirection.data) {
             return res.json({ success: true, credit: buyerDirection.data, viewerRole: "buyer" });
         }
-
-        // Neither direction has a row yet — still tell a seller-viewer who they'd be
-        // approving, even before any request exists, so the UI is consistent
-        // whenever a credit row does eventually appear.
         if (meAsSeller) {
             const buyerInfo = await getBuyerInfoForSeller(otherUserId);
             return res.json({ success: true, credit: null, viewerRole: "seller", buyerInfo });
@@ -96,6 +134,110 @@ export async function getCreditStatus(req, res) {
     res.json({ success: true, credit: data || null, viewerRole, buyerInfo });
 }
 
+// ---- NEW: Credit page data ------------------------------------------------
+
+// GET /api/credit/sellers — every approved seller EXCEPT the caller's own
+// shop, each with the caller's credit state (if any) as a buyer.
+export async function listCreditSellers(req, res) {
+    const myId = req.user.id;
+    const [{ data: sellers, error }, { data: credits, error: cErr }] = await Promise.all([
+        supabase.from("seller_profiles")
+            .select("id, user_id, display_name, logo_url")
+            .eq("status", "approved")
+            .neq("user_id", myId)
+            .is("deleted_at", null)
+            .order("display_name", { ascending: true }),
+        supabase.from("buyer_seller_credit").select("*").eq("buyer_id", myId),
+    ]);
+    if (error || cErr) return res.status(500).json({ success: false, message: (error || cErr).message });
+
+    const bySeller = new Map((credits || []).map((c) => [c.seller_id, c]));
+    res.json({
+        success: true,
+        sellers: (sellers || []).map((s) => ({
+            sellerId: s.id,
+            sellerUserId: s.user_id,
+            shopName: s.display_name,
+            logoUrl: s.logo_url || null,
+            credit: pickBuyerCredit(bySeller.get(s.id)),
+        })),
+    });
+}
+
+// GET /api/credit/incoming — seller-only: every buyer's credit row on this
+// seller's shop, with buyer identity. Non-sellers get isSeller:false.
+export async function listCreditRequests(req, res) {
+    const myId = req.user.id;
+    const { data: sp } = await supabase
+        .from("seller_profiles").select("id")
+        .eq("user_id", myId).eq("status", "approved").is("deleted_at", null)
+        .maybeSingle();
+    if (!sp) return res.json({ success: true, isSeller: false, requests: [] });
+
+    const { data: credits, error } = await supabase.from("buyer_seller_credit").select("*").eq("seller_id", sp.id);
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    const infoMap = await getBuyerInfoMap((credits || []).map((c) => c.buyer_id));
+    res.json({
+        success: true,
+        isSeller: true,
+        requests: (credits || []).map((c) => ({ credit: c, buyerInfo: infoMap.get(c.buyer_id) || null })),
+    });
+}
+
+// GET /api/credit/history?as=buyer|seller&before=<created_at>&limit=30
+// Both sides' actions on every credit relationship the caller is part of.
+export async function listCreditHistory(req, res) {
+    const myId = req.user.id;
+    const as = req.query.as;
+    const before = req.query.before;
+    const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 100);
+
+    let q = supabase.from("credit_events").select("*").order("created_at", { ascending: false }).limit(limit + 1);
+    if (as === "buyer") q = q.eq("buyer_id", myId);
+    else if (as === "seller") q = q.eq("seller_user_id", myId);
+    else q = q.or(`buyer_id.eq.${myId},seller_user_id.eq.${myId}`);
+    if (before) q = q.lt("created_at", before);
+
+    const { data, error } = await q;
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    const hasMore = (data || []).length > limit;
+    const rows = (data || []).slice(0, limit);
+
+    const sellerIds = [...new Set(rows.filter((r) => r.buyer_id === myId).map((r) => r.seller_id))];
+    const buyerIds = [...new Set(rows.filter((r) => r.seller_user_id === myId).map((r) => r.buyer_id))];
+    const [sellerRes, buyerMap] = await Promise.all([
+        sellerIds.length
+            ? supabase.from("seller_profiles").select("id, display_name").in("id", sellerIds)
+            : Promise.resolve({ data: [] }),
+        getBuyerInfoMap(buyerIds),
+    ]);
+    const sellerName = new Map((sellerRes.data || []).map((s) => [s.id, s.display_name]));
+
+    const events = rows.map((r) => {
+        const myRole = r.buyer_id === myId ? "buyer" : "seller";
+        const counterpartName = myRole === "buyer"
+            ? (sellerName.get(r.seller_id) || null)
+            : (buyerMap.get(r.buyer_id)?.businessName || buyerMap.get(r.buyer_id)?.name || null);
+        return {
+            id: r.id,
+            creditId: r.credit_id,
+            eventType: r.event_type,
+            actorRole: r.actor_role,
+            actorIsMe: r.actor_id === myId,
+            myRole,
+            creditLimit: r.credit_limit == null ? null : Number(r.credit_limit),
+            counterpartName,
+            createdAt: r.created_at, // returned verbatim: it is also the paging cursor
+        };
+    });
+
+    res.json({ success: true, events, hasMore });
+}
+
+// ---- buyer asks ---------------------------------------------------------
+
 export async function requestCredit(req, res) {
     let { sellerId, submissionId, sellerUserId, conversationId } = req.body;
 
@@ -104,20 +246,22 @@ export async function requestCredit(req, res) {
         if (!sub) return res.status(404).json({ success: false, message: "Listing not found." });
         sellerId = sub.seller_id;
     }
-    if (!sellerId && sellerUserId) {
-        const { data: sp } = await supabase.from("seller_profiles").select("id").eq("user_id", sellerUserId).maybeSingle();
+
+    let sp = null;
+    if (sellerId) {
+        ({ data: sp } = await supabase.from("seller_profiles").select("id, user_id, deleted_at").eq("id", sellerId).maybeSingle());
+    } else if (sellerUserId) {
+        ({ data: sp } = await supabase.from("seller_profiles").select("id, user_id, deleted_at").eq("user_id", sellerUserId).maybeSingle());
         if (!sp) return res.status(400).json({ success: false, message: "That user isn't a seller." });
-        sellerId = sp.id;
     }
-    if (!sellerUserId && sellerId) {
-        const { data: sp } = await supabase.from("seller_profiles").select("user_id").eq("id", sellerId).maybeSingle();
-        if (sp) sellerUserId = sp.user_id;
-    }
-    if (!sellerId || !sellerUserId) {
-        return res.status(400).json({ success: false, message: "Couldn't identify the seller." });
-    }
+    if (!sp) return res.status(400).json({ success: false, message: "Couldn't identify the seller." });
+    if (sp.deleted_at) return res.status(400).json({ success: false, message: "This seller's account is no longer active." });
+
+    sellerId = sp.id;
+    sellerUserId = sp.user_id;
+
     if (sellerUserId === req.user.id) {
-        return res.status(400).json({ success: false, code: "CANNOT_REQUEST_OWN_LISTING", message: "You can't request credit on your own listing." });
+        return res.status(400).json({ success: false, code: "CANNOT_REQUEST_OWN_LISTING", message: "You can't request credit on your own shop." });
     }
 
     let convId = conversationId;
@@ -129,7 +273,9 @@ export async function requestCredit(req, res) {
         } else {
             const { data: created, error: createErr } = await supabase.from("chat_conversations").insert({ is_group: false, direct_user_a: a, direct_user_b: b }).select("id").single();
             if (createErr) return res.status(500).json({ success: false, message: createErr.message });
-            await supabase.from("chat_participants").insert([{ conversation_id: created.id, user_id: a }, { conversation_id: created.id, user_id: b }]);
+            const { error: partErr } = await supabase.from("chat_participants").insert([{ conversation_id: created.id, user_id: a }, { conversation_id: created.id, user_id: b }]);
+            if (partErr) return res.status(500).json({ success: false, message: partErr.message });
+            invalidateParticipants(created.id);
             convId = created.id;
         }
     }
@@ -144,7 +290,7 @@ export async function requestCredit(req, res) {
             ALREADY_PENDING: "A credit request is already pending.",
             COOLDOWN_ACTIVE: "You can request credit from this seller again after the cooldown period.",
         };
-        const code = error.message; // Postgres RAISE EXCEPTION message becomes error.message via the RPC
+        const code = error.message;
         return res.status(400).json({
             success: false,
             code: map[code] ? code : "REQUEST_FAILED",
@@ -153,19 +299,21 @@ export async function requestCredit(req, res) {
     }
 
     const row = Array.isArray(data) ? data[0] : data;
-    const { data: message } = await supabase.from("chat_messages").select("*").eq("id", row.message_id).single();
+
+    await trackCreditEvent({
+        creditId: row.credit_id, buyerId: req.user.id, sellerId, sellerUserId,
+        actorId: req.user.id, actorRole: "buyer", eventType: "requested",
+    });
 
     res.json({ success: true, creditId: row.credit_id, conversationId: convId });
 
-    emitToConversation(convId, "message:new", { ...message, status: "sent" });
+    // The RPC also drops a marker message into the chat; keep the live chat in sync.
+    if (row.message_id) {
+        const { data: message } = await supabase.from("chat_messages").select("*").eq("id", row.message_id).maybeSingle();
+        if (message) emitToConversation(convId, "message:new", { ...message, status: "sent" });
+    }
 
-    // Freeze the OUTGOING request's final outcome onto its own message before
-    // request_message_id moves on to the new one — otherwise the old bubble
-    // has no way to distinguish "this was declined" from "this was turned
-    // off" from "I have no idea, guess I'll say Sent" once it's no longer
-    // the row's live pointer. This reuses the message:updated event/listener
-    // that transport_proposal's finalStatus already relies on — no new
-    // plumbing needed on the client.
+    // Freeze the previous request's outcome on its own chat message.
     if (row.previous_message_id && row.previous_status) {
         const { data: prevMsg } = await supabase.from("chat_messages").select("metadata").eq("id", row.previous_message_id).maybeSingle();
         const metadataPatch = { finalStatus: row.previous_status };
@@ -187,197 +335,9 @@ export async function requestCredit(req, res) {
     notifyUser(sellerUserId, {
         type: "credit_request",
         title: "New credit request",
-        body: `A buyer wants to buy on credit from you.`,
-        link: `/chat/${convId}`,
+        body: "A buyer wants to buy on credit from you.",
+        link: CREDIT_LINK,
     });
-}
-
-export async function decideCredit(req, res) {
-    const { decision, creditLimit } = req.body;
-    const { error } = await supabase.rpc("decide_credit", {
-        p_credit_id: req.params.id, p_seller_user_id: req.user.id,
-        p_decision: decision, p_credit_limit: decision === "approved" ? Number(creditLimit) : null,
-    });
-    if (error) {
-        const map = { CREDIT_LIMIT_REQUIRED: "Please set a credit limit to approve this request." };
-        return res.status(400).json({ success: false, message: map[error.message] || "Couldn't record the decision." });
-    }
-
-    const { data: credit } = await supabase.from("buyer_seller_credit").select("*").eq("id", req.params.id).single();
-
-    res.json({ success: true, status: credit.status });
-
-    if (credit?.conversation_id) {
-        emitToConversation(credit.conversation_id, "credit:decided", { creditId: credit.id, status: credit.status, cooldownUntil: credit.cooldown_until });
-    }
-    if (credit?.buyer_id) {
-        notifyUser(credit.buyer_id, {
-            type: "credit_decision",
-            title: decision === "approved" ? "Credit approved" : "Credit request declined",
-            body: decision === "approved" ? "You can now buy on credit from this seller." : "Your credit request was declined.",
-            link: credit.conversation_id ? `/chat/${credit.conversation_id}` : undefined,
-        });
-    }
-}
-
-// credit.controller.js — before returning to a buyer-viewer
-function sanitizeForBuyer(credit) {
-    if (!credit) return credit;
-    const { credit_limit, credit_used, period_start, ...safe } = credit;
-    return safe; // buyer gets status/cooldown/etc, never limit or usage
-}
-
-// credit.controller.js — new export
-// export async function requestCreditIncrease(req, res) {
-//     const { creditId } = req.body;
-//     const { data: credit } = await supabase.from("buyer_seller_credit").select("*").eq("id", creditId).eq("buyer_id", req.user.id).maybeSingle();
-//     if (!credit || credit.status !== "approved") {
-//         return res.status(400).json({ success: false, message: "No active credit arrangement found." });
-//     }
-//     const { data: msg, error } = await supabase.from("chat_messages").insert({
-//         conversation_id: credit.conversation_id, sender_id: req.user.id,
-//         body: "Requested a higher credit limit", message_type: "credit_limit_request",
-//         metadata: { creditId: credit.id },
-//     }).select("*").single();
-//     if (error) return res.status(500).json({ success: false, message: error.message });
-
-//     await supabase.from("buyer_seller_credit").update({
-//         limit_increase_requested_at: new Date().toISOString(),
-//         limit_increase_request_message_id: msg.id,
-//     }).eq("id", creditId);
-
-//     res.json({ success: true, conversationId: credit.conversation_id });
-//     emitToConversation(credit.conversation_id, "message:new", { ...msg, status: "sent" });
-//     notifyUser(/* seller's user id, looked up same way as requestCredit */ {
-//         type: "credit_limit_request",
-//         title: "Credit limit increase requested",
-//         body: "A buyer has asked you to reconsider their credit limit.",
-//         link: `/chat/${credit.conversation_id}`,
-//     });
-// }
-
-export async function toggleCredit(req, res) {
-    const { buyerId, enabled } = req.body;
-    const { error } = await supabase.rpc("toggle_credit", { p_seller_user_id: req.user.id, p_buyer_id: buyerId, p_enabled: enabled });
-    if (error) return res.status(400).json({ success: false, message: "Couldn't update credit status." });
-
-    const { data: sp } = await supabase.from("seller_profiles").select("id").eq("user_id", req.user.id).maybeSingle();
-    const { data: credit } = await supabase.from("buyer_seller_credit").select("*").eq("buyer_id", buyerId).eq("seller_id", sp.id).maybeSingle();
-
-    res.json({ success: true, status: enabled ? "approved" : "revoked" });
-
-    if (credit?.conversation_id) {
-        emitToConversation(credit.conversation_id, "credit:toggled", { buyerId, status: enabled ? "approved" : "revoked" });
-    }
-    notifyUser(buyerId, {
-        type: "credit_toggled",
-        title: enabled ? "Credit enabled" : "Credit turned off",
-        body: enabled ? "A seller has enabled buy-on-credit for you." : "A seller has turned off buy-on-credit for you.",
-        link: credit?.conversation_id ? `/chat/${credit.conversation_id}` : undefined,
-    });
-}
-
-// credit.controller.js — new export
-// REPLACE the existing updateCreditLimit body's post-RPC section with this
-// (defensive clear, since we don't know what update_credit_limit RPC itself clears):
-export async function updateCreditLimit(req, res) {
-    const { newLimit, resetUsed } = req.body;
-    const { data: before } = await supabase.from("buyer_seller_credit").select("limit_increase_request_message_id").eq("id", req.params.id).maybeSingle();
-
-    const { error } = await supabase.rpc("update_credit_limit", {
-        p_credit_id: req.params.id,
-        p_seller_user_id: req.user.id,
-        p_new_limit: Number(newLimit),
-        p_reset_used: resetUsed !== false,
-    });
-    if (error) {
-        const map = { CREDIT_LIMIT_REQUIRED: "Please enter a valid credit limit." };
-        return res.status(400).json({ success: false, message: map[error.message] || "Couldn't update the credit limit." });
-    }
-
-    // Defensive: make sure a live limit-increase request doesn't linger as
-    // "pending" forever after being approved this way.
-    if (before?.limit_increase_request_message_id) {
-        await supabase.from("buyer_seller_credit").update({
-            limit_increase_requested_at: null,
-            limit_increase_request_message_id: null,
-        }).eq("id", req.params.id);
-
-        const { data: msg } = await supabase.from("chat_messages").select("metadata").eq("id", before.limit_increase_request_message_id).maybeSingle();
-        const metadataPatch = { finalStatus: "approved" };
-        await supabase.from("chat_messages").update({ metadata: { ...(msg?.metadata || {}), ...metadataPatch } }).eq("id", before.limit_increase_request_message_id);
-    }
-
-    const { data: credit } = await supabase.from("buyer_seller_credit").select("*").eq("id", req.params.id).single();
-
-    res.json({ success: true, credit });
-
-    if (credit?.conversation_id) {
-        if (before?.limit_increase_request_message_id) {
-            emitToConversation(credit.conversation_id, "message:updated", {
-                conversationId: credit.conversation_id, messageId: before.limit_increase_request_message_id, metadataPatch: { finalStatus: "approved" },
-            });
-        }
-        emitToConversation(credit.conversation_id, "credit:decided", { creditId: credit.id, status: credit.status, cooldownUntil: credit.cooldown_until });
-    }
-    if (credit?.buyer_id) {
-        notifyUser(credit.buyer_id, {
-            type: "credit_decision", title: "Credit limit updated",
-            body: "Your seller has updated your monthly credit limit.",
-            link: credit.conversation_id ? `/chat/${credit.conversation_id}` : undefined,
-        });
-    }
-}
-
-// NEW — seller declines a limit-increase ask. Sets a cooldown so the buyer
-// can't immediately re-ask, mirroring how decide_credit's rejection cooldown works.
-export async function declineCreditIncrease(req, res) {
-    const { cooldownDays = 14 } = req.body || {};
-
-    const { data: credit } = await supabase.from("buyer_seller_credit").select("*").eq("id", req.params.id).maybeSingle();
-    if (!credit || !credit.limit_increase_request_message_id) {
-        return res.status(400).json({ success: false, message: "No pending limit increase request." });
-    }
-
-    const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", credit.seller_id).maybeSingle();
-    if (!sellerProfile || sellerProfile.user_id !== req.user.id) {
-        return res.status(403).json({ success: false, message: "Not authorized." });
-    }
-
-    const cooldownUntil = new Date();
-    cooldownUntil.setDate(cooldownUntil.getDate() + Number(cooldownDays));
-
-    const requestMessageId = credit.limit_increase_request_message_id;
-
-    const { error } = await supabase.from("buyer_seller_credit").update({
-        limit_increase_requested_at: null,
-        limit_increase_request_message_id: null,
-        limit_increase_cooldown_until: cooldownUntil.toISOString(),
-    }).eq("id", req.params.id);
-    if (error) return res.status(500).json({ success: false, message: error.message });
-
-    const { data: msg } = await supabase.from("chat_messages").select("metadata").eq("id", requestMessageId).maybeSingle();
-    const metadataPatch = { finalStatus: "rejected" };
-    await supabase.from("chat_messages").update({ metadata: { ...(msg?.metadata || {}), ...metadataPatch } }).eq("id", requestMessageId);
-
-    const { data: updated } = await supabase.from("buyer_seller_credit").select("*").eq("id", req.params.id).single();
-
-    res.json({ success: true, credit: updated });
-
-    if (updated?.conversation_id) {
-        emitToConversation(updated.conversation_id, "message:updated", { conversationId: updated.conversation_id, messageId: requestMessageId, metadataPatch });
-        emitToConversation(updated.conversation_id, "credit:decided", {
-            creditId: updated.id, status: updated.status,
-            limitIncreaseCooldownUntil: updated.limit_increase_cooldown_until,
-        });
-    }
-    if (updated?.buyer_id) {
-        notifyUser(updated.buyer_id, {
-            type: "credit_decision", title: "Credit limit request declined",
-            body: "Your seller declined your request for a higher credit limit.",
-            link: updated.conversation_id ? `/chat/${updated.conversation_id}` : undefined,
-        });
-    }
 }
 
 export async function requestCreditIncrease(req, res) {
@@ -386,8 +346,6 @@ export async function requestCreditIncrease(req, res) {
     if (!credit || credit.status !== "approved") {
         return res.status(400).json({ success: false, message: "No active credit arrangement found." });
     }
-
-    // NEW — only one live increase request at a time, and respect the cooldown after a decline
     if (credit.limit_increase_request_message_id) {
         return res.status(400).json({ success: false, code: "INCREASE_ALREADY_PENDING", message: "A request for a higher limit is already pending." });
     }
@@ -395,7 +353,6 @@ export async function requestCreditIncrease(req, res) {
         return res.status(400).json({ success: false, code: "INCREASE_COOLDOWN_ACTIVE", message: "You can ask for a higher limit again after the cooldown period." });
     }
 
-    // NEW — resolve the seller's user_id so we know who to notify
     const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", credit.seller_id).maybeSingle();
     if (!sellerProfile) {
         return res.status(400).json({ success: false, message: "Couldn't find the seller for this credit arrangement." });
@@ -413,6 +370,11 @@ export async function requestCreditIncrease(req, res) {
         limit_increase_request_message_id: msg.id,
     }).eq("id", creditId);
 
+    await trackCreditEvent({
+        creditId: credit.id, buyerId: credit.buyer_id, sellerId: credit.seller_id, sellerUserId: sellerProfile.user_id,
+        actorId: req.user.id, actorRole: "buyer", eventType: "limit_increase_requested",
+    });
+
     res.json({ success: true, conversationId: credit.conversation_id });
 
     emitToConversation(credit.conversation_id, "message:new", { ...msg, status: "sent" });
@@ -420,6 +382,189 @@ export async function requestCreditIncrease(req, res) {
         type: "credit_limit_request",
         title: "Credit limit increase requested",
         body: "A buyer has asked you to reconsider their credit limit.",
-        link: `/chat/${credit.conversation_id}`,
+        link: CREDIT_LINK,
+    });
+}
+
+// ---- seller decides -----------------------------------------------------
+
+export async function decideCredit(req, res) {
+    const { decision, creditLimit } = req.body;
+    if (!["approved", "rejected"].includes(decision)) {
+        return res.status(400).json({ success: false, message: "Invalid decision." });
+    }
+    const limit = decision === "approved" ? Number(creditLimit) : null;
+    if (decision === "approved" && !(limit > 0)) {
+        return res.status(400).json({ success: false, message: "Please set a credit limit to approve this request." });
+    }
+
+    const { error } = await supabase.rpc("decide_credit", {
+        p_credit_id: req.params.id, p_seller_user_id: req.user.id,
+        p_decision: decision, p_credit_limit: limit,
+    });
+    if (error) {
+        const map = { CREDIT_LIMIT_REQUIRED: "Please set a credit limit to approve this request." };
+        return res.status(400).json({ success: false, message: map[error.message] || "Couldn't record the decision." });
+    }
+
+    const { data: credit } = await supabase.from("buyer_seller_credit").select("*").eq("id", req.params.id).maybeSingle();
+    if (!credit) return res.status(404).json({ success: false, message: "Credit request not found." });
+
+    await trackCreditEvent({
+        creditId: credit.id, buyerId: credit.buyer_id, sellerId: credit.seller_id, sellerUserId: req.user.id,
+        actorId: req.user.id, actorRole: "seller", eventType: decision, creditLimit: limit,
+    });
+
+    res.json({ success: true, status: credit.status });
+
+    if (credit.conversation_id) {
+        emitToConversation(credit.conversation_id, "credit:decided", { creditId: credit.id, status: credit.status, cooldownUntil: credit.cooldown_until });
+    }
+    notifyUser(credit.buyer_id, {
+        type: "credit_decision",
+        title: decision === "approved" ? "Credit approved" : "Credit request declined",
+        body: decision === "approved" ? "You can now buy on credit from this seller." : "Your credit request was declined.",
+        link: CREDIT_LINK,
+    });
+}
+
+export async function toggleCredit(req, res) {
+    const { buyerId, enabled } = req.body;
+    if (!buyerId || typeof enabled !== "boolean") {
+        return res.status(400).json({ success: false, message: "Invalid request." });
+    }
+    const { data: sp } = await supabase.from("seller_profiles").select("id").eq("user_id", req.user.id).maybeSingle();
+    if (!sp) return res.status(403).json({ success: false, message: "Not a seller." });
+
+    const { error } = await supabase.rpc("toggle_credit", { p_seller_user_id: req.user.id, p_buyer_id: buyerId, p_enabled: enabled });
+    if (error) return res.status(400).json({ success: false, message: "Couldn't update credit status." });
+
+    const { data: credit } = await supabase.from("buyer_seller_credit").select("*").eq("buyer_id", buyerId).eq("seller_id", sp.id).maybeSingle();
+
+    if (credit) {
+        await trackCreditEvent({
+            creditId: credit.id, buyerId, sellerId: sp.id, sellerUserId: req.user.id,
+            actorId: req.user.id, actorRole: "seller", eventType: enabled ? "enabled" : "revoked",
+        });
+    }
+
+    res.json({ success: true, status: enabled ? "approved" : "revoked" });
+
+    if (credit?.conversation_id) {
+        emitToConversation(credit.conversation_id, "credit:toggled", { buyerId, status: enabled ? "approved" : "revoked" });
+    }
+    notifyUser(buyerId, {
+        type: "credit_toggled",
+        title: enabled ? "Credit enabled" : "Credit turned off",
+        body: enabled ? "A seller has enabled buy-on-credit for you." : "A seller has turned off buy-on-credit for you.",
+        link: CREDIT_LINK,
+    });
+}
+
+export async function updateCreditLimit(req, res) {
+    const { newLimit, resetUsed } = req.body;
+    if (!(Number(newLimit) > 0)) {
+        return res.status(400).json({ success: false, message: "Please enter a valid credit limit." });
+    }
+    const { data: before } = await supabase.from("buyer_seller_credit").select("limit_increase_request_message_id").eq("id", req.params.id).maybeSingle();
+
+    const { error } = await supabase.rpc("update_credit_limit", {
+        p_credit_id: req.params.id,
+        p_seller_user_id: req.user.id,
+        p_new_limit: Number(newLimit),
+        p_reset_used: resetUsed !== false,
+    });
+    if (error) {
+        const map = { CREDIT_LIMIT_REQUIRED: "Please enter a valid credit limit." };
+        return res.status(400).json({ success: false, message: map[error.message] || "Couldn't update the credit limit." });
+    }
+
+    // Make sure a live limit-increase request doesn't linger as "pending".
+    if (before?.limit_increase_request_message_id) {
+        await supabase.from("buyer_seller_credit").update({
+            limit_increase_requested_at: null,
+            limit_increase_request_message_id: null,
+        }).eq("id", req.params.id);
+
+        const { data: msg } = await supabase.from("chat_messages").select("metadata").eq("id", before.limit_increase_request_message_id).maybeSingle();
+        await supabase.from("chat_messages")
+            .update({ metadata: { ...(msg?.metadata || {}), finalStatus: "approved" } })
+            .eq("id", before.limit_increase_request_message_id);
+    }
+
+    const { data: credit } = await supabase.from("buyer_seller_credit").select("*").eq("id", req.params.id).maybeSingle();
+    if (!credit) return res.status(404).json({ success: false, message: "Credit record not found." });
+
+    await trackCreditEvent({
+        creditId: credit.id, buyerId: credit.buyer_id, sellerId: credit.seller_id, sellerUserId: req.user.id,
+        actorId: req.user.id, actorRole: "seller", eventType: "limit_updated", creditLimit: Number(newLimit),
+    });
+
+    res.json({ success: true, credit });
+
+    if (credit.conversation_id) {
+        if (before?.limit_increase_request_message_id) {
+            emitToConversation(credit.conversation_id, "message:updated", {
+                conversationId: credit.conversation_id, messageId: before.limit_increase_request_message_id, metadataPatch: { finalStatus: "approved" },
+            });
+        }
+        emitToConversation(credit.conversation_id, "credit:decided", { creditId: credit.id, status: credit.status, cooldownUntil: credit.cooldown_until });
+    }
+    notifyUser(credit.buyer_id, {
+        type: "credit_decision", title: "Credit limit updated",
+        body: "Your seller has updated your monthly credit limit.",
+        link: CREDIT_LINK,
+    });
+}
+
+export async function declineCreditIncrease(req, res) {
+    const days = Number(req.body?.cooldownDays);
+    const cooldownDays = Number.isFinite(days) && days > 0 ? days : 14;
+
+    const { data: credit } = await supabase.from("buyer_seller_credit").select("*").eq("id", req.params.id).maybeSingle();
+    if (!credit || !credit.limit_increase_request_message_id) {
+        return res.status(400).json({ success: false, message: "No pending limit increase request." });
+    }
+
+    const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", credit.seller_id).maybeSingle();
+    if (!sellerProfile || sellerProfile.user_id !== req.user.id) {
+        return res.status(403).json({ success: false, message: "Not authorized." });
+    }
+
+    const cooldownUntil = new Date();
+    cooldownUntil.setDate(cooldownUntil.getDate() + cooldownDays);
+    const requestMessageId = credit.limit_increase_request_message_id;
+
+    const { error } = await supabase.from("buyer_seller_credit").update({
+        limit_increase_requested_at: null,
+        limit_increase_request_message_id: null,
+        limit_increase_cooldown_until: cooldownUntil.toISOString(),
+    }).eq("id", req.params.id);
+    if (error) return res.status(500).json({ success: false, message: error.message });
+
+    const { data: msg } = await supabase.from("chat_messages").select("metadata").eq("id", requestMessageId).maybeSingle();
+    const metadataPatch = { finalStatus: "rejected" };
+    await supabase.from("chat_messages").update({ metadata: { ...(msg?.metadata || {}), ...metadataPatch } }).eq("id", requestMessageId);
+
+    const { data: updated } = await supabase.from("buyer_seller_credit").select("*").eq("id", req.params.id).maybeSingle();
+
+    await trackCreditEvent({
+        creditId: credit.id, buyerId: credit.buyer_id, sellerId: credit.seller_id, sellerUserId: req.user.id,
+        actorId: req.user.id, actorRole: "seller", eventType: "limit_increase_declined",
+    });
+
+    res.json({ success: true, credit: updated });
+
+    if (updated?.conversation_id) {
+        emitToConversation(updated.conversation_id, "message:updated", { conversationId: updated.conversation_id, messageId: requestMessageId, metadataPatch });
+        emitToConversation(updated.conversation_id, "credit:decided", {
+            creditId: updated.id, status: updated.status,
+            limitIncreaseCooldownUntil: updated.limit_increase_cooldown_until,
+        });
+    }
+    notifyUser(credit.buyer_id, {
+        type: "credit_decision", title: "Credit limit request declined",
+        body: "Your seller declined your request for a higher credit limit.",
+        link: CREDIT_LINK,
     });
 }
