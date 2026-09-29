@@ -114,6 +114,8 @@ async function applyBuyerAccessDraft(submissionId, sellerId, draft, defaultPrice
     await supabase.from("seller_listing_visibility")
         .upsert(visibilityRows, { onConflict: "submission_id,buyer_id", ignoreDuplicates: true });
 
+    const clamp = (p) => Math.max(-99999999, Math.min(99999999, Math.round(p * 1000) / 1000));
+
     const priceRows = draft.buyers
         .filter((b) => b.override?.canonicalPrice != null)
         .map((b) => {
@@ -124,15 +126,14 @@ async function applyBuyerAccessDraft(submissionId, sellerId, draft, defaultPrice
                 buyer_id: b.buyerId,
                 override_type: isFixed ? "fixed" : "percent",
                 fixed_price: isFixed ? Number(b.override.canonicalPrice) : null,
-                discount_percent: isFixed ? null : Number(b.override.percentValue),
+                discount_percent: isFixed ? null : clamp(Number(b.override.percentValue)),
                 base_price_at_set: defaultPrice,
                 updated_at: new Date().toISOString(),
             };
         });
-    if (priceRows.length) {
-        await supabase.from("buyer_seller_custom_prices")
-            .upsert(priceRows, { onConflict: "submission_id,buyer_id" });
-    }
+    const { error: priceErr } = await supabase.from("buyer_seller_custom_prices")
+        .upsert(priceRows, { onConflict: "submission_id,buyer_id" });
+    if (priceErr) console.error("[applyBuyerAccessDraft] price upsert failed", priceErr.message);
 }
 
 async function getSellerDispatchInfo(sellerId) {
