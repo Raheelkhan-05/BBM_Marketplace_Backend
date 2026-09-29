@@ -5,8 +5,11 @@ import { invalidateParticipants } from "../socket/participantsCache.js";
 import { notifyUser } from "../services/realtimeBroadcast.js";
 import { trackCreditEvent } from "../services/creditEvents.js";
 
-// Every credit notification now lands on the Credit page (not the chat).
-const CREDIT_LINK = "/credit";
+// Every credit notification deep-links into the Credit page: the right tab,
+// scrolled to and highlighted on the exact record (see CreditPage.jsx).
+//   tab: "requests" (seller inbox) | "approved" | "sellers"
+const creditLink = (tab, creditId) =>
+    creditId ? `/credit?tab=${tab}&highlight=${creditId}` : `/credit?tab=${tab}`;
 
 // ---- helpers ------------------------------------------------------------
 
@@ -336,7 +339,7 @@ export async function requestCredit(req, res) {
         type: "credit_request",
         title: "New credit request",
         body: "A buyer wants to buy on credit from you.",
-        link: CREDIT_LINK,
+        link: creditLink("requests", row.credit_id),
     });
 }
 
@@ -382,7 +385,7 @@ export async function requestCreditIncrease(req, res) {
         type: "credit_limit_request",
         title: "Credit limit increase requested",
         body: "A buyer has asked you to reconsider their credit limit.",
-        link: CREDIT_LINK,
+        link: creditLink("requests", credit.id),
     });
 }
 
@@ -424,7 +427,7 @@ export async function decideCredit(req, res) {
         type: "credit_decision",
         title: decision === "approved" ? "Credit approved" : "Credit request declined",
         body: decision === "approved" ? "You can now buy on credit from this seller." : "Your credit request was declined.",
-        link: CREDIT_LINK,
+        link: creditLink(decision === "approved" ? "approved" : "sellers", credit.id),
     });
 }
 
@@ -457,7 +460,7 @@ export async function toggleCredit(req, res) {
         type: "credit_toggled",
         title: enabled ? "Credit enabled" : "Credit turned off",
         body: enabled ? "A seller has enabled buy-on-credit for you." : "A seller has turned off buy-on-credit for you.",
-        link: CREDIT_LINK,
+        link: creditLink(enabled ? "approved" : "sellers", credit?.id),
     });
 }
 
@@ -513,7 +516,7 @@ export async function updateCreditLimit(req, res) {
     notifyUser(credit.buyer_id, {
         type: "credit_decision", title: "Credit limit updated",
         body: "Your seller has updated your monthly credit limit.",
-        link: CREDIT_LINK,
+        link: creditLink(enabled ? "approved" : "sellers", credit?.id),
     });
 }
 
@@ -565,6 +568,6 @@ export async function declineCreditIncrease(req, res) {
     notifyUser(credit.buyer_id, {
         type: "credit_decision", title: "Credit limit request declined",
         body: "Your seller declined your request for a higher credit limit.",
-        link: CREDIT_LINK,
+        link: creditLink("approved", credit.id),
     });
 }
