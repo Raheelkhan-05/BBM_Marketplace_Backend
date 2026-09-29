@@ -114,26 +114,27 @@ async function applyBuyerAccessDraft(submissionId, sellerId, draft, defaultPrice
     await supabase.from("seller_listing_visibility")
         .upsert(visibilityRows, { onConflict: "submission_id,buyer_id", ignoreDuplicates: true });
 
-    const clamp = (p) => Math.max(-99999999, Math.min(99999999, Math.round(p * 1000) / 1000));
+    const base = Number(defaultPrice);
+    const clamp = (p) => Math.max(-9999999999, Math.min(9999999999, Math.round(p * 1e6) / 1e6));
 
     const priceRows = draft.buyers
-        .filter((b) => b.override?.canonicalPrice != null)
-        .map((b) => {
-            const isFixed = b.override.mode === "amount";
-            return {
-                seller_id: sellerId,
-                submission_id: submissionId,
-                buyer_id: b.buyerId,
-                override_type: isFixed ? "fixed" : "percent",
-                fixed_price: isFixed ? Number(b.override.canonicalPrice) : null,
-                discount_percent: isFixed ? null : clamp(Number(b.override.percentValue)),
-                base_price_at_set: defaultPrice,
-                updated_at: new Date().toISOString(),
-            };
-        });
-    const { error: priceErr } = await supabase.from("buyer_seller_custom_prices")
-        .upsert(priceRows, { onConflict: "submission_id,buyer_id" });
-    if (priceErr) console.error("[applyBuyerAccessDraft] price upsert failed", priceErr.message);
+        .filter((b) => b.override?.canonicalPrice != null && base > 0)
+        .map((b) => ({
+            seller_id: sellerId,
+            submission_id: submissionId,
+            buyer_id: b.buyerId,
+            override_type: "percent",
+            discount_percent: clamp(((base - Number(b.override.canonicalPrice)) / base) * 100),
+            fixed_price: null,
+            base_price_at_set: base,
+            updated_at: new Date().toISOString(),
+        }));
+
+    if (priceRows.length) {
+        const { error } = await supabase.from("buyer_seller_custom_prices")
+            .upsert(priceRows, { onConflict: "seller_id,buyer_id,submission_id" });
+        if (error) console.error("[applyBuyerAccessDraft] price upsert failed", error.message);
+    }
 }
 
 async function getSellerDispatchInfo(sellerId) {

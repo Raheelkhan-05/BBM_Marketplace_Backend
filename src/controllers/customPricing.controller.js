@@ -168,9 +168,9 @@ export async function upsertCustomPricing(req, res) {
     if (subErr) return res.status(500).json({ success: false, message: subErr.message });
     const submissionById = Object.fromEntries((submissions || []).map((s) => [s.id, s]));
 
-    const MAX_ABS_PERCENT = 99999999;               // discount_percent is numeric(14,3)
-    const clampPercent = (p) => Math.max(-MAX_ABS_PERCENT, Math.min(MAX_ABS_PERCENT, Math.round(p * 1000) / 1000));
-    const MAX_PRICE = 9999999999.99;                // fixed_price is numeric(12,2)
+    const MAX_ABS_PERCENT = 9999999999;   // numeric(16,6) -> 10 integer digits
+    const clampPercent = (p) => Math.max(-MAX_ABS_PERCENT, Math.min(MAX_ABS_PERCENT, Math.round(p * 1e6) / 1e6));
+    const MAX_PRICE = 9999999999.99;
 
     const rows = [];
     const skipped = [];
@@ -179,36 +179,34 @@ export async function upsertCustomPricing(req, res) {
         const submission = submissionById[item.submissionId];
         if (!submission) { skipped.push({ submissionId: item.submissionId, reason: "not_found_or_not_eligible" }); continue; }
         const basePrice = Number(submission.price);
+        if (!(basePrice > 0)) { skipped.push({ submissionId: item.submissionId, reason: "invalid_base_price" }); continue; }
 
-        let canonicalPrice;
-        let percentForStore;
-        if (item.overrideType === "fixed") {
-            canonicalPrice = Number(item.value);
-            percentForStore = percentFromCustomPrice(basePrice, canonicalPrice);
+        // Work out the target price and the percent relative to the listing price,
+        // regardless of whether the seller typed an amount or a percent.
+        let percent;
+        if (item.overrideType === "fixed" || item.inputMode === "typed_price" || item.inputMode === "fixed_price") {
+            const price = Number(item.value);
+            if (!Number.isFinite(price)) { skipped.push({ submissionId: item.submissionId, reason: "invalid_price" }); continue; }
+            percent = ((basePrice - price) / basePrice) * 100;       // +ve = discount, -ve = markup
         } else {
-            const pct = item.inputMode === "typed_price"
-                ? percentFromCustomPrice(basePrice, Number(item.value))
-                : Number(item.value);
-            if (!Number.isFinite(pct)) { skipped.push({ submissionId: item.submissionId, reason: "invalid_percent" }); continue; }
-            canonicalPrice = Math.round(basePrice * (1 - pct / 100) * 100) / 100;
-            percentForStore = pct;
+            percent = Number(item.value);
+            if (!Number.isFinite(percent)) { skipped.push({ submissionId: item.submissionId, reason: "invalid_percent" }); continue; }
         }
 
-        if (!Number.isFinite(canonicalPrice) || canonicalPrice <= 0) {
+        const canonicalPrice = Math.round(basePrice * (1 - percent / 100) * 100) / 100;
+        if (!(canonicalPrice > 0)) {
             return res.status(400).json({ success: false, message: "The resulting price must be greater than ₹0." });
         }
         if (canonicalPrice > MAX_PRICE) {
             return res.status(400).json({ success: false, message: "That price is too large to store." });
         }
 
-        // Markups (negative percent) and explicit prices are stored as fixed prices;
-        // only true discounts are stored as percent overrides.
-        const asFixed = item.overrideType === "fixed" || percentForStore < 0;
+        // ALWAYS stored as a percent of the listing price, so it follows future price changes.
         rows.push({
             seller_id: sellerId, buyer_id: buyerId, submission_id: item.submissionId,
-            override_type: asFixed ? "fixed" : "percent",
-            discount_percent: asFixed ? clampPercent(percentForStore) : clampPercent(percentForStore),
-            fixed_price: asFixed ? canonicalPrice : null,
+            override_type: "percent",
+            discount_percent: clampPercent(percent),
+            fixed_price: null,
             base_price_at_set: basePrice,
         });
     }
