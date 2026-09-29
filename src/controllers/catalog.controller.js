@@ -157,6 +157,60 @@ export async function getBrandItemSellers(req, res) {
     return res.json({ success: true, ...data });
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// GET /api/catalog/followed-ids
+export async function getFollowedIds(req, res) {
+    const { data, error } = await supabaseAdmin
+        .from("buyer_followed_items")
+        .select("brand_item_id")
+        .eq("user_id", req.user.id);
+
+    if (error) {
+        console.error("[catalog] getFollowedIds failed:", error.message);
+        return res.status(500).json({ success: false, message: "Couldn't load your followed products." });
+    }
+    return res.json({ success: true, ids: (data || []).map((r) => r.brand_item_id) });
+}
+
+// PUT /api/catalog/followed/:brandItemId  (idempotent)
+export async function followBrandItem(req, res) {
+    const { brandItemId } = req.params;
+    if (!UUID_RE.test(brandItemId)) return res.status(400).json({ success: false, message: "Invalid product." });
+
+    const { error } = await supabaseAdmin
+        .from("buyer_followed_items")
+        .upsert(
+            { user_id: req.user.id, brand_item_id: brandItemId },
+            { onConflict: "user_id,brand_item_id", ignoreDuplicates: true }
+        );
+
+    if (error) {
+        if (error.code === "23503") return res.status(404).json({ success: false, message: "Product not found." });
+        console.error("[catalog] followBrandItem failed:", error.message);
+        return res.status(500).json({ success: false, message: "Couldn't follow this product." });
+    }
+    return res.json({ success: true, following: true });
+}
+
+// DELETE /api/catalog/followed/:brandItemId  (idempotent)
+export async function unfollowBrandItem(req, res) {
+    const { brandItemId } = req.params;
+    if (!UUID_RE.test(brandItemId)) return res.status(400).json({ success: false, message: "Invalid product." });
+
+    const { error } = await supabaseAdmin
+        .from("buyer_followed_items")
+        .delete()
+        .eq("user_id", req.user.id)
+        .eq("brand_item_id", brandItemId);
+
+    if (error) {
+        console.error("[catalog] unfollowBrandItem failed:", error.message);
+        return res.status(500).json({ success: false, message: "Couldn't unfollow this product." });
+    }
+    return res.json({ success: true, following: false });
+}
+
 // GET /api/catalog/brand-items-feed?categoryId=&q=&sort=&limit=&offset=
 // Home feed, one level flatter than getGenericProductsFeed — returns
 // hs_generic_product_brands rows directly (same shape as
@@ -167,11 +221,12 @@ export async function getBrandItemsFeed(req, res) {
     const { categoryId = "", q = "", sort = "relevance" } = req.query;
     const limit = parseIntSafe(req.query.limit, 24);
     const offset = parseIntSafe(req.query.offset, 0);
+    const followedOnly = req.query.followed === "1";
 
-    // Uses catalog_browse_feed instead of catalog_browse: identical item
-    // shape the frontend actually consumes here, without the wasted
-    // facet-aggregation work catalog_browse also does (that stays used
-    // by whatever DOES need facets — this call site is untouched).
+    if (followedOnly && !req.user?.id) {
+        return res.status(401).json({ success: false, message: "Login required." });
+    }
+
     const { data, error } = await supabaseAdmin.rpc("catalog_browse_feed", {
         p_category_id: categoryId || null,
         p_q: q,
@@ -180,6 +235,7 @@ export async function getBrandItemsFeed(req, res) {
         p_offset: offset,
         p_seller_id: req.sellerProfileId || null,
         p_buyer_id: req.user?.id || null,
+        p_followed_only: followedOnly,
     });
 
     if (error) {

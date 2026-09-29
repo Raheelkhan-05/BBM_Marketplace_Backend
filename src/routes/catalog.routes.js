@@ -17,7 +17,8 @@ import {
     getBrandItemsFeed,
     getBrandItemSellerOffer,
     getSharedProductLink,
-    getLowestPriceForBrandItem
+    getLowestPriceForBrandItem,
+    getFollowedIds, followBrandItem, unfollowBrandItem,
 } from "../controllers/catalog.controller.js";
 
 const router = Router();
@@ -25,6 +26,9 @@ const router = Router();
 router.get("/categories/:categoryId/generic-products", optionalAuth, optionalSellerProfile, getCategoryGenericProducts);
 router.get("/generic-products", optionalAuth, optionalSellerProfile, getGenericProductsFeed);
 router.get("/generic-products/:genericProductId/brands", optionalAuth, optionalSellerProfile, getGenericProductBrands);
+router.get("/followed-ids", requireAuth, getFollowedIds);
+router.put("/followed/:brandItemId", requireAuth, followBrandItem);
+router.delete("/followed/:brandItemId", requireAuth, unfollowBrandItem);
 router.get("/brand-items/:brandItemId", optionalAuth, optionalSellerProfile, getBrandItemDetail);
 router.get("/brand-items-feed", optionalAuth, optionalSellerProfile, getBrandItemsFeed);
 router.get("/brand-items/:brandItemId/sellers", optionalAuth, optionalSellerProfile, getBrandItemSellers);
