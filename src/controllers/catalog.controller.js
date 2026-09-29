@@ -218,10 +218,11 @@ export async function unfollowBrandItem(req, res) {
 // product picked yet. categoryId omitted = browse everything.
 // GET /api/catalog/brand-items-feed?categoryId=&q=&sort=&limit=&offset=
 export async function getBrandItemsFeed(req, res) {
-    const { categoryId = "", q = "", sort = "relevance" } = req.query;
+    const { categoryId = "", q = "", sort = "relevance", destPincode, destState } = req.query;
     const limit = parseIntSafe(req.query.limit, 24);
     const offset = parseIntSafe(req.query.offset, 0);
     const followedOnly = req.query.followed === "1";
+    const shop = String(req.query.shop || "").trim().slice(0, 100) || null;
 
     if (followedOnly && !req.user?.id) {
         return res.status(401).json({ success: false, message: "Login required." });
@@ -236,6 +237,9 @@ export async function getBrandItemsFeed(req, res) {
         p_seller_id: req.sellerProfileId || null,
         p_buyer_id: req.user?.id || null,
         p_followed_only: followedOnly,
+        p_shop_slug: shop,
+        p_dest_pincode: destPincode || null,
+        p_dest_state: destState || null,
     });
 
     if (error) {
@@ -243,6 +247,28 @@ export async function getBrandItemsFeed(req, res) {
         return res.status(500).json({ success: false, message: "Couldn't load products right now." });
     }
     return res.json({ success: true, ...data });
+}
+
+// GET /api/catalog/shops/:shopSlug  (public, only safe fields)
+export async function getShopPublicInfo(req, res) {
+    const slug = String(req.params.shopSlug || "").trim();
+    if (!slug || slug.length > 100) {
+        return res.status(400).json({ success: false, message: "Invalid store link." });
+    }
+    const { data, error } = await supabaseAdmin
+        .from("seller_profiles")
+        .select("shop_slug, display_name, city, state, logo_url")
+        .eq("shop_slug", slug)
+        .is("deleted_at", null)
+        .maybeSingle();
+
+    if (error) {
+        console.error("[catalog] getShopPublicInfo failed:", error.message);
+        return res.status(500).json({ success: false, message: "Couldn't load this store." });
+    }
+    if (!data) return res.status(404).json({ success: false, message: "Store not found." });
+    res.set("Cache-Control", "public, max-age=60");
+    return res.json({ success: true, shop: data });
 }
 
 // catalog.controller.js
@@ -256,6 +282,8 @@ export async function getBrandItemSellerOffer(req, res) {
         p_shop_slug: shopSlug,
         p_buyer_id: req.user?.id || null,
     });
+
+    if (!data.found) return res.status(404).json({ success: false, code: "LISTING_GONE", message: "This seller no longer has this listing available." });
 
     if (error) {
         console.error("[catalog] getBrandItemSellerOffer failed:", error.message);
