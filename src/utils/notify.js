@@ -1,11 +1,12 @@
 import { supabase } from "../config/supabase.js";
-import { transporter } from "../config/mailer.js";
+import { resend } from "../config/mailer.js";
 
-const FROM_ADDRESS = process.env.SMTP_FROM || process.env.SMTP_USER;
+const FROM_ADDRESS = process.env.SMTP_FROM;
 
 async function sendMail({ to, subject, html }) {
   if (!to) return; // no email on file — skip silently, in-app notification still landed
-  await transporter.sendMail({ from: FROM_ADDRESS, to, subject, html });
+  const { error } = await resend.emails.send({ from: FROM_ADDRESS, to, subject, html });
+  if (error) throw Object.assign(new Error(error.message || "Email send failed"), { cause: error });
 }
 
 export async function notifyUser({ userId, type, title, body, link, email, emailSubject, emailHtml }) {

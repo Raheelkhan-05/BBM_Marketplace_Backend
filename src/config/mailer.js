@@ -1,23 +1,16 @@
 // src/config/mailer.js
+import { Resend } from "resend";
 
-import nodemailer from "nodemailer";
+export const resend = new Resend(process.env.RESEND_API_KEY);
 
-const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
-
-export const transporter = nodemailer.createTransport({
-  host: SMTP_HOST,
-  port: Number(SMTP_PORT) || 587,
-  secure: Number(SMTP_PORT) === 465, // true for 465, false for 587 (STARTTLS)
-  auth: { user: SMTP_USER, pass: SMTP_PASS },
-});
-
-// Fail fast in dev if credentials are wrong, rather than discovering it
-// the first time a user tries to sign up.
+// Fail fast in dev/startup logs if the key is missing, rather than
+// discovering it the first time a user tries to sign up. Resend has no
+// separate "verify connection" call like SMTP does, so this just checks
+// the key is present.
 export async function verifyMailer() {
-  try {
-    await transporter.verify();
-    console.log("[mailer] SMTP connection OK");
-  } catch (err) {
-    console.error("[mailer] SMTP connection failed:", err.message);
+  if (!process.env.RESEND_API_KEY) {
+    console.error("[mailer] RESEND_API_KEY is not set.");
+    return;
   }
+  console.log("[mailer] Resend configured");
 }

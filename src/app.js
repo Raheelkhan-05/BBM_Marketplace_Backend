@@ -34,6 +34,11 @@ import customPricingRoutes from "./routes/customPricing.routes.js";
 export function createApp() {
   const app = express();
 
+  // Render (and most PaaS) sit behind a reverse proxy. Trusting exactly
+  // one hop means we use the proxy's X-Forwarded-For value for req.ip,
+  // which express-rate-limit needs to key limits per real client IP.
+  app.set("trust proxy", 1);
+
   app.use(helmet());
 
   // Gzip/brotli-compresses every response body (JSON, HTML, etc) before it

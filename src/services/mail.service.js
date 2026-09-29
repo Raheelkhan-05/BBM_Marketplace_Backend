@@ -1,6 +1,6 @@
 // src/services/mail.service.js
 
-import { transporter } from "../config/mailer.js";
+import { resend } from "../config/mailer.js";
 
 const FROM = process.env.SMTP_FROM || '"BBM" <communication@bbmpvtltd.com>';
 const BRAND_TEAL = "#047084";
@@ -33,6 +33,17 @@ function shell(title, bodyHtml) {
   </div>`;
 }
 
+// Resend returns { data, error } rather than throwing on a send failure
+// (e.g. unverified domain, invalid recipient). Surface that error the
+// same way a thrown SMTP error used to be surfaced, so callers that
+// catch on these functions keep working unchanged.
+function throwIfResendError({ data, error }) {
+  if (error) {
+    throw Object.assign(new Error(error.message || "Email send failed"), { cause: error });
+  }
+  return data;
+}
+
 export async function sendWelcomeEmail(toEmail, name) {
   if (!toEmail) return; // email is optional at signup
   const html = shell(
@@ -45,12 +56,13 @@ export async function sendWelcomeEmail(toEmail, name) {
        Go to marketplace
      </a>`
   );
-  return transporter.sendMail({
+  const result = await resend.emails.send({
     from: FROM,
     to: toEmail,
     subject: "Welcome to BBM — your account is ready",
     html,
   });
+  return throwIfResendError(result);
 }
 
 export async function sendBusinessPendingEmail(toEmail, businessName) {
@@ -63,12 +75,13 @@ export async function sendBusinessPendingEmail(toEmail, businessName) {
        occasionally longer. We'll email you the moment it's done.
      </p>`
   );
-  return transporter.sendMail({
+  const result = await resend.emails.send({
     from: FROM,
     to: toEmail,
     subject: "Your business details are being verified",
     html,
   });
+  return throwIfResendError(result);
 }
 
 export async function sendBusinessVerifiedEmail(toEmail, businessName) {
@@ -83,18 +96,20 @@ export async function sendBusinessVerifiedEmail(toEmail, businessName) {
        Open your shop
      </a>`
   );
-  return transporter.sendMail({
+  const result = await resend.emails.send({
     from: FROM,
     to: toEmail,
     subject: "You're verified to sell on BBM",
     html,
   });
+  return throwIfResendError(result);
 }
 
-// Add alongside sendWelcomeEmail / sendBusinessPendingEmail / sendBusinessVerifiedEmail,
-// reusing whatever transport those already use.
+// Used by src/services/otp.service.js's issueOtp() — that caller already
+// awaits this and catches on failure, so throwing on a Resend error (via
+// throwIfResendError) keeps that error-handling path working unchanged.
 export async function sendOtpEmail(email, otp) {
-  return transporter.sendMail({
+  const result = await resend.emails.send({
     from: FROM,
     to: email,
     subject: "Your verification code",
@@ -106,4 +121,5 @@ export async function sendOtpEmail(email, otp) {
        </p>`
     ),
   });
+  return throwIfResendError(result);
 }
