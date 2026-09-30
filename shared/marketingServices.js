@@ -12,27 +12,27 @@ export const MARKETING_SERVICES = [
         description: "Get your product listed and orderable on the marketplace."
     },
     {
-        key: "category_visibility", label: "Category Visibility", percent: 0.5, icon: "LayoutGrid",
-        description: "Show up higher in category and search results."
+        key: "category_visibility", label: "Generic Visibility", percent: 0.75, icon: "LayoutGrid",
+        description: "Show up higher in generic search results."
     },
     {
-        key: "buyer_discovery", label: "Buyer Discovery", percent: 0.5, icon: "Users",
+        key: "buyer_discovery", label: "Buyer Discovery", percent: 2, icon: "Users",
         description: "Recommend your product to buyers who match it."
     },
     {
-        key: "targeted_promotions", label: "Targeted Promotions", percent: 0.75, icon: "Target",
+        key: "targeted_promotions", label: "Targeted Promotions", percent: 3, icon: "Target",
         description: "Promote to buyers who buy similar products."
     },
     {
-        key: "distribution_network", label: "Distribution Network Promotion", percent: 0.75, icon: "Share2",
+        key: "distribution_network", label: "Distribution Network Promotion", percent: 7, icon: "Share2",
         description: "Promote through the BBM distributor and dealer network."
     },
     {
-        key: "featured_placement", label: "Featured Placement", percent: 1, icon: "Sparkles",
+        key: "featured_placement", label: "Featured Placement", percent: 10, icon: "Sparkles",
         description: "Get featured spots on the home feed."
     },
     {
-        key: "promo_campaigns", label: "Promotional Campaigns", percent: 1, icon: "Megaphone",
+        key: "promo_campaigns", label: "Promotional Campaigns", percent: 6, icon: "Megaphone",
         description: "Include the product in platform-wide campaigns."
     },
 ];
