@@ -20,6 +20,7 @@ import {
     getLowestPriceForBrandItem,
     getFollowedIds, followBrandItem, unfollowBrandItem,
     getShopPublicInfo,
+    observePriceTrends,
 } from "../controllers/catalog.controller.js";
 
 const router = Router();
@@ -31,6 +32,7 @@ router.get("/followed-ids", requireAuth, getFollowedIds);
 router.put("/followed/:brandItemId", requireAuth, followBrandItem);
 router.delete("/followed/:brandItemId", requireAuth, unfollowBrandItem);
 router.get("/shops/:shopSlug", getShopPublicInfo);
+router.post("/price-trends/observe", requireAuth, observePriceTrends);
 router.get("/brand-items/:brandItemId", optionalAuth, optionalSellerProfile, getBrandItemDetail);
 router.get("/brand-items-feed", optionalAuth, optionalSellerProfile, getBrandItemsFeed);
 router.get("/brand-items/:brandItemId/sellers", optionalAuth, optionalSellerProfile, getBrandItemSellers);

@@ -246,7 +246,12 @@ export async function getBrandItemsFeed(req, res) {
         console.error("[catalog] getBrandItemsFeed failed:", error.message);
         return res.status(500).json({ success: false, message: "Couldn't load products right now." });
     }
-    return res.json({ success: true, ...data });
+    const items = await attachPriceTrends({
+        buyerId: req.user?.id,
+        scope: shop ? `shop:${shop}` : "",
+        items: data?.items,
+    });
+    return res.json({ success: true, ...data, items });
 }
 
 // GET /api/catalog/shops/:shopSlug  (public, only safe fields)
@@ -352,4 +357,72 @@ export async function getLowestPriceForBrandItem(req, res) {
         lowestPricePerPack: Math.round(Math.min(...perPackPrices) * 100) / 100,
         sellerCount: perPackPrices.length,
     });
+}
+
+
+// ── Price-trend helpers ──────────────────────────────────────────────
+// MUST match pricePerBaseUnit() in HomeProductFeed.jsx exactly.
+function pricePerBaseUnit(price, packSize, masterPackSize) {
+    const p = Number(price);
+    if (!(p > 0)) return null;
+    const pack = Number(packSize) > 0 ? Number(packSize) : 1;
+    const master = Number(masterPackSize) > 0 ? Number(masterPackSize) : 1;
+    return Math.round((p / (pack * master)) * 10000) / 10000;
+}
+
+// Same rule as catalog_browse_feed's ordering (SQL uses greatest(1, moq)).
+function isRowOutOfStock(it) {
+    return it.lowest_price_stock_type === "ready_stock"
+        && Number(it.lowest_price_available_stock ?? 0) < Math.max(1, Number(it.lowest_price_moq) || 1);
+}
+
+// Reusable: call this from any endpoint that returns feed-shaped rows
+// (e.g. catalog-search/products-merged). Never throws: a cosmetic feature
+// must not be able to break the feed.
+export async function attachPriceTrends({ buyerId, scope = "", items }) {
+    try {
+        if (!buyerId || !Array.isArray(items) || !items.length) return items;
+        const obs = [];
+        for (const it of items) {
+            if (it.lowest_price == null || isRowOutOfStock(it)) continue;
+            const ppu = pricePerBaseUnit(it.lowest_price, it.lowest_price_pack_size, it.lowest_price_master_pack_size);
+            if (ppu != null) obs.push({ id: it.id, ppu });
+        }
+        if (!obs.length) return items.map((it) => ({ ...it, price_trend: null }));
+
+        const { data, error } = await supabaseAdmin.rpc("catalog_record_price_trend", {
+            p_buyer_id: buyerId, p_scope: scope, p_obs: obs,
+        });
+        if (error) {
+            console.error("[catalog] attachPriceTrends failed:", error.message);
+            return items; // price_trend stays undefined => frontend treats as "not tracked"
+        }
+        const map = data || {};
+        return items.map((it) => ({ ...it, price_trend: map[it.id] ?? null }));
+    } catch (e) {
+        console.error("[catalog] attachPriceTrends threw:", e?.message);
+        return items;
+    }
+}
+
+// POST /api/catalog/price-trends/observe   body: { obs: [{ id, ppu }] }  (global scope only)
+export async function observePriceTrends(req, res) {
+    const raw = Array.isArray(req.body?.obs) ? req.body.obs.slice(0, 50) : [];
+    const obs = [];
+    for (const o of raw) {
+        if (!UUID_RE.test(String(o?.id))) continue;
+        const ppu = Number(o?.ppu);
+        if (!Number.isFinite(ppu) || ppu <= 0 || ppu > 1e9) continue;
+        obs.push({ id: o.id, ppu: Math.round(ppu * 10000) / 10000 });
+    }
+    if (!obs.length) return res.json({ success: true, trends: {} });
+
+    const { data, error } = await supabaseAdmin.rpc("catalog_record_price_trend", {
+        p_buyer_id: req.user.id, p_scope: "", p_obs: obs,
+    });
+    if (error) {
+        console.error("[catalog] observePriceTrends failed:", error.message);
+        return res.status(500).json({ success: false, message: "Couldn't update price trends." });
+    }
+    return res.json({ success: true, trends: data || {} });
 }
