@@ -191,11 +191,11 @@ async function notifySellerListingLive(sellerId, submissionId, displayName) {
 const SUBMISSION_LIST_COLUMNS = `
     id, created_at, updated_at, review_status, rejection_reason,
     reviewed_at, is_active, generic_product_brand_id,
-    product_name, brand_name, image, price, base_price, moq, unit,
+    product_name, brand_name, image, price, base_price, gst_percent, moq, unit,
     pack_size, units_per_master_pack, marketing_commission_percent,
-    stock_type, stock_quantity, production_lead_time_days, visibility_mode,
+    stock_type, stock_quantity, production_lead_time_days, lead_time, visibility_mode,
     dispatch_district, dispatch_state, return_policy_key, warranty_key,
-    hs_generic_product_brands!inner ( id, name, brand_name, image, images, deleted_at )
+    hs_generic_product_brands!inner ( id, name, brand_name, brand_image, image, images, deleted_at )
 `;
 
 const SUBMISSION_DETAIL_COLUMNS = `*, hs_generic_product_brands ( id, name, brand_name, image, images, brand_not_applicable, deleted_at )`;
