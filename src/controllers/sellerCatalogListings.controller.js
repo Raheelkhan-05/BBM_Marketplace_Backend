@@ -82,6 +82,7 @@ import {
     getCommissionPercent, computeMarketplaceFigures,
     normalizeEnteredPrice,
 } from "../services/pricing.service.js";
+import { resolveMarketingFields } from "../services/marketing.service.js";
 import { resolveEffectiveBasePrice } from "../../shared/customPricing.js";
 
 export const ALLOWED_UNITS = [
@@ -97,7 +98,7 @@ const PRICE_BASES = ["per_unit", "per_pack", "per_master_pack"];
 const GROUP_FIELD_MAP = {
     delivery: ["dispatchPincode", "dispatchingLocations", "freightIncluded"],
     tax_legal: ["hsnCode", "gstPercent", "gstInclusive", "returnPolicyKey", "warrantyKey"],
-    commercial_terms: ["priceBasis"],
+    commercial_terms: ["priceBasis", "marketingServices"],
 };
 
 // Applies the seller's in-form buyer-access/pricing draft right after a
@@ -192,7 +193,7 @@ const SUBMISSION_LIST_COLUMNS = `
     id, created_at, updated_at, review_status, rejection_reason,
     reviewed_at, is_active, generic_product_brand_id,
     product_name, brand_name, image, price, base_price, gst_percent, moq, unit,
-    pack_size, units_per_master_pack, marketing_commission_percent,
+    pack_size, units_per_master_pack, marketing_commission_percent, marketing_services, marketing_legacy_percent,
     stock_type, stock_quantity, production_lead_time_days, lead_time, visibility_mode,
     dispatch_district, dispatch_state, return_policy_key, warranty_key,
     hs_generic_product_brands!inner ( id, name, brand_name, brand_image, image, images, deleted_at )
@@ -293,8 +294,13 @@ function validateListingPayload(body) {
     if (!PRICE_BASES.includes(body.priceBasis)) missing.push("Price basis (per unit / pack / master pack)");
     if (typeof body.gstInclusive !== "boolean") missing.push("Whether price includes GST");
     if (typeof body.freightIncluded !== "boolean") missing.push("Whether freight is included");
-    const mcp = Number(body.marketingCommissionPercent);
-    if (!(mcp >= 0.25 && mcp <= 100)) missing.push("Promotion & Visibility Budget %");
+
+    if (!Array.isArray(body.marketingServices)) {
+        // Only legacy listings edited without choosing services reach here (percent comes from the DB row).
+        const mcp = Number(body.marketingCommissionPercent);
+        if (!(mcp >= 0.25 && mcp <= 100)) missing.push("Marketing & Promotion plan");
+    }
+
 
     if (body.sampleAvailable) {
         if (!(Number(body.sampleQuantity) > 0)) missing.push("Sample quantity");
@@ -355,7 +361,10 @@ function toListingRow(body, brand, sellerDispatch) {
         price_basis: body.priceBasis,
         gst_inclusive_input: Boolean(body.gstInclusive),
         freight_included: Boolean(body.freightIncluded),
-        marketing_commission_percent: Number(body.marketingCommissionPercent),
+        ...(Array.isArray(body.marketingServices)
+            ? resolveMarketingFields(body.marketingServices)
+            : { marketing_commission_percent: Number(body.marketingCommissionPercent) }), // legacy carry-over, services untouched
+
 
         pack_size: packSize,
         units_per_master_pack: masterPackSize,
@@ -397,6 +406,8 @@ async function resolvePolicyText(kind, key) {
 export async function createSubmission(req, res) {
     const sellerId = req.sellerId;
     const body = req.body || {};
+
+    delete body.marketingCommissionPercent; // creates must choose services; a client percent is never trusted
 
     const missing = validateListingPayload(body);
     if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.`, missing });
@@ -611,6 +622,7 @@ export async function getCommissionInfo(req, res) {
 export async function createListingForExistingBrand(req, res) {
     const sellerId = req.sellerId;
     const body = req.body || {};
+    delete body.marketingCommissionPercent; // creates must choose services; a client percent is never trusted
     const { genericProductBrandId } = body;
     console.log("sellerId", sellerId);
     console.log("body", body);
@@ -866,7 +878,8 @@ export async function updateSubmission(req, res) {
         priceBasis: body.priceBasis ?? existing.price_basis,
         gstInclusive: body.gstInclusive ?? existing.gst_inclusive_input,
         freightIncluded: body.freightIncluded ?? existing.freight_included,
-        marketingCommissionPercent: body.marketingCommissionPercent ?? existing.marketing_commission_percent,
+        marketingServices: Array.isArray(body.marketingServices) ? body.marketingServices : null,
+        marketingCommissionPercent: existing.marketing_commission_percent, // never client-controlled
 
         sampleAvailable: body.sampleAvailable ?? existing.sample_available,
         sampleQuantity: body.sampleQuantity ?? existing.sample_quantity,

@@ -14,7 +14,7 @@ export async function getWalletStatus(req, res) {
 export async function getWalletTransactions(req, res) {
     const { data, error } = await supabase
         .from("wallet_transactions")
-        .select("id, order_id, type, amount, billing_period, note, created_at")
+        .select("id, order_id, type, amount, billing_period, note, breakdown, created_at")
         .eq("seller_id", req.sellerId)
         .order("created_at", { ascending: false })
         .limit(100);

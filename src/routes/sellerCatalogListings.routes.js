@@ -19,6 +19,7 @@ import {
     setSubmissionActive,
     deleteSubmission,
 } from "../controllers/sellerCatalogListings.controller.js";
+import { bulkUpdateMarketing } from "../controllers/sellerMarketing.controller.js";
 import {
     getListingAccess, setVisibilityMode, addVisibilityBuyer,
     removeVisibilityBuyer, searchEligibleBuyersForSeller,
@@ -51,6 +52,8 @@ router.post("/listings", requireAuth, requireApprovedSeller, createListingForExi
 router.patch("/submissions/:id", requireAuth, requireApprovedSeller, updateSubmission);
 router.delete("/submissions/:id", requireAuth, requireApprovedSeller, deleteSubmission);
 router.patch("/submissions/:id/active", requireAuth, requireApprovedSeller, setSubmissionActive);
+
+router.patch("/marketing/bulk", requireAuth, requireApprovedSeller, bulkUpdateMarketing);
 
 router.get("/submissions/:id/access", requireAuth, requireApprovedSeller, getListingAccess);
 router.patch("/submissions/:id/visibility-mode", requireAuth, requireApprovedSeller, setVisibilityMode);
