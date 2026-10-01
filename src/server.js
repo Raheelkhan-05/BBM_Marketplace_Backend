@@ -7,6 +7,7 @@ import { verifyMailer } from "./config/mailer.js";
 import { verifyAuthToken } from "./middleware/auth.middleware.js";
 import { registerChatSocket } from "./socket/chatSocket.js";
 import { setIO, attachRedisAdapter } from "./socket/io.js";
+import { startListingExpiryScheduler } from "./services/listingExpiry.service.js";
 
 const PORT = process.env.PORT || 4000;
 const app = createApp();
@@ -60,4 +61,5 @@ async function start() {
   });
 }
 
+startListingExpiryScheduler();
 start();

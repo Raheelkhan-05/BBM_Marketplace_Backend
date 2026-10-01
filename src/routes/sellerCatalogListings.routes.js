@@ -18,6 +18,7 @@ import {
     updateSubmission,
     setSubmissionActive,
     deleteSubmission,
+    refreshSubmission,
 } from "../controllers/sellerCatalogListings.controller.js";
 import { bulkUpdateMarketing } from "../controllers/sellerMarketing.controller.js";
 import {
@@ -59,6 +60,7 @@ router.get("/submissions/:id/access", requireAuth, requireApprovedSeller, getLis
 router.patch("/submissions/:id/visibility-mode", requireAuth, requireApprovedSeller, setVisibilityMode);
 router.post("/submissions/:id/visibility/buyers", requireAuth, requireApprovedSeller, addVisibilityBuyer);
 router.delete("/submissions/:id/visibility/buyers/:buyerId", requireAuth, requireApprovedSeller, removeVisibilityBuyer);
+router.post("/submissions/:id/refresh", requireAuth, requireApprovedSeller, refreshSubmission);
 router.get("/buyers/search", requireAuth, requireApprovedSeller, searchEligibleBuyersForSeller);
 
 router.get("/templates", requireAuth, requireApprovedSeller, listTemplates);

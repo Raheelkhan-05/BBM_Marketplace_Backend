@@ -288,14 +288,12 @@ export async function getBrandItemSellerOffer(req, res) {
         p_buyer_id: req.user?.id || null,
     });
 
-    if (!data.found) return res.status(404).json({ success: false, code: "LISTING_GONE", message: "This seller no longer has this listing available." });
-
     if (error) {
         console.error("[catalog] getBrandItemSellerOffer failed:", error.message);
         return res.status(500).json({ success: false, message: "Couldn't load this offer right now." });
     }
     if (!data?.item) return res.status(404).json({ success: false, message: "Product not found." });
-    if (!data.found) return res.status(404).json({ success: false, message: "This seller no longer has this listing available." });
+    if (!data.found) return res.status(404).json({ success: false, code: "LISTING_GONE", message: "This seller no longer has this listing available." });
     return res.json({ success: true, item: data.item, offer: data.offer });
 }
 
@@ -333,6 +331,7 @@ export async function getLowestPriceForBrandItem(req, res) {
         .eq("generic_product_brand_id", genericProductBrandId)
         .eq("review_status", "approved")
         .eq("is_active", true)
+        .or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`)
         .not("price", "is", null);
 
     if (error) return res.status(500).json({ success: false, message: error.message });

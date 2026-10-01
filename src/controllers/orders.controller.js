@@ -4,6 +4,7 @@ import { notifyUser, notifyOrderChanged, notifyUserOrdersChanged } from "../serv
 import { sendOrderUpdateWhatsApp } from "../services/whatsapp.service.js";
 import { notifyIfWalletJustBlocked } from "../services/walletNotifications.service.js";
 import { fetchCustomPriceMap, resolveEffectiveBasePrice } from "../../shared/customPricing.js";
+import { isListingExpired } from "../../shared/listingValidity.js";
 
 import { getRoadDistanceKm } from "../services/pincodeDistance.js";
 import { purchaseQtyToSaleUnitQty, saleUnitQtyToBaseUnits, getSaleUnit, saleUnitLabel, round2 } from "../../shared/packUnits.js";
@@ -290,6 +291,7 @@ export async function getOrderQuote(req, res) {
             sample_available, sample_quantity, sample_price, generic_product_brand_id,
             marketing_commission_percent, gst_percent,
             seller_id,
+            expires_at, expired_at,
             seller:seller_profiles!seller_product_submissions_seller_id_fkey (
                 working_days, order_acceptance_start, order_acceptance_end, holidays,
                 pincode, state, dispatch_pincode, dispatch_state, dispatch_same_as_registered
@@ -297,7 +299,7 @@ export async function getOrderQuote(req, res) {
         `)
         .eq("id", submissionId).maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
-    if (!submission || submission.review_status !== "approved") {
+    if (!submission || submission.review_status !== "approved" || isListingExpired(submission)) {
         return res.status(404).json({ success: false, message: "Listing not available." });
     }
 
@@ -507,9 +509,13 @@ export async function placeOrder(req, res) {
 
     const { data: constraintRow } = await supabase
         .from("seller_product_submissions")
-        .select("dispatching_locations")
+        .select("dispatching_locations, expires_at, expired_at")
         .eq("id", submissionId)
         .maybeSingle();
+
+    if (isListingExpired(constraintRow)) {
+        return res.status(400).json({ success: false, code: "LISTING_EXPIRED", message: "This listing is no longer available. The seller's validity period for it has ended." });
+    }
 
     if (constraintRow) {
         const { data: address } = await supabase.from("buyer_addresses").select("state, city").eq("id", shippingAddressId).maybeSingle();
@@ -849,6 +855,7 @@ export async function getOfferForResume(req, res) {
             payment_terms, return_policy, warranty, delivery_timeline, freight_included, price_basis,
             generic_product_brand_id, product_name, brand_name,
             seller_id,
+            expires_at, expired_at,
             seller:seller_profiles!seller_product_submissions_seller_id_fkey (
                 id, display_name, transport_options,
                 pincode, state, dispatch_pincode, dispatch_district, dispatch_state, dispatch_same_as_registered
@@ -858,7 +865,7 @@ export async function getOfferForResume(req, res) {
         .maybeSingle();
 
     if (error) return res.status(500).json({ success: false, message: error.message });
-    if (!submission || submission.review_status !== "approved") {
+    if (!submission || submission.review_status !== "approved" || isListingExpired(submission)) {
         return res.status(404).json({ success: false, message: "This listing is no longer available." });
     }
 

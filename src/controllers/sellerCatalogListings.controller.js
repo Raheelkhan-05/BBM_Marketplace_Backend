@@ -74,7 +74,8 @@
 //      is the one that created the brand item, so re-submissions of an
 //      already-approved item (the pre-existing autoApprove path) don't
 //      also fire this "needs mapping" notice a second time.
-import { supabase } from "../config/supabase.js";
+import { supabase, supabaseAdmin } from "../config/supabase.js";
+import { isValidValidityHours, resolveValidityHours, computeExpiry, isListingExpired } from "../../shared/listingValidity.js";
 import { notifyAdmins, notifyAdminSubmissionsChanged, notifyUser, notifySellerSubmissionsChanged } from "../services/notifications.service.js";
 import { slugify } from "../services/slugify.js";
 import { publishListingChange, publishListingRemoved } from "../services/listingRealtime.service.js";
@@ -98,7 +99,7 @@ const PRICE_BASES = ["per_unit", "per_pack", "per_master_pack"];
 const GROUP_FIELD_MAP = {
     delivery: ["dispatchPincode", "dispatchingLocations", "freightIncluded"],
     tax_legal: ["hsnCode", "gstPercent", "gstInclusive", "returnPolicyKey", "warrantyKey"],
-    commercial_terms: ["priceBasis", "marketingServices"],
+    commercial_terms: ["priceBasis", "marketingServices", "validityHours"],
 };
 
 // Applies the seller's in-form buyer-access/pricing draft right after a
@@ -192,6 +193,7 @@ async function notifySellerListingLive(sellerId, submissionId, displayName) {
 const SUBMISSION_LIST_COLUMNS = `
     id, created_at, updated_at, review_status, rejection_reason,
     reviewed_at, is_active, generic_product_brand_id,
+    validity_hours, valid_from, expires_at, expired_at,
     product_name, brand_name, image, price, base_price, gst_percent, moq, unit,
     pack_size, units_per_master_pack, marketing_commission_percent, marketing_services, marketing_legacy_percent,
     stock_type, stock_quantity, production_lead_time_days, lead_time, visibility_mode,
@@ -278,6 +280,18 @@ async function createBrandItem({ productName, brandName, brandImage, brandNotApp
     throw error;
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function liveClock(hours, nowMs = Date.now()) {
+    return {
+        valid_from: new Date(nowMs).toISOString(),
+        expires_at: computeExpiry(nowMs, hours).toISOString(),
+        expired_at: null,
+    };
+}
+// Not live yet: the DB trigger starts the clock when admin approves.
+const PENDING_CLOCK = { valid_from: null, expires_at: null, expired_at: null };
+
 /* ------------------------- validation ------------------------- */
 
 function validateListingPayload(body) {
@@ -316,6 +330,9 @@ function validateListingPayload(body) {
 
     if (!body.returnPolicyKey?.trim()) missing.push("Return / replacement policy");
     if (!body.warrantyKey?.trim()) missing.push("Warranty");
+    if (body.validityHours != null && body.validityHours !== "" && !isValidValidityHours(body.validityHours)) {
+        missing.push("Listing validity");
+    }
 
     return missing;
 }
@@ -361,6 +378,7 @@ function toListingRow(body, brand, sellerDispatch) {
         price_basis: body.priceBasis,
         gst_inclusive_input: Boolean(body.gstInclusive),
         freight_included: Boolean(body.freightIncluded),
+        validity_hours: resolveValidityHours(body.validityHours),
         ...(Array.isArray(body.marketingServices)
             ? resolveMarketingFields(body.marketingServices)
             : { marketing_commission_percent: Number(body.marketingCommissionPercent) }), // legacy carry-over, services untouched
@@ -486,8 +504,8 @@ export async function createSubmission(req, res) {
     row.warranty = warrantyText;
 
     const statusPatch = autoApprove
-        ? { review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: null, rejection_reason: null }
-        : { review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null };
+        ? { review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: null, rejection_reason: null, ...liveClock(row.validity_hours) }
+        : { review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null, ...PENDING_CLOCK };
 
     let inserted, error;
     if (existingRow) {
@@ -699,8 +717,8 @@ export async function createListingForExistingBrand(req, res) {
     row.warranty = warrantyText;
 
     const statusPatch = autoApprove
-        ? { review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: null, rejection_reason: null }
-        : { review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null };
+        ? { review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: null, rejection_reason: null, ...liveClock(row.validity_hours) }
+        : { review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null, ...PENDING_CLOCK };
 
     let result, error;
     if (existingRow) {
@@ -878,6 +896,7 @@ export async function updateSubmission(req, res) {
         priceBasis: body.priceBasis ?? existing.price_basis,
         gstInclusive: body.gstInclusive ?? existing.gst_inclusive_input,
         freightIncluded: body.freightIncluded ?? existing.freight_included,
+        validityHours: body.validityHours ?? existing.validity_hours,
         marketingServices: Array.isArray(body.marketingServices) ? body.marketingServices : null,
         marketingCommissionPercent: existing.marketing_commission_percent, // never client-controlled
 
@@ -927,11 +946,17 @@ export async function updateSubmission(req, res) {
         ? {}
         : { review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null };
 
+    // Changing validity on a live listing restarts its countdown from now.
+    // An already-expired listing only stores the new value; it takes effect on Refresh.
+    const validityChanged = Number(row.validity_hours) !== Number(existing.validity_hours);
+    const clockPatch = staysApproved && validityChanged && !existing.expired_at ? liveClock(row.validity_hours) : {};
+
     const { data: updated, error } = await supabase
         .from("seller_product_submissions")
-        .update({ ...row, ...statusPatch })
+        .update({ ...row, ...statusPatch, ...clockPatch })
         .eq("id", id).eq("seller_id", sellerId)
-        .select("id, created_at, price").single();
+        .select("id, created_at, price, validity_hours, valid_from, expires_at, expired_at").single();
+
     if (error) return res.status(500).json({ success: false, message: error.message });
 
     await autoSaveSellerDefaults(sellerId, body);
@@ -968,6 +993,18 @@ export async function setSubmissionActive(req, res) {
         return res.status(400).json({ success: false, message: "isActive must be true or false." });
     }
 
+    if (isActive) {
+        const { data: cur, error: curErr } = await supabase
+            .from("seller_product_submissions")
+            .select("expires_at, expired_at")
+            .eq("id", id).eq("seller_id", sellerId).maybeSingle();
+        if (curErr) return res.status(500).json({ success: false, message: curErr.message });
+        if (!cur) return res.status(404).json({ success: false, message: "Submission not found." });
+        if (isListingExpired(cur)) {
+            return res.status(409).json({ success: false, code: "LISTING_EXPIRED", message: "This listing's validity has ended. Refresh it to take it live again." });
+        }
+    }
+
     const { data: updated, error } = await supabase
         .from("seller_product_submissions")
         .update({ is_active: isActive })
@@ -993,4 +1030,38 @@ export async function deleteSubmission(req, res) {
     publishListingRemoved({ submissionId: id, brandItemId: deleted.generic_product_brand_id, sellerId });
     await notifyAdminSubmissionsChanged();
     res.json({ success: true, message: "Listing deleted." });
+}
+
+// POST /api/seller/catalog/submissions/:id/refresh   body: { validityHours? }
+export async function refreshSubmission(req, res) {
+    const sellerId = req.sellerId;
+    const { id } = req.params;
+    if (!UUID_RE.test(String(id))) return res.status(400).json({ success: false, message: "Invalid listing." });
+
+    const raw = req.body?.validityHours;
+    let hours = null;
+    if (raw !== undefined && raw !== null && raw !== "") {
+        if (!isValidValidityHours(raw)) return res.status(400).json({ success: false, message: "Please choose a valid listing validity." });
+        hours = Number(raw);
+    }
+
+    const { data, error } = await supabaseAdmin.rpc("refresh_listing_validity", {
+        p_submission_id: id, p_seller_id: sellerId, p_validity_hours: hours,
+    });
+    if (error) {
+        console.error("[sellerListings] refreshSubmission failed:", error.message);
+        return res.status(500).json({ success: false, message: "Couldn't refresh this listing. Please try again." });
+    }
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) return res.status(404).json({ success: false, message: "Listing not found, or it isn't approved yet." });
+
+    void publishListingChange(id);
+    res.json({
+        success: true,
+        submission: {
+            id: row.out_id, is_active: row.out_is_active, validity_hours: row.out_validity_hours,
+            valid_from: row.out_valid_from, expires_at: row.out_expires_at, expired_at: row.out_expired_at,
+        },
+        message: "Listing refreshed. It's live again.",
+    });
 }

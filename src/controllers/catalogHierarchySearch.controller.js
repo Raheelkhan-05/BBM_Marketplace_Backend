@@ -45,6 +45,9 @@ function escapeIlike(term) {
     return term.replace(/[%_\\]/g, (m) => `\\${m}`);
 }
 
+// Hides listings whose validity has ended, even before the sweep flips them off.
+const notExpired = (q) => q.or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
+
 // Plain %term% ILIKE pattern (safe to pass to .ilike(), which takes the
 // pattern as its own argument and never shares a string with other
 // filters — no comma-escaping needed here, just the wildcard escaping).
@@ -201,12 +204,13 @@ export async function searchBrandItemsV2(req, res) {
     }
 
     const ids = brandItems.map((b) => b.id);
-    const { data: listings, error: listErr } = await supabase
-        .from("seller_product_submissions")
-        .select("generic_product_brand_id, price")
-        .in("generic_product_brand_id", ids)
-        .eq("review_status", "approved")
-        .eq("is_active", true);
+    const { data: listings, error: listErr } = await notExpired(
+        supabase.from("seller_product_submissions")
+            .select("generic_product_brand_id, price")
+            .in("generic_product_brand_id", ids)
+            .eq("review_status", "approved")
+            .eq("is_active", true)
+    );
     if (listErr) return res.status(500).json({ success: false, message: listErr.message });
 
     const statsByBrand = {};
@@ -245,6 +249,9 @@ export async function searchSellersForBrandItemV2(req, res) {
         .eq("is_active", true)
         .order("price", { ascending: true })
         .range(off, off + lim);
+
+    query = notExpired(query);
+
     if (q.trim()) query = query.ilike("seller.display_name", ilikePattern(q.trim()));
     if (req.sellerId) query = query.neq("seller_id", req.sellerId);
 
@@ -676,12 +683,13 @@ export async function searchProductsMergedV2(req, res) {
     }
 
     const ids = page.map((b) => b.id);
-    const { data: listings, error: listErr } = await supabase
-        .from("seller_product_submissions")
-        .select("generic_product_brand_id, price, unit, pack_size, units_per_master_pack, gst_percent, stock_type, stock_quantity")
-        .in("generic_product_brand_id", ids)
-        .eq("review_status", "approved")
-        .eq("is_active", true);
+    const { data: listings, error: listErr } = await notExpired(
+        supabase.from("seller_product_submissions")
+            .select("generic_product_brand_id, price, unit, pack_size, units_per_master_pack, gst_percent, stock_type, stock_quantity")
+            .in("generic_product_brand_id", ids)
+            .eq("review_status", "approved")
+            .eq("is_active", true)
+    );
     if (listErr) return res.status(500).json({ success: false, message: listErr.message });
 
     const lowestByBrand = {};
