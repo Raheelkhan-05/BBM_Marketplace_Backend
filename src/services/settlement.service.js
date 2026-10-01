@@ -10,6 +10,7 @@
 // API call where the comment says so — the ledger rows stay as the audit trail.
 import { supabase } from "../config/supabase.js";
 import { notifyUser, notifyOrderChanged, notifyUserOrdersChanged } from "./realtimeBroadcast.js";
+import { startOrderExpiryScheduler } from "./orderExpiry.service.js";
 
 const SWEEP_INTERVAL_MS = 60 * 1000;
 const BATCH_SIZE = 100;
@@ -41,6 +42,14 @@ export async function releaseDueSettlements() {
         }
     }
     return released;
+}
+
+export function startSettlementScheduler() {
+    startOrderExpiryScheduler();
+    tick();
+    const timer = setInterval(tick, SWEEP_INTERVAL_MS);
+    timer.unref?.();
+    return timer;
 }
 
 async function tick() {

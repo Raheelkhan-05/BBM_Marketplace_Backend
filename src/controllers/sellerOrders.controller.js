@@ -48,6 +48,7 @@ export async function listSellerOrders(req, res) {
       buyer_transport_mode, transport_mode, transport_fields, transport_route_option_id,
       ship_lr_number, ship_bill_url, ship_details_confirmed_at,
       delivered_at, dispute_status, dispute_window_ends_at, settlement_status, settlement_seller_amount, cancel_reason_code, cancel_reason_text,
+      seller_response_due_at, auto_rejected_at, auto_refund_amount,
       items:order_items (
         id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied,
         discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total,
@@ -105,8 +106,13 @@ function transitionHandler(newStatus) {
             p_new_status: newStatus, p_note: reason || null,
         });
         if (error) {
-            const status = { FORBIDDEN: 403, ORDER_NOT_FOUND: 404, INVALID_TRANSITION: 400 }[error.message] || 500;
-            return res.status(status).json({ success: false, code: error.message, message: status === 400 ? "That status change isn't allowed right now." : "Couldn't update the order." });
+            const status = { FORBIDDEN: 403, ORDER_NOT_FOUND: 404, INVALID_TRANSITION: 400, ORDER_EXPIRED: 400 }[error.message] || 500;
+            return res.status(status).json({
+                success: false, code: error.message,
+                message: error.message === "ORDER_EXPIRED"
+                    ? "The 24-hour window to accept this order has passed. It's being marked as not accepted."
+                    : status === 400 ? "That status change isn't allowed right now." : "Couldn't update the order.",
+            });
         }
 
         if (newStatus === "rejected") {

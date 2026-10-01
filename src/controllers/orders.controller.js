@@ -692,6 +692,7 @@ export async function listMyOrders(req, res) {
       buyer_transport_mode, transport_mode, transport_fields, transport_notes, transport_proof_url, transport_confirmed_at, transport_source,
       seller:seller_profiles ( id, display_name, shop_slug, logo_url, city, state ),
       delivered_at, dispute_status, dispute_window_ends_at, settlement_status, settlement_seller_amount, cancel_reason_code, cancel_reason_text,
+      seller_response_due_at, auto_rejected_at, auto_refund_amount,
       items:order_items (
         id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied,
         discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total,

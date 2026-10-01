@@ -5,6 +5,8 @@
 
 export const DISPUTE_WINDOW_LABEL = "48 hours"; // display only — the real value is dispute_window_hours() in SQL
 
+export const SELLER_RESPONSE_WINDOW_LABEL = "24 hours"; // display only — real value is seller_response_hours() in SQL
+
 // Buyer may cancel only before the seller confirms.
 export const CANCELLABLE_STATUSES = ["awaiting_payment", "pending_confirmation"];
 
