@@ -25,6 +25,11 @@ import { notifyUser, notifySellerProfileChanged } from "../services/notification
 import adminDbRoutes from "./adminDb.routes.js";
 import { downloadFullCatalogTemplate, bulkUploadFullCatalog } from "../controllers/adminCatalogFullBulk.controller.js";
 import productCommissionRoutes from "./productCommission.routes.js";
+import {
+  adminListDisputes, adminGetDispute, adminStartReview, adminPostMessage,
+  adminResolveDispute, adminListLedger, adminRunSettlementSweep,
+} from "../controllers/adminDisputes.controller.js";
+
 // NEW — these two functions already existed in wallet.controller.js but were
 // never imported/mounted here, which is why there was no admin route to
 // verify wallet top-ups. Wiring them in now.
@@ -78,6 +83,15 @@ router.post("/payment-proofs/:id/reject", requireAuth, requireAdmin, authWriteLi
 // Mirrors the order payment-proofs routes above, but for wallet_payments.
 router.get("/wallet/payments", requireAuth, requireAdmin, adminListWalletPayments);
 router.post("/wallet/payments/:id/verify", requireAuth, requireAdmin, authWriteLimiter, adminVerifyWalletPayment);
+
+router.get("/disputes", requireAuth, requireAdmin, adminListDisputes);
+router.get("/disputes/ledger", requireAuth, requireAdmin, adminListLedger);
+router.post("/disputes/settlements/run", requireAuth, requireAdmin, authWriteLimiter, adminRunSettlementSweep);
+router.get("/disputes/:id", requireAuth, requireAdmin, adminGetDispute);
+router.post("/disputes/:id/review", requireAuth, requireAdmin, authWriteLimiter, adminStartReview);
+router.post("/disputes/:id/message", requireAuth, requireAdmin, authWriteLimiter, adminPostMessage);
+router.post("/disputes/:id/resolve", requireAuth, requireAdmin, authWriteLimiter, adminResolveDispute);
+
 
 router.get("/catalog-bulk/excel-template", requireAuth, requireAdmin, downloadFullCatalogTemplate);
 router.post("/catalog-bulk/excel-upload", requireAuth, requireAdmin, upload.single("file"), bulkUploadFullCatalog);

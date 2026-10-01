@@ -27,7 +27,7 @@ function whatsappHeadlineForStatus(newStatus, orderNumber) {
         confirmed: `Your order #${orderNumber} has been confirmed by the seller.`,
         rejected: `Your order #${orderNumber} was rejected by the seller.`,
         shipped: `Your order #${orderNumber} has been shipped.`,
-        delivered: `Your order #${orderNumber} has been delivered.`,
+        delivered: `Your order #${orderNumber} has been delivered. You can report an issue within 48 hours.`,
     };
     return map[newStatus] || `Your order #${orderNumber} status changed to ${newStatus.replace("_", " ")}.`;
 }
@@ -47,6 +47,7 @@ export async function listSellerOrders(req, res) {
       shipping_address_snapshot, buyer_notes, created_at, updated_at,
       buyer_transport_mode, transport_mode, transport_fields, transport_route_option_id,
       ship_lr_number, ship_bill_url, ship_details_confirmed_at,
+      delivered_at, dispute_status, dispute_window_ends_at, settlement_status, settlement_seller_amount, cancel_reason_code, cancel_reason_text,
       items:order_items (
         id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied,
         discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total,
@@ -54,7 +55,7 @@ export async function listSellerOrders(req, res) {
         submission:seller_product_submissions ( freight_terms )
       )
     `)
-        .eq("seller_id", req.sellerId).neq("status", "awaiting_payment").order("created_at", { ascending: false });
+        .eq("seller_id", req.sellerId).neq("status", "awaiting_payment").or("status.neq.cancelled,payment_status.neq.unpaid,payment_method.eq.credit").order("created_at", { ascending: false });
     if (status) query = query.eq("status", status);
     if (orderType) query = query.eq("order_type", orderType);
 
@@ -81,7 +82,7 @@ export async function getSellerOrder(req, res) {
         submission:seller_product_submissions ( freight_terms )
       )
     `)
-        .eq("id", req.params.id).eq("seller_id", req.sellerId).neq("status", "awaiting_payment").maybeSingle();
+        .eq("id", req.params.id).eq("seller_id", req.sellerId).neq("status", "awaiting_payment").or("status.neq.cancelled,payment_status.neq.unpaid,payment_method.eq.credit").maybeSingle();
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!order) return res.status(404).json({ success: false, message: "Order not found." });
 
