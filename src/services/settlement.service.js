@@ -66,10 +66,3 @@ async function tick() {
         running = false;
     }
 }
-
-export function startSettlementScheduler() {
-    tick(); // catch up immediately after a restart / downtime
-    const timer = setInterval(tick, SWEEP_INTERVAL_MS);
-    timer.unref?.();
-    return timer;
-}
