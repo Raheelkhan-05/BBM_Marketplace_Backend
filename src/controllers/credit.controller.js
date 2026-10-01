@@ -516,7 +516,7 @@ export async function updateCreditLimit(req, res) {
     notifyUser(credit.buyer_id, {
         type: "credit_decision", title: "Credit limit updated",
         body: "Your seller has updated your monthly credit limit.",
-        link: creditLink(enabled ? "approved" : "sellers", credit?.id),
+        link: creditLink("approved", credit.id),
     });
 }
 
