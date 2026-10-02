@@ -304,7 +304,7 @@ export async function searchCreditBuyers(req, res) {
     if (term.length < 3) return res.json({ success: true, buyers: [] });
 
     const digits = term.replace(/\D/g, "");
-    const phoneLike = /^[\d\s+\-]+$/.test(term) && digits.length >= 4;
+    const phoneLike = /^[\d\s+\-]+$/.test(term) && digits.length >= 3;
 
     let ids = [];
     try {
@@ -359,8 +359,10 @@ export async function searchCreditBuyers(req, res) {
                 businessName: info.businessName,
                 location: info.location,
                 logoUrl: info.logoUrl,
-                phone: maskPhone(info.phone),
-                email: maskEmail(info.email),
+                // phone: maskPhone(info.phone),
+                // email: maskEmail(info.email),
+                phone: info.phone,
+                email: info.email,
                 credit: c
                     ? { id: c.id, status: c.status, credit_limit: c.credit_limit, credit_used: c.credit_used }
                     : null,
