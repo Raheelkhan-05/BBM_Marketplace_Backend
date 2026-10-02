@@ -5,7 +5,7 @@ export function optionalAuth(req, res, next) {
     const token = header.startsWith("Bearer ") ? header.slice(7) : null;
     // console.log("token", token);
 
-    if (!token) { console.log("optionalAuth: no token"); req.user = null; return next(); }
+    // if (!token) { console.log("optionalAuth: no token"); req.user = null; return next(); }
 
     try {
         req.user = verifyAuthToken(token);
