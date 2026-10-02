@@ -71,6 +71,52 @@ function pickBuyerCredit(c) {
     };
 }
 
+// Finds (or creates) the 1:1 chat between two users and returns its id.
+async function ensureDirectConversation(userA, userB) {
+    const [a, b] = [userA, userB].sort();
+    const { data: existing } = await supabase
+        .from("chat_conversations").select("id")
+        .eq("is_group", false).eq("direct_user_a", a).eq("direct_user_b", b)
+        .maybeSingle();
+    if (existing) return existing.id;
+
+    const { data: created, error: createErr } = await supabase
+        .from("chat_conversations")
+        .insert({ is_group: false, direct_user_a: a, direct_user_b: b })
+        .select("id").single();
+    if (createErr) throw createErr;
+
+    const { error: partErr } = await supabase
+        .from("chat_participants")
+        .insert([{ conversation_id: created.id, user_id: a }, { conversation_id: created.id, user_id: b }]);
+    if (partErr) throw partErr;
+
+    invalidateParticipants(created.id);
+    return created.id;
+}
+
+// A buyer the seller can proactively extend credit to: a real, finished,
+// fully-verified, non-deleted user account. Used by BOTH search and grant so
+// the rules can never drift apart.
+function eligibleBuyers(selectCols, excludeUserId) {
+    return supabase
+        .from("profiles")
+        .select(selectCols)
+        .eq("role", "user")
+        .eq("phone_verified", true)
+        .eq("email_verified", true)
+        .eq("onboarding_step", "done")
+        .is("deleted_at", null)
+        .neq("id", excludeUserId);
+}
+
+const maskEmail = (e) => {
+    if (!e || !e.includes("@")) return null;
+    const [user, domain] = e.split("@");
+    return `${user.slice(0, 2)}${"*".repeat(Math.max(user.length - 2, 1))}@${domain}`;
+};
+const maskPhone = (p) => (p ? `${"*".repeat(Math.max(p.length - 4, 0))}${p.slice(-4)}` : null);
+
 // ---- GET /api/credit/status (unchanged; still used by chat + BuyNowModal) ---
 // Three ways to call it:
 //   ?sellerId=<seller_profiles.id>        — buyer's perspective
@@ -137,7 +183,7 @@ export async function getCreditStatus(req, res) {
     res.json({ success: true, credit: data || null, viewerRole, buyerInfo });
 }
 
-// ---- NEW: Credit page data ------------------------------------------------
+// ---- Credit page data ------------------------------------------------------
 
 // GET /api/credit/sellers — every approved seller EXCEPT the caller's own
 // shop, each with the caller's credit state (if any) as a buyer.
@@ -237,6 +283,202 @@ export async function listCreditHistory(req, res) {
     });
 
     res.json({ success: true, events, hasMore });
+}
+
+// ---- seller: find a buyer to approve directly ----------------------------
+
+// GET /api/credit/buyers/search?q=<phone | email | shop name>
+// Seller-only. Only real, finished, fully-verified, non-deleted accounts
+// are ever returned. Contact details are masked in the response.
+export async function searchCreditBuyers(req, res) {
+    const myId = req.user.id;
+
+    const { data: sp } = await supabase
+        .from("seller_profiles").select("id")
+        .eq("user_id", myId).eq("status", "approved").is("deleted_at", null)
+        .maybeSingle();
+    if (!sp) return res.status(403).json({ success: false, message: "Only approved sellers can search for buyers." });
+
+    // Strip characters that have meaning inside PostgREST filters / LIKE patterns.
+    const term = String(req.query.q || "").slice(0, 80).replace(/[%,()\\*]/g, " ").replace(/\s+/g, " ").trim();
+    if (term.length < 3) return res.json({ success: true, buyers: [] });
+
+    const digits = term.replace(/\D/g, "");
+    const phoneLike = /^[\d\s+\-]+$/.test(term) && digits.length >= 4;
+
+    let ids = [];
+    try {
+        if (phoneLike) {
+            // Accept "+91 98765…" / "91987…" by matching on the trailing 10 digits.
+            const phoneTerm = digits.length >= 12 && digits.startsWith("91") ? digits.slice(2) : digits;
+            const { data, error } = await eligibleBuyers("id", myId).ilike("phone", `%${phoneTerm}%`).limit(10);
+            if (error) throw error;
+            ids = (data || []).map((p) => p.id);
+        } else {
+            const [byEmail, byBusiness] = await Promise.all([
+                eligibleBuyers("id", myId).ilike("email", `%${term}%`).limit(10),
+                supabase.from("business_profiles")
+                    .select("user_id")
+                    .or(`display_name.ilike.%${term}%,legal_name.ilike.%${term}%,trade_name.ilike.%${term}%`)
+                    .limit(30),
+            ]);
+            if (byEmail.error) throw byEmail.error;
+            if (byBusiness.error) throw byBusiness.error;
+
+            const businessUserIds = [...new Set((byBusiness.data || []).map((b) => b.user_id).filter(Boolean))];
+            let businessEligible = [];
+            if (businessUserIds.length) {
+                // Re-apply the eligibility rules to the business matches.
+                const { data, error } = await eligibleBuyers("id", myId).in("id", businessUserIds).limit(20);
+                if (error) throw error;
+                businessEligible = data || [];
+            }
+            ids = [...new Set([...(byEmail.data || []).map((p) => p.id), ...businessEligible.map((p) => p.id)])];
+        }
+    } catch (e) {
+        console.error("[credit] buyer search failed:", e.message);
+        return res.status(500).json({ success: false, message: "Search failed. Please try again." });
+    }
+
+    if (!ids.length) return res.json({ success: true, buyers: [] });
+
+    const [infoMap, { data: credits }] = await Promise.all([
+        getBuyerInfoMap(ids),
+        supabase.from("buyer_seller_credit").select("*").eq("seller_id", sp.id).in("buyer_id", ids),
+    ]);
+    const creditByBuyer = new Map((credits || []).map((c) => [c.buyer_id, c]));
+
+    const buyers = ids
+        .map((id) => {
+            const info = infoMap.get(id);
+            if (!info) return null;
+            const c = creditByBuyer.get(id);
+            return {
+                buyerId: id,
+                name: info.name,
+                businessName: info.businessName,
+                location: info.location,
+                logoUrl: info.logoUrl,
+                phone: maskPhone(info.phone),
+                email: maskEmail(info.email),
+                credit: c
+                    ? { id: c.id, status: c.status, credit_limit: c.credit_limit, credit_used: c.credit_used }
+                    : null,
+            };
+        })
+        .filter(Boolean)
+        .sort((a, b) => (a.businessName || a.name || "").localeCompare(b.businessName || b.name || ""))
+        .slice(0, 10);
+
+    res.json({ success: true, buyers });
+}
+
+// POST /api/credit/grant  { buyerId, creditLimit }
+// Seller approves a buyer directly, without the buyer having asked first.
+export async function grantCredit(req, res) {
+    const { buyerId, creditLimit } = req.body || {};
+    const limit = Number(creditLimit);
+    if (!buyerId || !(limit > 0)) {
+        return res.status(400).json({ success: false, message: "Pick a buyer and set a credit limit." });
+    }
+    if (buyerId === req.user.id) {
+        return res.status(400).json({ success: false, message: "You can't give credit to your own shop." });
+    }
+
+    const { data: sp } = await supabase
+        .from("seller_profiles").select("id")
+        .eq("user_id", req.user.id).eq("status", "approved").is("deleted_at", null)
+        .maybeSingle();
+    if (!sp) return res.status(403).json({ success: false, message: "Only approved sellers can grant credit." });
+
+    // Same eligibility rules as search — never trust the client's pick.
+    const { data: buyer } = await eligibleBuyers("id", req.user.id).eq("id", buyerId).maybeSingle();
+    if (!buyer) {
+        return res.status(400).json({ success: false, code: "BUYER_NOT_ELIGIBLE", message: "This buyer isn't available for credit." });
+    }
+
+    const { data: existing } = await supabase
+        .from("buyer_seller_credit").select("*")
+        .eq("buyer_id", buyerId).eq("seller_id", sp.id)
+        .maybeSingle();
+
+    if (existing?.status === "approved") {
+        return res.status(409).json({
+            success: false, code: "ALREADY_APPROVED",
+            message: "Credit is already approved for this buyer. Use \"Change limit\" to adjust it.",
+        });
+    }
+
+    let creditId;
+    let conversationId = existing?.conversation_id || null;
+
+    if (existing?.status === "pending") {
+        // The buyer already asked — resolve it the normal way (updates their chat card too).
+        const { error } = await supabase.rpc("decide_credit", {
+            p_credit_id: existing.id, p_seller_user_id: req.user.id,
+            p_decision: "approved", p_credit_limit: limit,
+        });
+        if (error) {
+            console.error("grantCredit decide_credit failed:", error);
+            return res.status(400).json({ success: false, message: "Couldn't approve this buyer. Please try again." });
+        }
+        creditId = existing.id;
+    } else {
+        try {
+            if (!conversationId) conversationId = await ensureDirectConversation(req.user.id, buyerId);
+        } catch (e) {
+            console.error("grantCredit conversation failed:", e.message);
+            return res.status(500).json({ success: false, message: "Couldn't set up the chat with this buyer." });
+        }
+
+        const patch = {
+            status: "approved",
+            credit_limit: limit,
+            credit_used: 0,
+            cooldown_until: null,
+            limit_increase_requested_at: null,
+            limit_increase_request_message_id: null,
+            limit_increase_cooldown_until: null,
+            conversation_id: conversationId,
+        };
+
+        if (existing) {
+            // Previously declined or turned off — re-approve with a fresh limit.
+            const { error } = await supabase.from("buyer_seller_credit").update(patch).eq("id", existing.id);
+            if (error) {
+                console.error("grantCredit update failed:", error);
+                return res.status(500).json({ success: false, message: "Couldn't approve this buyer. Please try again." });
+            }
+            creditId = existing.id;
+        } else {
+            const { data: created, error } = await supabase
+                .from("buyer_seller_credit")
+                .insert({ buyer_id: buyerId, seller_id: sp.id, ...patch })
+                .select("id").single();
+            if (error) {
+                console.error("grantCredit insert failed:", error);
+                return res.status(500).json({ success: false, message: "Couldn't approve this buyer. Please try again." });
+            }
+            creditId = created.id;
+        }
+    }
+
+    await trackCreditEvent({
+        creditId, buyerId, sellerId: sp.id, sellerUserId: req.user.id,
+        actorId: req.user.id, actorRole: "seller", eventType: "approved", creditLimit: limit,
+    });
+
+    res.json({ success: true, creditId, status: "approved" });
+
+    if (conversationId) {
+        emitToConversation(conversationId, "credit:decided", { creditId, status: "approved", cooldownUntil: null });
+    }
+    notifyUser(buyerId, {
+        type: "credit_decision",
+        title: "Credit approved",
+        body: "A seller has approved you to buy on credit.",
+        link: creditLink("approved", creditId),
+    });
 }
 
 // ---- buyer asks ---------------------------------------------------------
