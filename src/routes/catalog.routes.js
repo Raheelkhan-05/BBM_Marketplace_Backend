@@ -15,6 +15,7 @@ import {
     getBrandItemSellers,
     getGenericProductsFeed,
     getBrandItemsFeed,
+    getFeedBrands,
     getBrandItemSellerOffer,
     getSharedProductLink,
     getLowestPriceForBrandItem,
@@ -34,6 +35,7 @@ router.delete("/followed/:brandItemId", requireAuth, unfollowBrandItem);
 router.get("/shops/:shopSlug", getShopPublicInfo);
 router.post("/price-trends/observe", requireAuth, observePriceTrends);
 router.get("/brand-items/:brandItemId", optionalAuth, optionalSellerProfile, getBrandItemDetail);
+router.get("/feed-brands", optionalAuth, optionalSellerProfile, getFeedBrands);
 router.get("/brand-items-feed", optionalAuth, optionalSellerProfile, getBrandItemsFeed);
 router.get("/brand-items/:brandItemId/sellers", optionalAuth, optionalSellerProfile, getBrandItemSellers);
 router.get("/brand-items/:brandItemId/seller-offer", optionalAuth, optionalSellerProfile, getBrandItemSellerOffer);

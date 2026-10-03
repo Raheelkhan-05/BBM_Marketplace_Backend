@@ -223,6 +223,10 @@ export async function getBrandItemsFeed(req, res) {
     const offset = parseIntSafe(req.query.offset, 0);
     const followedOnly = req.query.followed === "1";
     const shop = String(req.query.shop || "").trim().slice(0, 100) || null;
+    const brands = [].concat(req.query.brand || [])
+        .map((s) => String(s).trim().slice(0, 100))
+        .filter(Boolean)
+        .slice(0, 20);
 
     if (followedOnly && !req.user?.id) {
         return res.status(401).json({ success: false, message: "Login required." });
@@ -240,6 +244,7 @@ export async function getBrandItemsFeed(req, res) {
         p_shop_slug: shop,
         p_dest_pincode: destPincode || null,
         p_dest_state: destState || null,
+        ...(brands.length ? { p_brand_names: brands } : {}),
     });
 
     if (error) {
@@ -252,6 +257,30 @@ export async function getBrandItemsFeed(req, res) {
         items: data?.items,
     });
     return res.json({ success: true, ...data, items });
+}
+
+// GET /api/catalog/feed-brands?categoryId=&q=&followed=&shop=
+export async function getFeedBrands(req, res) {
+    const { categoryId = "", q = "" } = req.query;
+    const followedOnly = req.query.followed === "1";
+    const shop = String(req.query.shop || "").trim().slice(0, 100) || null;
+    if (followedOnly && !req.user?.id) {
+        return res.status(401).json({ success: false, message: "Login required." });
+    }
+    const { data, error } = await supabaseAdmin.rpc("catalog_feed_brands", {
+        p_category_id: categoryId || null,
+        p_q: q,
+        p_seller_id: req.sellerProfileId || null,
+        p_buyer_id: req.user?.id || null,
+        p_followed_only: followedOnly,
+        p_shop_slug: shop,
+    });
+    if (error) {
+        console.error("[catalog] getFeedBrands failed:", error.message);
+        return res.status(500).json({ success: false, message: "Couldn't load brands." });
+    }
+    res.set("Cache-Control", "private, max-age=30");
+    return res.json({ success: true, brands: data || [] });
 }
 
 // GET /api/catalog/shops/:shopSlug  (public, only safe fields)
