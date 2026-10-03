@@ -30,6 +30,7 @@ import helpRoutes from "./routes/help.routes.js";
 import transportLibraryRoutes from "./routes/transportLibrary.routes.js";
 import adminAuthRoutes from "./routes/adminAuth.routes.js";
 import customPricingRoutes from "./routes/customPricing.routes.js";
+import rfqRoutes from "./routes/rfq.routes.js";
 
 export function createApp() {
   const app = express();
@@ -105,6 +106,7 @@ export function createApp() {
   app.use("/api/chat", chatRoutes);
   app.use("/api/whatsapp", whatsappRoutes);
   app.use("/api/orders", ordersRoutes);
+  app.use("/api/rfq", rfqRoutes);
   app.use("/api/buyer/addresses", buyerAddressRoutes);
   app.use("/api/buyer/business-profile", buyerBusinessProfileRoutes);
   app.use("/api/catalog", catalogRoutes);

@@ -30,6 +30,12 @@ import {
   adminResolveDispute, adminListLedger, adminRunSettlementSweep,
 } from "../controllers/adminDisputes.controller.js";
 
+// NEW — RFQ review queue + settings.
+import {
+  getRfqSettings, updateRfqSettings, adminListEnquiries, adminGetEnquiry,
+  adminUpdateEnquiry, adminApproveEnquiry, adminRejectEnquiry,
+} from "../controllers/adminRfq.controller.js";
+
 // NEW — these two functions already existed in wallet.controller.js but were
 // never imported/mounted here, which is why there was no admin route to
 // verify wallet top-ups. Wiring them in now.
@@ -92,6 +98,14 @@ router.post("/disputes/:id/review", requireAuth, requireAdmin, authWriteLimiter,
 router.post("/disputes/:id/message", requireAuth, requireAdmin, authWriteLimiter, adminPostMessage);
 router.post("/disputes/:id/resolve", requireAuth, requireAdmin, authWriteLimiter, adminResolveDispute);
 
+// NEW — RFQ review. /rfq/settings MUST stay above /rfq/:id.
+router.get("/rfq/settings", requireAuth, requireAdmin, getRfqSettings);
+router.put("/rfq/settings", requireAuth, requireAdmin, authWriteLimiter, updateRfqSettings);
+router.get("/rfq", requireAuth, requireAdmin, adminListEnquiries);
+router.get("/rfq/:id", requireAuth, requireAdmin, adminGetEnquiry);
+router.patch("/rfq/:id", requireAuth, requireAdmin, authWriteLimiter, adminUpdateEnquiry);
+router.post("/rfq/:id/approve", requireAuth, requireAdmin, authWriteLimiter, adminApproveEnquiry);
+router.post("/rfq/:id/reject", requireAuth, requireAdmin, authWriteLimiter, adminRejectEnquiry);
 
 router.get("/catalog-bulk/excel-template", requireAuth, requireAdmin, downloadFullCatalogTemplate);
 router.post("/catalog-bulk/excel-upload", requireAuth, requireAdmin, upload.single("file"), bulkUploadFullCatalog);
