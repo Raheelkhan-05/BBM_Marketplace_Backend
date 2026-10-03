@@ -259,6 +259,28 @@ export async function getBrandItemsFeed(req, res) {
     return res.json({ success: true, ...data, items });
 }
 
+// GET /api/catalog/sellers?q=&limit=&offset=
+// Per-buyer (wallet + visibility rules), so it must NOT be publicly cached.
+export async function getSellersPage(req, res) {
+    const q = String(req.query.q || "").trim().slice(0, 100);
+    const limit = Math.min(Math.max(parseIntSafe(req.query.limit, 48), 1), 60);
+    const offset = Math.max(parseIntSafe(req.query.offset, 0), 0);
+    const { data, error } = await supabaseAdmin.rpc("catalog_sellers_page", {
+        p_q: q,
+        p_limit: limit,
+        p_offset: offset,
+        p_seller_id: req.sellerProfileId || null,
+        p_buyer_id: req.user?.id || null,
+    });
+    if (error) {
+        console.error("[catalog] getSellersPage failed:", error.message);
+        return res.status(500).json({ success: false, message: "Couldn't load sellers." });
+    }
+    res.set("Cache-Control", "private, max-age=30");
+    res.set("Vary", "Authorization");
+    return res.json({ success: true, ...data });
+}
+
 // GET /api/catalog/brands?q=&limit=&offset=
 export async function getBrandsPage(req, res) {
     const q = String(req.query.q || "").trim().slice(0, 100);

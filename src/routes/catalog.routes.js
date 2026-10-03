@@ -22,6 +22,7 @@ import {
     getFollowedIds, followBrandItem, unfollowBrandItem,
     getShopPublicInfo,
     observePriceTrends,
+    getSellersPage,
 } from "../controllers/catalog.controller.js";
 
 const router = Router();
@@ -35,7 +36,10 @@ router.delete("/followed/:brandItemId", requireAuth, unfollowBrandItem);
 router.get("/shops/:shopSlug", getShopPublicInfo);
 router.post("/price-trends/observe", requireAuth, observePriceTrends);
 router.get("/brand-items/:brandItemId", optionalAuth, optionalSellerProfile, getBrandItemDetail);
+
 router.get("/brands", getBrandsPage);
+router.get("/sellers", optionalAuth, optionalSellerProfile, getSellersPage);
+
 router.get("/brand-items-feed", optionalAuth, optionalSellerProfile, getBrandItemsFeed);
 router.get("/brand-items/:brandItemId/sellers", optionalAuth, optionalSellerProfile, getBrandItemSellers);
 router.get("/brand-items/:brandItemId/seller-offer", optionalAuth, optionalSellerProfile, getBrandItemSellerOffer);
