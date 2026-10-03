@@ -259,28 +259,20 @@ export async function getBrandItemsFeed(req, res) {
     return res.json({ success: true, ...data, items });
 }
 
-// GET /api/catalog/feed-brands?categoryId=&q=&followed=&shop=
-export async function getFeedBrands(req, res) {
-    const { categoryId = "", q = "" } = req.query;
-    const followedOnly = req.query.followed === "1";
-    const shop = String(req.query.shop || "").trim().slice(0, 100) || null;
-    if (followedOnly && !req.user?.id) {
-        return res.status(401).json({ success: false, message: "Login required." });
-    }
-    const { data, error } = await supabaseAdmin.rpc("catalog_feed_brands", {
-        p_category_id: categoryId || null,
-        p_q: q,
-        p_seller_id: req.sellerProfileId || null,
-        p_buyer_id: req.user?.id || null,
-        p_followed_only: followedOnly,
-        p_shop_slug: shop,
+// GET /api/catalog/brands?q=&limit=&offset=
+export async function getBrandsPage(req, res) {
+    const q = String(req.query.q || "").trim().slice(0, 100);
+    const limit = Math.min(Math.max(parseIntSafe(req.query.limit, 24), 1), 60);
+    const offset = Math.max(parseIntSafe(req.query.offset, 0), 0);
+    const { data, error } = await supabaseAdmin.rpc("catalog_brands_page", {
+        p_q: q, p_limit: limit, p_offset: offset,
     });
     if (error) {
-        console.error("[catalog] getFeedBrands failed:", error.message);
+        console.error("[catalog] getBrandsPage failed:", error.message);
         return res.status(500).json({ success: false, message: "Couldn't load brands." });
     }
-    res.set("Cache-Control", "private, max-age=30");
-    return res.json({ success: true, brands: data || [] });
+    res.set("Cache-Control", "public, max-age=60");
+    return res.json({ success: true, ...data });
 }
 
 // GET /api/catalog/shops/:shopSlug  (public, only safe fields)
