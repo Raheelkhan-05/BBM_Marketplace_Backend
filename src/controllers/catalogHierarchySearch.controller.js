@@ -7,7 +7,7 @@ import { supabase } from "../config/supabase.js";
 // original AI-resolver hierarchy (hierarchysearch.controller.js) is
 // untouched and still serves whatever still points at it.
 //
-// SEPARATOR-INSENSITIVE MATCHING (this revision):
+// SEPARATOR-INSENSITIVE MATCHING:
 // Searching "20w40" used to miss "20W-40" (or "20 W 40", "20w/40") because
 // ILIKE '%20w40%' needs the exact characters. Every searchable name now has
 // a normalized twin column (name_norm / brand_name_norm — see
@@ -19,6 +19,18 @@ import { supabase } from "../config/supabase.js";
 // substring still matches (stripping the same characters from both sides
 // preserves substring-ness). Terms with no letters/digits at all (e.g. "%")
 // fall back to the original raw ILIKE so they behave exactly as before.
+//
+// has_own_listing ON SEARCH ROWS (this revision):
+// The home feed (catalog_browse_feed) tags every row with has_own_listing so
+// the "Sell this product" button can be hidden for a seller who already
+// lists that product. Search rows (products-merged) come from this file, not
+// from that RPC, so they never carried the flag — the button wrongly showed
+// up in search results. searchProductsMergedV2 now sets has_own_listing on
+// every row, using the SAME rule as catalog_browse_feed (any listing by this
+// seller that isn't rejected). It needs the signed-in seller's id, so the
+// route must run optionalAuth + optionalSellerProfile (sets
+// req.sellerProfileId, the same value the feed uses) — see
+// catalogSearch.routes.js. Guests / non-sellers get has_own_listing: false.
 
 const DEFAULT_LIMIT = 20;
 function clampLimit(limit) {
@@ -700,6 +712,33 @@ export async function searchProductsMergedV2(req, res) {
         }
     }
 
+    // Which of these products does the signed-in seller already list?
+    // MUST match the has_own_listing rule in catalog_browse_feed exactly:
+    // any listing by this seller for the product whose review_status is not
+    // 'rejected' — pending, inactive and expired listings all count, because
+    // the seller already has that product (re-listing it makes no sense).
+    // Scoped to this page's ids. Guests and non-sellers have no seller id, so
+    // the query is skipped and every row gets has_own_listing: false. A
+    // failure here must never break the search itself, so on error we log
+    // and fall back to false.
+    // req.sellerProfileId is what the feed passes as p_seller_id (set by
+    // optionalSellerProfile); req.sellerId is the older fallback.
+    const ownSellerId = req.sellerProfileId || req.sellerId || null;
+    const ownBrandIds = new Set();
+    if (ownSellerId) {
+        const { data: ownRows, error: ownErr } = await supabase
+            .from("seller_product_submissions")
+            .select("generic_product_brand_id")
+            .in("generic_product_brand_id", ids)
+            .eq("seller_id", ownSellerId)
+            .neq("review_status", "rejected");
+        if (ownErr) {
+            console.error("[catalog-search] own-listing lookup failed:", ownErr.message);
+        } else {
+            for (const r of ownRows || []) ownBrandIds.add(r.generic_product_brand_id);
+        }
+    }
+
     const items = page.map((b) => {
         const l = lowestByBrand[b.id];
         const gp = b.generic_product;
@@ -717,6 +756,7 @@ export async function searchProductsMergedV2(req, res) {
             lowest_price_gst_percent: l?.gst_percent ?? null,
             lowest_price_stock_type: l?.stock_type ?? null,
             lowest_price_available_stock: l?.stock_quantity ?? null,
+            has_own_listing: ownBrandIds.has(b.id),
         };
     });
 

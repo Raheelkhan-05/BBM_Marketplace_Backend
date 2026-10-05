@@ -12,6 +12,8 @@ import {
 } from "../controllers/catalogHierarchySearch.controller.js";
 import { browseCatalog, browseGenericProducts } from "../controllers/catalogBrowse.controller.js";
 import { optionalAuthListing } from "../middleware/optionalAuthListing.middleware.js";
+import { optionalAuth } from "../middleware/optionalAuth.middleware.js";
+import { optionalSellerProfile } from "../middleware/optionalSellerProfile.middleware.js";
 import { listGenericProductSellers, getPublicListingDetail, listApprovedBrandsForGenericProduct } from "../controllers/catalogGenericProductSellers.controller.js";
 import { refreshHomeFeedCache } from "../services/homeFeedCache.service.js";
 import { supabase } from "../config/supabase.js";
@@ -32,7 +34,10 @@ router.get("/hierarchy", searchHierarchyV2);
 router.get("/browse", optionalAuthListing, browseCatalog);
 router.get("/smart", smartSearchV2);
 router.get("/autocomplete", searchAutocompleteV2);
-router.get("/products-merged", searchProductsMergedV2);
+// optionalAuth + optionalSellerProfile (same pair /api/catalog uses): sets
+// req.sellerProfileId, which products-merged needs to tag each row with
+// has_own_listing exactly like catalog_browse_feed does.
+router.get("/products-merged", optionalAuth, optionalSellerProfile, searchProductsMergedV2);
 
 router.get("/browse-products", optionalAuthListing, browseGenericProducts);
 router.get("/generic-product-sellers", listGenericProductSellers);
