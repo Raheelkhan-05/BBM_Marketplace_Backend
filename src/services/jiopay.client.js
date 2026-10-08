@@ -48,17 +48,23 @@ export function computeHash(fields) {
 }
 
 // Constant-time verification of a payload that carries `secureHash`.
-export function verifyPayloadHash(payload) {
+// Fields JioPay returns but does not include in the command-response hash.
+const COMMAND_HASH_EXCLUDE = new Set(["oth_charge"]);
+
+export function verifyPayloadHash(payload, { exclude = null } = {}) {
     if (!payload || typeof payload !== "object") return false;
     const received = String(payload.secureHash || "").trim().toLowerCase();
     if (!/^[0-9a-f]{64}$/.test(received)) return false;
     // eslint-disable-next-line no-unused-vars
     const { secureHash, ...rest } = payload;
-    const expected = Buffer.from(computeHash(rest), "hex");
+    const body = exclude
+        ? Object.fromEntries(Object.entries(rest).filter(([k]) => !exclude.has(k)))
+        : rest;
+    const expected = Buffer.from(computeHash(body), "hex");
     const actual = Buffer.from(received, "hex");
     const ok = expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
     if (!ok && cfg.hashDebug) {
-        console.warn("[jiopay] secureHash did not verify. Fields present:", Object.keys(rest).sort().join(","));
+        console.warn("[jiopay] secureHash did not verify. Fields present:", Object.keys(body).sort().join(","));
     }
     return ok;
 }
@@ -181,7 +187,8 @@ async function command(fields) {
     if (cfg.aggregatorId) withHash.aggregatorID = cfg.aggregatorId;
     withHash.secureHash = computeHash(withHash);
     const { data } = await post("/pg/api/command", { form: withHash });
-    const hashValid = verifyPayloadHash(data);
+    // const hashValid = verifyPayloadHash(data);
+    const hashValid = verifyPayloadHash(data, { exclude: COMMAND_HASH_EXCLUDE });
     const normalized = normalizeGatewayPayload(data);
     if (normalized.merchantTxnNo && normalized.merchantTxnNo !== fields.merchantTxnNo) {
         throw new JiopayError("TXN_MISMATCH", "Gateway answered for a different transaction number");
