@@ -4,9 +4,10 @@ import { requireAuth } from "../middleware/auth.middleware.js";
 import { optionalAuth } from "../middleware/optionalAuth.middleware.js";
 import { checkoutStatus, getOrderQuote, placeOrder, listMyOrders, getMyOrder, getOfferForResume, getOrderConstraints, getSellerTransportOptions } from "../controllers/orders.controller.js";
 import { cancelMyOrder, raiseDispute, getBuyerDispute } from "../controllers/orderDisputes.controller.js";
-import { getPaymentInstructions, submitPaymentProof } from "../controllers/paymentProof.controller.js";
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+// Payments now go through JioPay (see routes/payments.routes.js). The manual
+// GET /:id/payment and POST /:id/payment-proof endpoints were removed on purpose:
+// a buyer must never be able to self-report a payment.
 const evidenceUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 4 } });
 
 const router = Router();
@@ -23,6 +24,4 @@ router.post("/:id/cancel", requireAuth, cancelMyOrder);
 router.get("/:id/dispute", requireAuth, getBuyerDispute);
 router.post("/:id/dispute", requireAuth, evidenceUpload.array("evidence", 4), raiseDispute);
 
-router.get("/:id/payment", requireAuth, getPaymentInstructions);
-router.post("/:id/payment-proof", requireAuth, upload.single("screenshot"), submitPaymentProof);
 export default router;

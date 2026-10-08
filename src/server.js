@@ -8,6 +8,8 @@ import { verifyAuthToken } from "./middleware/auth.middleware.js";
 import { registerChatSocket } from "./socket/chatSocket.js";
 import { setIO, attachRedisAdapter } from "./socket/io.js";
 import { startListingExpiryScheduler } from "./services/listingExpiry.service.js";
+import { startSettlementScheduler } from "./services/settlement.service.js";
+import { startPaymentScheduler } from "./services/paymentScheduler.service.js";
 
 const PORT = process.env.PORT || 4000;
 const app = createApp();
@@ -62,4 +64,9 @@ async function start() {
 }
 
 startListingExpiryScheduler();
+// Dispute-window payout releases + "seller didn't accept in 24h" expiry sweeps (these were defined
+// but never started from here). Safe if also started elsewhere: both use SKIP LOCKED in SQL.
+startSettlementScheduler();
+// JioPay: re-checks open payments, repairs commissions, pushes queued refunds to the gateway.
+startPaymentScheduler();
 start();

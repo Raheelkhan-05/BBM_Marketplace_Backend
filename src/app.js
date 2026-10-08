@@ -31,6 +31,9 @@ import transportLibraryRoutes from "./routes/transportLibrary.routes.js";
 import adminAuthRoutes from "./routes/adminAuth.routes.js";
 import customPricingRoutes from "./routes/customPricing.routes.js";
 import rfqRoutes from "./routes/rfq.routes.js";
+import paymentsPublicRoutes from "./routes/paymentsPublic.routes.js";
+import paymentsRoutes from "./routes/payments.routes.js";
+import adminPaymentsRoutes from "./routes/adminPayments.routes.js";
 
 export function createApp() {
   const app = express();
@@ -50,6 +53,11 @@ export function createApp() {
   // for free, so this is pure savings with no client-side change needed.
   // Placed early, before routes, so it wraps every response this app sends.
   app.use(compression());
+
+  // JioPay's webhook (server-to-server) and the buyer's browser return (a cross-site form POST that
+  // carries an Origin header) must be reachable WITHOUT the browser CORS allow-list below, so they
+  // are mounted here, before cors(). They parse their own bodies and authenticate by secureHash.
+  app.use(paymentsPublicRoutes);
 
   const allowedOrigins = (
     process.env.CLIENT_ORIGINS ||
@@ -96,6 +104,8 @@ export function createApp() {
   app.use("/api/admin/seller-submissions", adminSellerSubmissionsRouter);
   app.use("/api/seller", sellerRoutes);
   app.use("/api/admin/auth", adminAuthRoutes);
+  // Must stay BEFORE "/api/admin" so it is matched first.
+  app.use("/api/admin/payments", adminPaymentsRoutes);
   app.use("/api/admin", adminRoutes);
   app.use("/api/notifications", notificationRoutes);
   app.use("/api/shop", shopRoutes);
@@ -106,6 +116,7 @@ export function createApp() {
   app.use("/api/chat", chatRoutes);
   app.use("/api/whatsapp", whatsappRoutes);
   app.use("/api/orders", ordersRoutes);
+  app.use("/api/payments", paymentsRoutes);
   app.use("/api/rfq", rfqRoutes);
   app.use("/api/buyer/addresses", buyerAddressRoutes);
   app.use("/api/buyer/business-profile", buyerBusinessProfileRoutes);
