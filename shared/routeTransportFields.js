@@ -23,7 +23,7 @@ export const ROUTE_TRANSPORT_GROUPS = [
 ];
 
 export const ROUTE_TRANSPORT_MODE_LABELS = {
-    self_pickup: "Self Pickup",
+    self_pickup: "Self Pickup By Client",
     rapido: "Rapido",
     roadway_transport: "Roadway Transport",
     train_service: "Train Service",
@@ -107,7 +107,7 @@ export function routeOptionSummary(mode, fields = {}) {
         case "flight_service":
             return fields?.airline_name || routeTransportModeLabel(mode);
         case "self_pickup":
-            return "Self Pickup";
+            return "Self Pickup By Client";
         case "rapido":
             return "Rapido";
         default:

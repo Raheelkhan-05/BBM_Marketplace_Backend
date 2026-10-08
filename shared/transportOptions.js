@@ -19,7 +19,7 @@
 export const TRANSPORT_OPTIONS = [
     {
         key: "self_pickup",
-        label: "Self Pickup",
+        label: "Self Pickup By Client",
         fields: [
             { key: "contact_name", label: "Pickup contact name", type: "text", required: true },
             { key: "contact_phone", label: "Pickup contact number", type: "text", required: true },

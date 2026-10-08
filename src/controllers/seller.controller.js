@@ -21,7 +21,7 @@ import { sendOtp, verifyOtpCode } from "../utils/otp.js";
 const REQUIRED_FIELDS = [
   "display_name", "business_type",
   "contact_person", "whatsapp_number",
-  "logo_url",
+  // "logo_url",
   "order_acceptance_start", "order_acceptance_end",
   "dispatch_pincode",
   "transport_options",
