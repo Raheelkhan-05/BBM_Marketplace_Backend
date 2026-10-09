@@ -312,8 +312,12 @@ export async function reconcileAttempt({ id, ref, amountPaise, status, expiresAt
         outcome = "pending";
     }
 
-    // An explicit failure before the attempt expires is not final (the buyer may retry inside the same session).
-    if (outcome === "failed" && !expired && status !== "expired") outcome = "pending";
+    const buyerReturned = arguments[0]?.buyerReturned === true;
+    // Only an explicit rejection (REJ) counts as final before expiry. Anything else stays provisional.
+    const explicitReject = s.txnStatus === "REJ";
+    if (outcome === "failed" && !expired && status !== "expired" && !explicitReject && !buyerReturned) {
+        outcome = "pending";
+    }
 
     const amount = outcome === "success" ? (s.amountPaise ?? amountPaise) : (s.amountPaise ?? null);
     const result = await processOutcome({
