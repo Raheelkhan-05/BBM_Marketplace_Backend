@@ -405,6 +405,9 @@ export async function getAttemptStatusForUser(ref, userId) {
 /* =================================================================== refunds */
 
 export async function processRefundQueue() {
+    const { error: cancelErr } = await supabase.rpc("payment_enqueue_cancel_refunds", { p_limit: 50 });
+    if (cancelErr) console.error("[payments] enqueue cancel refunds failed:", cancelErr.message);
+
     const { error: enqErr } = await supabase.rpc("payment_enqueue_settlement_refunds", { p_limit: 50 });
     if (enqErr) console.error("[payments] enqueue settlement refunds failed:", enqErr.message);
 

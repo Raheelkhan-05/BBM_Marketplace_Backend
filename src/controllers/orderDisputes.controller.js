@@ -12,6 +12,7 @@ import { supabase } from "../config/supabase.js";
 import { notifyUser, notifyOrderChanged, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
 import { notifyAdmins } from "../services/notifications.service.js";
 import { notifyIfWalletJustBlocked } from "../services/walletNotifications.service.js";
+import { processRefundQueue } from "../services/payments.service.js";
 import {
     CANCELLABLE_STATUSES, CANCEL_REASONS, MAX_CANCEL_TEXT,
     DESIRED_RESOLUTIONS, findCategory, labelFor,
@@ -155,6 +156,7 @@ export async function cancelMyOrder(req, res) {
         }
     }
 
+    if (!wasUnpaid) processRefundQueue().catch((e) => console.error("[cancelMyOrder] refund kick failed:", e?.message || e));
     res.json({ success: true, message: "Order cancelled." });
 }
 

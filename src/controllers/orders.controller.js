@@ -5,6 +5,7 @@ import { sendOrderUpdateWhatsApp } from "../services/whatsapp.service.js";
 import { notifyIfWalletJustBlocked } from "../services/walletNotifications.service.js";
 import { fetchCustomPriceMap, resolveEffectiveBasePrice } from "../../shared/customPricing.js";
 import { isListingExpired } from "../../shared/listingValidity.js";
+import { processRefundQueue } from "../services/payments.service.js";
 
 import { getRoadDistanceKm } from "../services/pincodeDistance.js";
 import { purchaseQtyToSaleUnitQty, saleUnitQtyToBaseUnits, getSaleUnit, saleUnitLabel, round2 } from "../../shared/packUnits.js";
@@ -796,6 +797,7 @@ export async function cancelMyOrder(req, res) {
         });
         await notifyUserOrdersChanged(row.notify_user_id);
     }
+    if (!wasUnpaid) processRefundQueue().catch((e) => console.error("[cancelMyOrder] refund kick failed:", e?.message || e));
     res.json({ success: true, message: "Order cancelled." });
 }
 
