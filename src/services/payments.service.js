@@ -469,6 +469,11 @@ export async function processRefundQueue() {
     await inChunks(claimed || [], 3, (r) => processOneRefund(r).catch((e) => console.error("[payments] refund error:", r.r_merchant_txn_no, e?.message || e)));
 }
 
+// Re-submitting a declined refund under a NEW reference is OFF by default: while the gateway is declining
+// every refund for an environmental reason (e.g. UAT), it only piles up extra declined references.
+// Turn it on (JIOPAY_REFUND_RESUBMIT=true) once refunds work and you want declines retried automatically.
+const RESUBMIT_DECLINED = ["1", "true", "yes", "on"].includes(String(process.env.JIOPAY_REFUND_RESUBMIT || "").trim().toLowerCase());
+
 // A fresh reference for re-submitting a refund the gateway has DEFINITELY declined.
 // Same shape as the originals: "RFD" + 17 upper-case hex chars.
 const newRefundRef = () => `RFD${crypto.randomBytes(9).toString("hex").slice(0, 17).toUpperCase()}`;
@@ -522,7 +527,10 @@ async function processOneRefund(r) {
         // The gateway has given a verified, final "no" for THIS reference (e.g. 039 Transaction Declined).
         // Polling it again can never change the answer, which is why these used to sit in "queued" forever.
         // It is safe to re-submit under a NEW reference: the old one was declined, so no money moved.
-        if (s.txnStatus !== "SUC") {
+        if (!RESUBMIT_DECLINED || s.txnStatus === "SUC") {
+            return finish("retry", { code: s.code, message: s.message, retryMinutes: Math.min(240, 10 * 2 ** Math.max(tries - 2, 0)) });
+        }
+        {
             const fresh = newRefundRef();
             const { error: swapErr } = await supabase.from("payment_refunds")
                 .update({ merchant_txn_no: fresh }).eq("id", id).eq("merchant_txn_no", ref);

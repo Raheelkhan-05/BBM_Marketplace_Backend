@@ -3,8 +3,13 @@
 // Thin, dependency-free client for JioPay (Jio Payment Solutions Ltd) hosted checkout.
 // Hash algorithm (docs.jiopay.in/docs/generate-hash): sort the keys alphabetically,
 // concatenate the VALUES with no delimiter, HMAC-SHA256 with the merchant secret, lowercase hex.
+//
+// UAT evidence: set JIOPAY_LOG_API_CALLS=true to store every request we send and every response we get
+// in the payment_api_logs table (see sql/payment_api_logs.sql). Off by default: it stores customer
+// email/mobile, so switch it off again once sign-off is done. The secret key is never part of a request body.
 import crypto from "crypto";
 import { jiopayConfig as cfg, assertJiopayConfigured } from "../config/jiopay.js";
+import { supabase } from "../config/supabase.js";
 
 export class JiopayError extends Error {
     constructor(code, message, { retryable = false } = {}) {
@@ -13,6 +18,29 @@ export class JiopayError extends Error {
         this.code = code;
         this.retryable = retryable;
     }
+}
+
+const LOG_API_CALLS = ["1", "true", "yes", "on"].includes(String(process.env.JIOPAY_LOG_API_CALLS || "").trim().toLowerCase());
+
+// Fire-and-forget: a logging problem must never affect a payment.
+function logApiCall({ path, request, httpStatus = null, response = null, error = null }) {
+    if (!LOG_API_CALLS) return;
+    const api = path.includes("initiateSale") ? "initiateSale" : String(request?.transactionType || "command");
+    (async () => {
+        try {
+            const { error: dbErr } = await supabase.from("payment_api_logs").insert({
+                api,
+                merchant_txn_no: request?.merchantTxnNo ? String(request.merchantTxnNo).slice(0, 40) : null,
+                request,
+                http_status: httpStatus,
+                response,
+                error,
+            });
+            if (dbErr) console.error("[jiopay] api log insert failed:", dbErr.message);
+        } catch (e) {
+            console.error("[jiopay] api log insert failed:", e?.message || e);
+        }
+    })();
 }
 
 /* ------------------------------------------------------------------ money */
@@ -89,6 +117,7 @@ function txnDate(d = new Date()) {
 async function post(path, { json, form }) {
     assertJiopayConfigured();
     const url = `${cfg.baseUrl}${path}`;
+    const request = json || form;
     let res;
     try {
         res = await fetch(url, {
@@ -100,11 +129,13 @@ async function post(path, { json, form }) {
             signal: AbortSignal.timeout(cfg.requestTimeoutMs),
         });
     } catch (e) {
+        logApiCall({ path, request, error: String(e?.name || "error") });
         throw new JiopayError("NETWORK", `Gateway request failed: ${e?.name || "error"}`, { retryable: true });
     }
     const text = await res.text();
     let data = null;
     try { data = JSON.parse(text); } catch { /* handled below */ }
+    logApiCall({ path, request, httpStatus: res.status, response: data ?? { nonJsonBody: text.slice(0, 500) } });
     if (!data || typeof data !== "object" || Array.isArray(data)) {
         throw new JiopayError("INVALID_RESPONSE", `Gateway returned a non-JSON response (HTTP ${res.status})`, { retryable: res.status >= 500 });
     }
@@ -188,7 +219,6 @@ async function command(fields) {
     if (cfg.aggregatorId) withHash.aggregatorID = cfg.aggregatorId;
     withHash.secureHash = computeHash(withHash);
     const { data } = await post("/pg/api/command", { form: withHash });
-    // const hashValid = verifyPayloadHash(data);
     const hashValid = verifyPayloadHash(data, { exclude: COMMAND_HASH_EXCLUDE });
     const normalized = normalizeGatewayPayload(data);
     if (normalized.merchantTxnNo && normalized.merchantTxnNo !== fields.merchantTxnNo) {
