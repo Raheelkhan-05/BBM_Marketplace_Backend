@@ -69,6 +69,7 @@ const normalizeIp = (ip) => String(ip || "").replace(/^::ffff:/, "");
 
 // POST /api/payments/jiopay/webhook  (public; authenticity = secureHash, optionally source IP)
 export async function jiopayWebhook(req, res) {
+    console.log("[payments] webhook hit:", req.method, normalizeIp(req.ip), req.headers["content-type"], String(req.body?.merchantTxnNo || ""));
     try {
         if (cfg.webhookAllowedIps.length && !cfg.webhookAllowedIps.includes(normalizeIp(req.ip))) {
             console.warn("[payments] webhook from non-allowlisted IP:", normalizeIp(req.ip));
