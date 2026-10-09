@@ -6,6 +6,7 @@
 //      for the exact amount we stored server-side — and (by default) re-confirmed via the status API.
 //   3. The browser return (B2B) never credits anything; it only triggers an authoritative status check.
 //   4. Notifications are best-effort and run AFTER the database commit; they can never undo a payment.
+import crypto from "crypto";
 import { supabase } from "../config/supabase.js";
 import { jiopayConfig as cfg, assertJiopayConfigured } from "../config/jiopay.js";
 import {
@@ -206,6 +207,58 @@ async function logRejected(payload, reason) {
     });
 }
 
+/* ------------------------------------------------------- refund notifications */
+
+// Who should hear about a refund: the person who made the original payment.
+async function loadRefundParties(refundId) {
+    const { data: refund } = await supabase.from("payment_refunds")
+        .select("id, attempt_id, order_id, amount_paise, merchant_txn_no").eq("id", refundId).maybeSingle();
+    if (!refund) return null;
+    let userId = null;
+    let purpose = null;
+    if (refund.attempt_id) {
+        const { data: a } = await supabase.from("payment_attempts")
+            .select("user_id, purpose").eq("id", refund.attempt_id).maybeSingle();
+        userId = a?.user_id || null;
+        purpose = a?.purpose || null;
+    }
+    let orderNumber = null;
+    if (refund.order_id) {
+        const { data: o } = await supabase.from("orders").select("order_number").eq("id", refund.order_id).maybeSingle();
+        orderNumber = o?.order_number || null;
+    }
+    return { refund, userId, purpose, orderNumber };
+}
+
+// kind: 'initiated' | 'success' | 'delayed'
+async function notifyRefund(refundId, kind) {
+    await safely(`refund notify (${kind})`, async () => {
+        const ctx = await loadRefundParties(refundId);
+        if (!ctx?.userId) return;
+        const amount = inr(ctx.refund.amount_paise);
+        const forOrder = ctx.orderNumber ? ` for order ${ctx.orderNumber}` : "";
+        const link = ctx.purpose === "wallet_topup" ? "/seller/wallet" : ctx.refund.order_id ? `/orders/${ctx.refund.order_id}` : "/orders";
+
+        const copy = {
+            initiated: {
+                type: "refund_initiated", title: "Refund initiated",
+                body: `Your refund of ${amount}${forOrder} has been started. It goes back to your original payment method and can take 5–7 working days to show up.`,
+            },
+            success: {
+                type: "refund_success", title: "Refund processed",
+                body: `Your refund of ${amount}${forOrder} has been sent to your original payment method. Your bank may take a few working days to show it.`,
+            },
+            delayed: {
+                type: "refund_delayed", title: "Refund is taking longer than usual",
+                body: `We're having trouble sending your refund of ${amount}${forOrder}. Our team has been alerted and will complete it manually — you don't need to do anything.`,
+            },
+        }[kind];
+
+        await notifyUser(ctx.userId, { ...copy, link });
+        await notifyUserOrdersChanged(ctx.userId);
+    });
+}
+
 async function handleRefundWebhook(payload, ref) {
     const { data: refund } = await supabase.from("payment_refunds")
         .select("id, status, amount_paise").eq("merchant_txn_no", ref).maybeSingle();
@@ -222,10 +275,11 @@ async function handleRefundWebhook(payload, ref) {
             await alertAdmins("Refund callback amount mismatch", `Refund ${ref}: callback ${inr(n.amountPaise)} vs expected ${inr(refund.amount_paise)}.`);
             return { ok: true };
         }
-        await supabase.rpc("payment_finish_refund", {
+        const { data: status } = await supabase.rpc("payment_finish_refund", {
             p_refund_id: refund.id, p_result: "success", p_code: n.code, p_message: n.message,
             p_gateway_ref: n.gatewayTxnId, p_retry_minutes: 0,
         });
+        if (status === "success") await notifyRefund(refund.id, "success");
     }
     return { ok: true };
 }
@@ -261,7 +315,6 @@ export async function handleWebhook(payload) {
             console.error("[payments] could not confirm webhook via status API:", ref, e?.message || e);
             return { retry: true }; // do not apply on an unconfirmed success; the reconciler will resolve it
         }
-        // const confirmed = s.hashValid && classifyCode(s.code) === "success";
         const confirmed = s.hashValid && classifyCode(s.code) === "success" && s.txnStatus === "SUC";
         if (!confirmed) {
             console.warn("[payments] webhook claimed success but the status API did not confirm:", ref, s.code);
@@ -416,9 +469,13 @@ export async function processRefundQueue() {
     await inChunks(claimed || [], 3, (r) => processOneRefund(r).catch((e) => console.error("[payments] refund error:", r.r_merchant_txn_no, e?.message || e)));
 }
 
+// A fresh reference for re-submitting a refund the gateway has DEFINITELY declined.
+// Same shape as the originals: "RFD" + 17 upper-case hex chars.
+const newRefundRef = () => `RFD${crypto.randomBytes(9).toString("hex").slice(0, 17).toUpperCase()}`;
+
 async function processOneRefund(r) {
     const id = r.r_id;
-    const ref = r.r_merchant_txn_no;
+    let ref = r.r_merchant_txn_no;
     const paise = Number(r.r_amount_paise);
     const tries = Number(r.r_attempts);
 
@@ -427,14 +484,20 @@ async function processOneRefund(r) {
             p_refund_id: id, p_result: result, p_code: extra.code ?? null, p_message: extra.message ?? null,
             p_gateway_ref: extra.gatewayRef ?? null, p_retry_minutes: extra.retryMinutes ?? 5,
         });
-        if (status === "failed") {
-            await alertAdmins("Refund failed", `Refund ${ref} for ${inr(paise)} could not be completed after ${tries} attempts. Check Payments -> Refunds.`);
+        if (status === "success") {
+            await notifyRefund(id, "success");
+        } else if (status === "failed") {
+            await alertAdmins("Refund failed", `Refund ${ref} for ${inr(paise)} could not be completed after ${tries} attempts (last gateway answer: ${extra.code || "n/a"} ${extra.message || ""}). Check Payments -> Refunds.`);
+            await notifyRefund(id, "delayed");
         }
+        return status;
     };
 
-    // On any retry, first ask the gateway whether the previous try already went through,
-    // so a crash/timeout can never cause a double refund.
-    // Once the gateway has seen this refund reference, never submit it again: only poll its status.
+    // The buyer hears about it as soon as we first submit the refund — not only when it finishes.
+    if (tries <= 1) await notifyRefund(id, "initiated");
+
+    // On any retry, first ask the gateway what happened to the previous try, so a crash/timeout
+    // can never cause a double refund.
     if (tries > 1) {
         let s;
         try {
@@ -447,10 +510,30 @@ async function processOneRefund(r) {
             response_code: s.code?.slice(0, 20) || null, payload: sanitizePayload(s.raw),
         }));
         if (!s.hashValid) return finish("retry", { code: s.code, message: "status pre-check unverifiable", retryMinutes: 15 });
-        if (classifyCode(s.code) === "success" && s.txnStatus === "SUC") {
+
+        const cls = classifyCode(s.code);
+        if (cls === "success" && s.txnStatus === "SUC") {
             return finish("success", { code: s.code, message: s.message, gatewayRef: s.gatewayTxnId });
         }
-        return finish("retry", { code: s.code, message: s.message, retryMinutes: 10 });
+        if (cls === "pending") {
+            return finish("retry", { code: s.code, message: s.message, retryMinutes: 10 });
+        }
+
+        // The gateway has given a verified, final "no" for THIS reference (e.g. 039 Transaction Declined).
+        // Polling it again can never change the answer, which is why these used to sit in "queued" forever.
+        // It is safe to re-submit under a NEW reference: the old one was declined, so no money moved.
+        if (s.txnStatus !== "SUC") {
+            const fresh = newRefundRef();
+            const { error: swapErr } = await supabase.from("payment_refunds")
+                .update({ merchant_txn_no: fresh }).eq("id", id).eq("merchant_txn_no", ref);
+            if (swapErr) {
+                console.error("[payments] couldn't assign a new refund reference:", ref, swapErr.message);
+                return finish("retry", { code: s.code, message: s.message, retryMinutes: 30 });
+            }
+            console.warn(`[payments] refund ${ref} declined (${s.code} ${s.message}); re-submitting as ${fresh}`);
+            ref = fresh;
+            // fall through to a fresh submit below
+        }
     }
 
     let res;
@@ -468,5 +551,14 @@ async function processOneRefund(r) {
     const c = res.hashValid ? classifyCode(res.code) : "pending";
     if (c === "success") return finish("success", { code: res.code, message: res.message, gatewayRef: res.gatewayTxnId });
     if (c === "pending") return finish("retry", { code: res.code, message: res.message, retryMinutes: 5 });
+
+    // Declined on submit. Tell the admins ONCE, with the gateway's own words, so the real cause gets fixed
+    // instead of the refund silently retrying until it gives up.
+    if (tries <= 1) {
+        await alertAdmins(
+            "Refund declined by JioPay",
+            `Refund ${ref} for ${inr(paise)} (original ${r.r_original_txn_no}) was declined: ${res.code} ${res.message || ""}. It will keep retrying with backoff; ask JioPay why if it persists.`,
+        );
+    }
     return finish("retry", { code: res.code, message: res.message, retryMinutes: Math.min(240, 5 * 2 ** Math.max(tries - 1, 0)) });
 }
