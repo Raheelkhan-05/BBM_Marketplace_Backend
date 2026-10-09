@@ -261,7 +261,8 @@ export async function handleWebhook(payload) {
             console.error("[payments] could not confirm webhook via status API:", ref, e?.message || e);
             return { retry: true }; // do not apply on an unconfirmed success; the reconciler will resolve it
         }
-        const confirmed = s.hashValid && classifyCode(s.code) === "success";
+        // const confirmed = s.hashValid && classifyCode(s.code) === "success";
+        const confirmed = s.hashValid && classifyCode(s.code) === "success" && s.txnStatus === "SUC";
         if (!confirmed) {
             console.warn("[payments] webhook claimed success but the status API did not confirm:", ref, s.code);
             await alertAdmins("Webhook success not confirmed by status API", `Attempt ${ref}: webhook said success, status API said "${s.code || "unknown"}". Not applied; it will be re-checked automatically.`);
@@ -304,6 +305,13 @@ export async function reconcileAttempt({ id, ref, amountPaise, status, expiresAt
 
     const expired = new Date(expiresAt).getTime() <= Date.now();
     let outcome = s.hashValid ? classifyCode(s.code) : "pending";
+
+    if (!s.hashValid) console.warn("[payments] status response hash NOT verified:", ref, s.code);
+    if (outcome === "success" && s.txnStatus !== "SUC") {
+        console.warn("[payments] code says success but txnStatus is", s.txnStatus, ref);
+        outcome = "pending";
+    }
+
     // An explicit failure before the attempt expires is not final (the buyer may retry inside the same session).
     if (outcome === "failed" && !expired && status !== "expired") outcome = "pending";
 

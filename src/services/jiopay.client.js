@@ -119,6 +119,7 @@ export function normalizeGatewayPayload(data) {
         message: String(data.respDescription ?? data.responseDescription ?? data.message ?? "").slice(0, 500),
         amountPaise: amountToPaise(data.amount),
         gatewayTxnId: data.txnID ? String(data.txnID) : data.paymentID ? String(data.paymentID) : null,
+        txnStatus: data.txnStatus ? String(data.txnStatus) : null,
         paymentMode: data.paymentMode ? String(data.paymentMode).slice(0, 40) : null,
         merchantTxnNo: data.merchantTxnNo ? String(data.merchantTxnNo) : null,
         raw: data,
