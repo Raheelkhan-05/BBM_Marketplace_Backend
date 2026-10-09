@@ -434,6 +434,7 @@ async function processOneRefund(r) {
 
     // On any retry, first ask the gateway whether the previous try already went through,
     // so a crash/timeout can never cause a double refund.
+    // Once the gateway has seen this refund reference, never submit it again: only poll its status.
     if (tries > 1) {
         let s;
         try {
@@ -441,10 +442,15 @@ async function processOneRefund(r) {
         } catch (e) {
             return finish("retry", { message: `status pre-check failed: ${e?.message || e}`, retryMinutes: 10 });
         }
+        await safely("log refund pre-check", () => supabase.from("payment_events").insert({
+            refund_id: id, merchant_txn_no: ref, source: "refund_status", hash_valid: s.hashValid,
+            response_code: s.code?.slice(0, 20) || null, payload: sanitizePayload(s.raw),
+        }));
         if (!s.hashValid) return finish("retry", { code: s.code, message: "status pre-check unverifiable", retryMinutes: 15 });
-        const c = classifyCode(s.code);
-        if (c === "success") return finish("success", { code: s.code, message: s.message, gatewayRef: s.gatewayTxnId });
-        if (c === "pending") return finish("retry", { code: s.code, message: s.message, retryMinutes: 10 });
+        if (classifyCode(s.code) === "success" && s.txnStatus === "SUC") {
+            return finish("success", { code: s.code, message: s.message, gatewayRef: s.gatewayTxnId });
+        }
+        return finish("retry", { code: s.code, message: s.message, retryMinutes: 10 });
     }
 
     let res;
