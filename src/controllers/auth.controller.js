@@ -18,6 +18,12 @@ import { sendWelcomeEmail, sendBusinessVerifiedEmail } from "../services/mail.se
 // the whole app feels — cutting it from three sequential round trips to
 // two (profile first, since its result decides the 401; then seller +
 // businessProfile together) is a real, repeated win, not a one-off.
+//
+// sellerLocation: the seller's ship-from location (registered city/state,
+// plus dispatch district/state when they dispatch from somewhere else).
+// Added to the SAME seller_profiles query as status/shop_slug, so there is
+// no extra round trip. The GROW Transport page uses it to prefill the
+// origin city/state when a seller adds a route manually.
 export async function getMe(req, res) {
   // console.log("[getMe] req.user.id:", req.user?.id);
 
@@ -37,7 +43,11 @@ export async function getMe(req, res) {
   }
 
   const [sellerResult, businessResult] = await Promise.allSettled([
-    supabase.from("seller_profiles").select("status, shop_slug").eq("user_id", req.user.id).maybeSingle(),
+    supabase
+      .from("seller_profiles")
+      .select("status, shop_slug, city, state, dispatch_same_as_registered, dispatch_district, dispatch_state")
+      .eq("user_id", req.user.id)
+      .maybeSingle(),
     supabaseAdmin.from("business_profiles").select("*").eq("user_id", req.user.id).maybeSingle(),
   ]);
   const seller = sellerResult.status === "fulfilled" ? sellerResult.value.data : null;
@@ -50,6 +60,15 @@ export async function getMe(req, res) {
     notificationChannel: channelTokenFor(req.user.id),
     shop_slug: seller?.shop_slug ?? null,
     seller_status: seller?.status ?? null,
+    sellerLocation: seller
+      ? {
+        city: seller.city ?? null,
+        state: seller.state ?? null,
+        dispatch_same_as_registered: seller.dispatch_same_as_registered ?? true,
+        dispatch_district: seller.dispatch_district ?? null,
+        dispatch_state: seller.dispatch_state ?? null,
+      }
+      : null,
   });
 }
 
