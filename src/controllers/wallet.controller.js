@@ -11,15 +11,43 @@ export async function getWalletStatus(req, res) {
 }
 
 // GET /api/seller/wallet/transactions
+// GET /api/seller/wallet/transactions?limit=20&cursor=<created_at>|<id>
+// Newest first. Returns { transactions, hasMore, nextCursor }.
 export async function getWalletTransactions(req, res) {
-    const { data, error } = await supabase
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
+
+    let query = supabase
         .from("wallet_transactions")
         .select("id, order_id, type, amount, billing_period, note, breakdown, created_at")
         .eq("seller_id", req.sellerId)
         .order("created_at", { ascending: false })
-        .limit(100);
+        .order("id", { ascending: false })   // tie-breaker so rows with the same timestamp keep a stable order
+        .limit(limit + 1);                   // one extra row tells us whether another page exists
+
+    const cursor = String(req.query.cursor || "");
+    if (cursor) {
+        const [ts, id] = cursor.split("|");
+        // Validate before putting it into the filter string.
+        if (!ts || !id || !/^[0-9T:.+\-Z ]+$/.test(ts) || !/^[\w-]+$/.test(id)) {
+            return res.status(400).json({ success: false, message: "Invalid cursor." });
+        }
+        query = query.or(`created_at.lt."${ts}",and(created_at.eq."${ts}",id.lt."${id}")`);
+    }
+
+    const { data, error } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
-    res.json({ success: true, transactions: data || [] });
+
+    const rows = data || [];
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const last = page[page.length - 1];
+
+    res.json({
+        success: true,
+        transactions: page,
+        hasMore,
+        nextCursor: hasMore && last ? `${last.created_at}|${last.id}` : null,
+    });
 }
 
 // GET /api/seller/wallet/payment-instructions?amount=1000
