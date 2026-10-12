@@ -74,6 +74,17 @@
 //      is the one that created the brand item, so re-submissions of an
 //      already-approved item (the pre-existing autoApprove path) don't
 //      also fire this "needs mapping" notice a second time.
+//
+// ENQUIRY AUTO-APPROVAL (this pass): a product listed through "Sell this" on
+// an RFQ enquiry sends body.rfqEnquiryId. When that enquiry is open
+// (approved) and isn't the seller's own, a brand-NEW brand item is created
+// already "approved" (and linked to the enquiry's generic product, if any),
+// so the seller's submission rides the existing autoApprove path and is live
+// immediately. The frontend then sends the seller straight back to the
+// enquiry. An already-existing brand item that is still pending keeps its
+// status — the enquiry never approves someone else's pending product.
+// createSubmission / createListingForExistingBrand now also return
+// review_status on the submission, so the frontend can tell it is live.
 import { supabase, supabaseAdmin } from "../config/supabase.js";
 import { isValidValidityHours, resolveValidityHours, computeExpiry, isListingExpired } from "../../shared/listingValidity.js";
 import { notifyAdmins, notifyAdminSubmissionsChanged, notifyUser, notifySellerSubmissionsChanged } from "../services/notifications.service.js";
@@ -239,18 +250,32 @@ function validateNewBrandPackaging(body) {
     return missing;
 }
 
-// NEW: brand-new brand items are now created already-approved (see
-// "BRAND-NEW-PRODUCT FAST APPROVAL" note at top of file). generic_product_id
-// stays null — mapping happens later, independently, via
-// adminUpdateCatalogEntry("brand_item", ..., { parentId }) ("Fix mapping"
-// in the admin UI), not as a precondition of being live for buyers.
-async function createBrandItem({ productName, brandName, brandImage, brandNotApplicable, images, unit, packSize, masterPackSize, gstPercent }) {
+// The RFQ enquiry a listing is being created for ("Sell this" on an enquiry).
+// Only an OPEN (approved) enquiry that the seller did not post themselves
+// counts. Returns the enquiry row or null. The client id is never trusted
+// beyond this lookup.
+async function loadOpenRfqEnquiry(id, sellerId) {
+    if (!UUID_RE.test(String(id || ""))) return null;
+    const { data } = await supabase
+        .from("rfq_enquiries").select("id, buyer_id, generic_product_id, status").eq("id", id).maybeSingle();
+    if (!data || data.status !== "approved" || data.buyer_id === sellerId) return null;
+    return data;
+}
+
+// Brand-new brand items normally start "pending_review". When the product is
+// being listed from an open RFQ enquiry (`approved: true`) it is created
+// already "approved", so the seller's first submission is live immediately
+// (see ENQUIRY AUTO-APPROVAL note at the top). generic_product_id is the
+// enquiry's generic product when it has one, otherwise null — mapping stays
+// a separate, non-blocking admin task via adminUpdateCatalogEntry
+// ("brand_item", ..., { parentId }) ("Fix mapping" in the admin UI).
+async function createBrandItem({ productName, brandName, brandImage, genericProductId, brandNotApplicable, images, unit, packSize, masterPackSize, gstPercent, approved = false }) {
     const trimmedProduct = productName.trim();
     const insertRow = {
-        generic_product_id: null,
         name: trimmedProduct,
         brand_name: brandNotApplicable ? null : brandName.trim(),
         brand_image: brandNotApplicable ? null : (brandImage || null),
+        generic_product_id: genericProductId || null,
         brand_not_applicable: Boolean(brandNotApplicable),
         slug: slugify(`${trimmedProduct}-${brandNotApplicable ? Date.now() : brandName.trim()}`),
         image: images[0] || null,
@@ -260,7 +285,7 @@ async function createBrandItem({ productName, brandName, brandImage, brandNotApp
         units_per_master_pack: Number(masterPackSize),
         gst_percent: Number(gstPercent),
         is_ai_generated: false,
-        review_status: "pending_review",
+        review_status: approved ? "approved" : "pending_review",
         reviewed_at: new Date().toISOString(),
         reviewed_by: null,
     };
@@ -438,7 +463,16 @@ export async function createSubmission(req, res) {
     // (possibly already-mapped, possibly not) brand item created by an
     // earlier call should not fire it again.
     let isNewBrandItem = false;
+    // Listing created from an open RFQ enquiry ("Sell this"): a brand-new
+    // brand item is then created already approved, and linked to the
+    // enquiry's generic product when it has one.
+    let fromEnquiry = false;
+    let mapTo = null;
     try {
+        const enq = await loadOpenRfqEnquiry(body.rfqEnquiryId, sellerId);
+        fromEnquiry = !!enq;
+        mapTo = enq?.generic_product_id || null;
+
         brand = await findExistingBrandItem({
             productName: body.productName,
             brandName: body.brandName,
@@ -456,12 +490,14 @@ export async function createSubmission(req, res) {
                 productName: body.productName,
                 brandName: body.brandName,
                 brandImage: body.brandImage,
+                genericProductId: mapTo,
                 brandNotApplicable: Boolean(body.brandNotApplicable),
                 images: Array.isArray(body.images) ? body.images : [],
                 unit: body.unit,
                 packSize: body.packSize,
                 masterPackSize: body.masterPackSize,
                 gstPercent: body.gstPercent,
+                approved: fromEnquiry,
             });
             isNewBrandItem = true;
         }
@@ -480,10 +516,10 @@ export async function createSubmission(req, res) {
 
     // A brand item that's ALREADY approved means the product itself has
     // already cleared admin review — either because some seller's earlier
-    // submission got manually approved, OR (as of this pass) because it's
-    // a brand-new product created moments ago via createBrandItem, which
-    // now inserts as "approved" from the start. Either way, this seller's
-    // submission for it doesn't need to sit in the review queue.
+    // submission got manually approved, OR because it was just created
+    // from an open RFQ enquiry (createBrandItem inserts it "approved" in
+    // that case). Either way, this seller's submission for it doesn't
+    // need to sit in the review queue.
     // existingRow, when present here, is always "rejected" (the conflict
     // check above already ruled out any other status) — that resubmission
     // still goes through review even if the brand is approved, since
@@ -512,12 +548,12 @@ export async function createSubmission(req, res) {
         ({ data: inserted, error } = await supabase
             .from("seller_product_submissions")
             .update({ ...row, ...statusPatch })
-            .eq("id", existingRow.id).select("id, created_at, price").single());
+            .eq("id", existingRow.id).select("id, created_at, price, review_status").single());
     } else {
         ({ data: inserted, error } = await supabase
             .from("seller_product_submissions")
             .insert({ seller_id: sellerId, generic_product_brand_id: brand.id, ...row, ...statusPatch })
-            .select("id, created_at, price").single());
+            .select("id, created_at, price, review_status").single());
     }
     if (error) {
         if (error.code === "23505") return res.status(409).json({ success: false, message: "You're already listing this item." });
@@ -529,7 +565,7 @@ export async function createSubmission(req, res) {
     void publishListingChange(inserted.id);
 
     if (autoApprove) {
-        // Product already approved (or just fast-approved as brand-new) —
+        // Product already approved (or just fast-approved from an enquiry) —
         // nothing here BLOCKS admin's attention.
         await notifySellerListingLive(sellerId, inserted.id, brand.name);
 
@@ -538,7 +574,7 @@ export async function createSubmission(req, res) {
         // Notify admin so it surfaces in the "Needs mapping" tab — this
         // is informational, not a gate, and only fires once (the call
         // that actually created the brand item).
-        if (isNewBrandItem) {
+        if (isNewBrandItem && !mapTo) {
             await notifyAdmins({
                 type: "seller_submission",
                 title: "New product live — needs category mapping",
@@ -550,8 +586,10 @@ export async function createSubmission(req, res) {
     } else {
         await notifyAdmins({
             type: "seller_submission",
-            title: "Listing resubmitted for review",
-            message: `${brand.brand_name || "(No brand)"} — ${brand.name} was resubmitted after rejection.`,
+            title: existingRow ? "Listing resubmitted for review" : "New listing submitted for review",
+            message: existingRow
+                ? `${brand.brand_name || "(No brand)"} — ${brand.name} was resubmitted after rejection.`
+                : `${brand.brand_name || "(No brand)"} — ${brand.name} was submitted and needs review.`,
             link: `/listings?highlight=${inserted.id}`,
         });
         await notifyAdminSubmissionsChanged();
@@ -724,11 +762,11 @@ export async function createListingForExistingBrand(req, res) {
     if (existingRow) {
         ({ data: result, error } = await supabase.from("seller_product_submissions")
             .update({ ...row, ...statusPatch })
-            .eq("id", existingRow.id).select("id, created_at, price").single());
+            .eq("id", existingRow.id).select("id, created_at, price, review_status").single());
     } else {
         ({ data: result, error } = await supabase.from("seller_product_submissions")
             .insert({ seller_id: sellerId, generic_product_brand_id: effectiveBrand.id, ...row, ...statusPatch })
-            .select("id, created_at, price").single());
+            .select("id, created_at, price, review_status").single());
     }
     if (error) {
         if (error.code === "23505") return res.status(409).json({ success: false, message: "You're already listing this item." });

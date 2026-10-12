@@ -2,11 +2,14 @@
 import { supabase } from "../config/supabase.js";
 import { sanitizeEnquiry, toDto, isUuid, RFQ_STATUSES } from "../services/rfqValidation.js";
 import { notifyAdminsNewRfq } from "../services/rfqNotify.js";
+import { attachQuotes, countQuotesForBuyer } from "../services/rfqQuotes.service.js";
 
 const MAX_BULK = 50;       // keep within express.json's default 100kb body limit, or raise that limit for this route
 const MAX_PENDING = 100;   // per-user cap on enquiries waiting for review
 
 const safeSearch = (q) => String(q || "").replace(/[%_,()\\]/g, " ").trim().slice(0, 80);
+
+const sellerIdsOf = (req) => [...new Set([req.user.id, req.sellerId].filter(Boolean))];
 
 async function pendingCount(userId) {
     const { count, error } = await supabase
@@ -19,8 +22,11 @@ async function pendingCount(userId) {
 }
 
 // GET /api/rfq?scope=all|mine&q=&status=&limit=&offset=
+// Own rows carry `quotes` + `quotesCount`; other people's live rows carry `myQuote` (this seller's own quote, if any).
+// scope=mine also returns `quotesTotal` (live quotes across all of the buyer's enquiries).
 export async function listEnquiries(req, res) {
     try {
+        res.set("Cache-Control", "no-store");
         const scope = req.query.scope === "mine" ? "mine" : "all";
         const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 12, 1), 30);
         const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
@@ -31,18 +37,38 @@ export async function listEnquiries(req, res) {
             query = query.eq("buyer_id", req.user.id).order("created_at", { ascending: false });
             if (RFQ_STATUSES.includes(req.query.status)) query = query.eq("status", req.query.status);
         } else {
-            query = query.eq("status", "approved").order("published_at", { ascending: false });
+            query = query
+                .eq("status", "approved")
+                .neq("buyer_id", req.user.id)
+                .order("published_at", { ascending: false });
         }
         if (q) query = query.ilike("product_name", `%${q}%`);
 
         const { data, count, error } = await query.range(offset, offset + limit - 1);
         if (error) throw error;
 
-        const items = (data || []).map((row) => {
+        const rows = data || [];
+        const base = rows.map((row) => {
             const mine = row.buyer_id === req.user.id;
-            return { ...toDto(row, { owner: mine }), isMine: mine };
+            return {
+                ...toDto(row, { owner: mine }),
+                isMine: mine,
+                ...(mine ? {} : { buyerId: row.buyer_id }), // sellers need it to save this buyer's custom price
+            };
         });
-        res.json({ success: true, items, total: count ?? items.length, hasMore: offset + items.length < (count ?? 0) });
+
+        let items = base;
+        let quotesError = null;
+        try { items = await attachQuotes(base, rows, req.user.id, sellerIdsOf(req)); }
+        catch (e) { quotesError = e.message; console.error("[rfq] attachQuotes failed:", e.message); }
+
+        const body = { success: true, items, total: count ?? items.length, hasMore: offset + items.length < (count ?? 0) };
+        if (quotesError) body.quotesError = quotesError; // visible in DevTools instead of silently empty
+
+        if (scope === "mine") {
+            try { body.quotesTotal = await countQuotesForBuyer(req.user.id); } catch { /* tile falls back to a dash */ }
+        }
+        res.json(body);
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }
@@ -59,7 +85,14 @@ export async function getEnquiry(req, res) {
         if (!data || (!mine && data.status !== "approved")) {
             return res.status(404).json({ success: false, message: "Enquiry not found." });
         }
-        res.json({ success: true, enquiry: { ...toDto(data, { owner: mine }), isMine: mine } });
+        res.set("Cache-Control", "no-store");
+        let enquiry = {
+            ...toDto(data, { owner: mine }),
+            isMine: mine,
+            ...(mine ? {} : { buyerId: data.buyer_id }),
+        };
+        try { [enquiry] = await attachQuotes([enquiry], [data], req.user.id, sellerIdsOf(req)); } catch (e) { console.error("[rfq] attachQuotes failed:", e.message); }
+        res.json({ success: true, enquiry });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }

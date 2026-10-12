@@ -73,7 +73,7 @@ function daysFromDistance(km) {
 // actual dispatch location now lives on seller_profiles: either their
 // registered pincode/state (when dispatch_same_as_registered is true) or
 // their explicit dispatch_pincode/dispatch_district/dispatch_state.
-function resolveSellerDispatchLocation(seller) {
+export function resolveSellerDispatchLocation(seller) {
     if (!seller) return { pincode: null, state: null };
     if (seller.dispatch_same_as_registered) {
         return { pincode: seller.pincode || null, state: seller.state || null };
@@ -157,7 +157,7 @@ async function estimateTransitDayRange(originPincode, originState, destPincode, 
 // already resolved (by the caller) via resolveSellerDispatchLocation from
 // seller_profiles — submission.dispatch_pincode/dispatch_state are legacy
 // and no longer used as a source.
-async function estimateDeliveryDate(submission, dispatchPincode, dispatchState, buyerPincode, buyerState, acceptanceDelayDays = 0) {
+export async function estimateDeliveryDate(submission, dispatchPincode, dispatchState, buyerPincode, buyerState, acceptanceDelayDays = 0) {
     const leadDays = submission.stock_type === "made_to_order"
         ? Number(submission.production_lead_time_days || 0)
         : Number(submission.dispatch_time_days ?? submission.lead_time ?? 0);
@@ -205,7 +205,7 @@ async function estimateDeliveryDate(submission, dispatchPincode, dispatchState, 
     };
 }
 
-async function getAcceptanceWindow(submissionId, now = new Date()) {
+export async function getAcceptanceWindow(submissionId, now = new Date()) {
     const { data } = await supabase
         .from("seller_product_submissions")
         .select("seller:seller_profiles!seller_product_submissions_seller_id_fkey ( working_days, order_acceptance_start, order_acceptance_end, holidays )")
