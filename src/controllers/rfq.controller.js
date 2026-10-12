@@ -11,6 +11,19 @@ const safeSearch = (q) => String(q || "").replace(/[%_,()\\]/g, " ").trim().slic
 
 const sellerIdsOf = (req) => [...new Set([req.user.id, req.sellerId].filter(Boolean))];
 
+// Buyers now give ONE final quantity in the individual unit (e.g. 500 Kg). If a client still sends
+// "quantity in packs" + "pack size" (the older post form, bulk-upload sheets), fold it into the total and store a
+// pack size of 1, so every enquiry saved from now on has a single quantity. Anything that doesn't carry both numbers
+// as positive values is passed through untouched (sanitizeEnquiry then validates it exactly as before).
+function toTotalQuantity(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+    const packKey = "packSize" in raw ? "packSize" : "pack_size" in raw ? "pack_size" : null;
+    if (!packKey) return raw;
+    const q = Number(raw.quantity), p = Number(raw[packKey]);
+    if (!Number.isFinite(q) || !Number.isFinite(p) || !(q > 0) || !(p > 0) || p === 1) return raw;
+    return { ...raw, quantity: Math.round(q * p * 1e6) / 1e6, [packKey]: 1 };
+}
+
 async function pendingCount(userId) {
     const { count, error } = await supabase
         .from("rfq_enquiries")
@@ -101,7 +114,7 @@ export async function getEnquiry(req, res) {
 // POST /api/rfq
 export async function createEnquiry(req, res) {
     try {
-        const v = sanitizeEnquiry(req.body);
+        const v = sanitizeEnquiry(toTotalQuantity(req.body));
         if (!v.ok) return res.status(400).json({ success: false, message: v.message });
 
         if ((await pendingCount(req.user.id)) >= MAX_PENDING) {
@@ -140,7 +153,7 @@ export async function bulkCreateEnquiries(req, res) {
         const errors = [];
         const clean = [];
         rows.forEach((r, i) => {
-            const v = sanitizeEnquiry(r);
+            const v = sanitizeEnquiry(toTotalQuantity(r));
             if (!v.ok) errors.push({ row: i + 1, message: v.message });
             else clean.push({ ...v.row, buyer_id: req.user.id, status: "pending_review" });
         });
@@ -172,7 +185,7 @@ export async function updateOwnEnquiry(req, res) {
         const { id } = req.params;
         if (!isUuid(id)) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
-        const v = sanitizeEnquiry(req.body);
+        const v = sanitizeEnquiry(toTotalQuantity(req.body));
         if (!v.ok) return res.status(400).json({ success: false, message: v.message });
 
         const { data: current, error: curErr } = await supabase
