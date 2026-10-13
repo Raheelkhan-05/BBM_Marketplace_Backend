@@ -34,6 +34,7 @@ import rfqRoutes from "./routes/rfq.routes.js";
 import paymentsPublicRoutes from "./routes/paymentsPublic.routes.js";
 import paymentsRoutes from "./routes/payments.routes.js";
 import adminPaymentsRoutes from "./routes/adminPayments.routes.js";
+import sellerCustomersRoutes from "./routes/sellerCustomers.routes.js";
 
 export function createApp() {
   const app = express();
@@ -97,6 +98,7 @@ export function createApp() {
   });
 
   app.use("/api/auth", authRoutes);
+  app.use("/api/seller/customers", sellerCustomersRoutes);
   app.use("/api/seller/catalog", sellerCatalogListingsRouter);
   app.use("/api/seller/orders", sellerOrdersRoutes);
   app.use("/api/seller/wallet", sellerWalletRoutes);

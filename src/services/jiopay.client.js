@@ -4,6 +4,10 @@
 // Hash algorithm (docs.jiopay.in/docs/generate-hash): sort the keys alphabetically,
 // concatenate the VALUES with no delimiter, HMAC-SHA256 with the merchant secret, lowercase hex.
 //
+// Static-IP relay: when JIOPAY_BASE_URL points at our VPS relay, every call carries an
+// X-Relay-Key header (JIOPAY_RELAY_KEY). The relay forwards the request body untouched, so hashes
+// still verify exactly as before.
+//
 // UAT evidence: set JIOPAY_LOG_API_CALLS=true to store every request we send and every response we get
 // in the payment_api_logs table (see sql/payment_api_logs.sql). Off by default: it stores customer
 // email/mobile, so switch it off again once sign-off is done. The secret key is never part of a request body.
@@ -118,13 +122,18 @@ async function post(path, { json, form }) {
     assertJiopayConfigured();
     const url = `${cfg.baseUrl}${path}`;
     const request = json || form;
+
+    const headers = json
+        ? { "content-type": "application/json", accept: "application/json" }
+        : { "content-type": "application/x-www-form-urlencoded", accept: "application/json" };
+    // Authenticates us to the static-IP relay (the relay strips it before forwarding to JioPay).
+    if (cfg.relayKey) headers["x-relay-key"] = cfg.relayKey;
+
     let res;
     try {
         res = await fetch(url, {
             method: "POST",
-            headers: json
-                ? { "content-type": "application/json", accept: "application/json" }
-                : { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+            headers,
             body: json ? JSON.stringify(json) : new URLSearchParams(form).toString(),
             signal: AbortSignal.timeout(cfg.requestTimeoutMs),
         });

@@ -9,8 +9,10 @@
 //   JIOPAY_SECRET_KEY       your secret key
 //   JIOPAY_RETURN_URL       https://bbm-marketplace-backend.onrender.com/pay/return   (max 64 chars)
 //   FRONTEND_URL            https://www.bbm.business
+// Static-IP relay (VPS that forwards calls to JioPay so they leave from one whitelisted IP):
+//   JIOPAY_BASE_URL         https://relay.bbm.business   (the relay; do NOT add /tsp, the relay adds it for UAT)
+//   JIOPAY_RELAY_KEY        the secret you put in the relay's Caddyfile (sent as X-Relay-Key)
 // Optional:
-//   JIOPAY_BASE_URL         override gateway host (default: UAT https://uat.jiopay.co.in/tsp, PROD https://jiopay.co.in)
 //   JIOPAY_AGGREGATOR_ID    only if JioPay told you to send one
 //   JIOPAY_FALLBACK_EMAIL   used when a buyer has no email (default noreply@bbm.business)
 //   JIOPAY_SUCCESS_CODES    comma list, default "0000"
@@ -18,6 +20,7 @@
 //   JIOPAY_CONFIRM_WEBHOOK_WITH_STATUS true|false, default true (re-verify every success via the status API)
 //   JIOPAY_WEBHOOK_IPS      comma list of JioPay source IPs; when set, other IPs get 403
 //   JIOPAY_HASH_DEBUG       true to log field NAMES (never values) when a hash does not verify
+//   (If JIOPAY_BASE_URL is not set, calls go straight to JioPay: UAT https://uat.jiopay.co.in/tsp, PROD https://jiopay.co.in)
 
 const flag = (v, fallback) =>
     v == null || v === "" ? fallback : ["1", "true", "yes", "on"].includes(String(v).trim().toLowerCase());
@@ -37,6 +40,8 @@ export const jiopayConfig = Object.freeze({
     baseUrl: (process.env.JIOPAY_BASE_URL || (isProd ? "https://jiopay.co.in" : "https://uat.jiopay.co.in/tsp"))
         .trim()
         .replace(/\/+$/, ""),
+    // Shared secret for the static-IP relay. Empty = no relay header is sent (direct-to-JioPay mode).
+    relayKey: (process.env.JIOPAY_RELAY_KEY || "").trim(),
     returnUrl: (process.env.JIOPAY_RETURN_URL || "").trim(),
     frontendUrl: (process.env.FRONTEND_URL || "https://www.bbm.business").trim().replace(/\/+$/, ""),
     fallbackEmail: (process.env.JIOPAY_FALLBACK_EMAIL || "noreply@bbm.business").trim(),
@@ -65,7 +70,9 @@ export function assertJiopayConfigured() {
 export function logJiopayConfigStatus() {
     try {
         assertJiopayConfigured();
-        console.log(`[jiopay] configured (${jiopayConfig.isProd ? "PRODUCTION" : "UAT"}) base=${jiopayConfig.baseUrl}`);
+        console.log(
+            `[jiopay] configured (${jiopayConfig.isProd ? "PRODUCTION" : "UAT"}) base=${jiopayConfig.baseUrl} relay=${jiopayConfig.relayKey ? "on" : "off"}`
+        );
         return true;
     } catch (e) {
         console.error(`[jiopay] ${e.message}`);

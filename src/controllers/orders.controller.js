@@ -669,6 +669,9 @@ export async function placeOrder(req, res) {
                 await notifyIfWalletJustBlocked({ sellerId: submission.seller_id, sellerUserId: sellerProfile.user_id });
             }
         }
+
+        void supabase.rpc("sync_seller_customers_from_orders", { p_seller_id: submission.seller_id })
+            .then(({ error: syncErr }) => { if (syncErr) console.error("[customers] sync failed:", syncErr.message); });
     }
 
     res.json({
