@@ -12,7 +12,7 @@
 // Started from startSettlementScheduler() (settlement.service.js), so no
 // server.js change is needed.
 import { supabase } from "../config/supabase.js";
-import { notifyUser, notifyOrderChanged, notifyUserOrdersChanged } from "./realtimeBroadcast.js";
+import { notifyUser, notifyOrderChanged, notifyUserOrdersChanged, notifyCreditChanged } from "./realtimeBroadcast.js";
 import { sendOrderUpdateWhatsApp } from "./whatsapp.service.js";
 import { notifyIfWalletJustBlocked } from "./walletNotifications.service.js";
 
@@ -36,6 +36,10 @@ async function runSideEffects(r) {
         if (r.r_seller_user_id) {
             await notifyIfWalletJustBlocked({ sellerId: r.r_seller_id, sellerUserId: r.r_seller_user_id });
         }
+    });
+    // credit order: usage was given back inside expire_unaccepted_orders — refresh both open screens
+    await safely("credit usage ping", async () => {
+        if (r.r_is_credit) notifyCreditChanged([r.r_buyer_id, r.r_seller_user_id]);
     });
 
     await safely("realtime", () => notifyOrderChanged(r.r_order_id, { status: "rejected" }));

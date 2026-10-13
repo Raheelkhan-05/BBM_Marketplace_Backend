@@ -8,6 +8,12 @@ import { trackCreditEvent } from "../services/creditEvents.js";
 // Every credit notification deep-links into the Credit page: the right tab,
 // scrolled to and highlighted on the exact record (see CreditPage.jsx).
 //   tab: "requests" (seller inbox) | "approved" | "sellers"
+// Seller-facing credit events now land on the Customers page, buyer-facing ones stay on /credit.
+// !! VERIFY: this must be the real route of GrowCustomersPage in your router.
+const CUSTOMERS_PATH = process.env.SELLER_CUSTOMERS_PATH || "/grow/customers";
+const sellerCreditLink = (creditId) =>
+    `${CUSTOMERS_PATH}?filter=requests${creditId ? `&highlight=${creditId}` : ""}`;
+
 const creditLink = (tab, creditId) =>
     creditId ? `/credit?tab=${tab}&highlight=${creditId}` : `/credit?tab=${tab}`;
 
@@ -380,8 +386,8 @@ export async function searchCreditBuyers(req, res) {
 export async function grantCredit(req, res) {
     const { buyerId, creditLimit } = req.body || {};
     const limit = Number(creditLimit);
-    if (!buyerId || !(limit > 0)) {
-        return res.status(400).json({ success: false, message: "Pick a buyer and set a credit limit." });
+    if (!buyerId || !Number.isFinite(limit) || !(limit > 0) || limit > 1_000_000_000) {
+        return res.status(400).json({ success: false, message: "Pick a buyer and set a valid credit limit." });
     }
     if (buyerId === req.user.id) {
         return res.status(400).json({ success: false, message: "You can't give credit to your own shop." });
@@ -396,74 +402,32 @@ export async function grantCredit(req, res) {
     // Same eligibility rules as search — never trust the client's pick.
     const { data: buyer } = await eligibleBuyers("id", req.user.id).eq("id", buyerId).maybeSingle();
     if (!buyer) {
-        return res.status(400).json({ success: false, code: "BUYER_NOT_ELIGIBLE", message: "This buyer isn't available for credit." });
-    }
-
-    const { data: existing } = await supabase
-        .from("buyer_seller_credit").select("*")
-        .eq("buyer_id", buyerId).eq("seller_id", sp.id)
-        .maybeSingle();
-
-    if (existing?.status === "approved") {
-        return res.status(409).json({
-            success: false, code: "ALREADY_APPROVED",
-            message: "Credit is already approved for this buyer. Use \"Change limit\" to adjust it.",
+        return res.status(400).json({
+            success: false, code: "BUYER_NOT_ELIGIBLE",
+            message: "This buyer hasn't finished verifying their account yet, so credit can't be set for them.",
         });
     }
 
-    let creditId;
-    let conversationId = existing?.conversation_id || null;
-
-    if (existing?.status === "pending") {
-        // The buyer already asked — resolve it the normal way (updates their chat card too).
-        const { error } = await supabase.rpc("decide_credit", {
-            p_credit_id: existing.id, p_seller_user_id: req.user.id,
-            p_decision: "approved", p_credit_limit: limit,
-        });
-        if (error) {
-            console.error("grantCredit decide_credit failed:", error);
-            return res.status(400).json({ success: false, message: "Couldn't approve this buyer. Please try again." });
-        }
-        creditId = existing.id;
-    } else {
-        try {
-            if (!conversationId) conversationId = await ensureDirectConversation(req.user.id, buyerId);
-        } catch (e) {
-            console.error("grantCredit conversation failed:", e.message);
-            return res.status(500).json({ success: false, message: "Couldn't set up the chat with this buyer." });
-        }
-
-        const patch = {
-            status: "approved",
-            credit_limit: limit,
-            credit_used: 0,
-            cooldown_until: null,
-            limit_increase_requested_at: null,
-            limit_increase_request_message_id: null,
-            limit_increase_cooldown_until: null,
-            conversation_id: conversationId,
-        };
-
-        if (existing) {
-            // Previously declined or turned off — re-approve with a fresh limit.
-            const { error } = await supabase.from("buyer_seller_credit").update(patch).eq("id", existing.id);
-            if (error) {
-                console.error("grantCredit update failed:", error);
-                return res.status(500).json({ success: false, message: "Couldn't approve this buyer. Please try again." });
-            }
-            creditId = existing.id;
-        } else {
-            const { data: created, error } = await supabase
-                .from("buyer_seller_credit")
-                .insert({ buyer_id: buyerId, seller_id: sp.id, ...patch })
-                .select("id").single();
-            if (error) {
-                console.error("grantCredit insert failed:", error);
-                return res.status(500).json({ success: false, message: "Couldn't approve this buyer. Please try again." });
-            }
-            creditId = created.id;
-        }
+    let conversationId;
+    try { conversationId = await ensureDirectConversation(req.user.id, buyerId); }
+    catch (e) {
+        console.error("grantCredit conversation failed:", e.message);
+        return res.status(500).json({ success: false, message: "Couldn't set up the chat with this buyer." });
     }
+
+    const { data, error } = await supabase.rpc("grant_credit", {
+        p_seller_user_id: req.user.id, p_buyer_id: buyerId, p_limit: limit, p_conversation_id: conversationId,
+    });
+    if (error) {
+        if (error.message === "ALREADY_APPROVED") {
+            return res.status(409).json({ success: false, code: "ALREADY_APPROVED", message: 'Credit is already approved for this buyer. Use "Change limit" to adjust it.' });
+        }
+        console.error("grant_credit RPC failed:", error);
+        return res.status(error.message === "NOT_A_SELLER" ? 403 : 500).json({ success: false, message: "Couldn't approve this buyer. Please try again." });
+    }
+    const row = Array.isArray(data) ? data[0] : data;
+    const creditId = row.credit_id;
+    conversationId = row.conversation_id || conversationId;
 
     await trackCreditEvent({
         creditId, buyerId, sellerId: sp.id, sellerUserId: req.user.id,
@@ -476,8 +440,7 @@ export async function grantCredit(req, res) {
         emitToConversation(conversationId, "credit:decided", { creditId, status: "approved", cooldownUntil: null });
     }
     notifyUser(buyerId, {
-        type: "credit_decision",
-        title: "Credit approved",
+        type: "credit_decision", title: "Credit approved",
         body: "A seller has approved you to buy on credit.",
         link: creditLink("approved", creditId),
     });
@@ -583,7 +546,7 @@ export async function requestCredit(req, res) {
         type: "credit_request",
         title: "New credit request",
         body: "A buyer wants to buy on credit from you.",
-        link: creditLink("requests", row.credit_id),
+        link: sellerCreditLink(row.credit_id),
     });
 }
 
@@ -629,7 +592,7 @@ export async function requestCreditIncrease(req, res) {
         type: "credit_limit_request",
         title: "Credit limit increase requested",
         body: "A buyer has asked you to reconsider their credit limit.",
-        link: creditLink("requests", credit.id),
+        link: sellerCreditLink(credit.id),
     });
 }
 

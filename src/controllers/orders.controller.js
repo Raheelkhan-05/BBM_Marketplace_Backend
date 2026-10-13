@@ -1,6 +1,6 @@
 // controllers/orders.controller.js
 import { supabase } from "../config/supabase.js";
-import { notifyUser, notifyOrderChanged, notifyUserOrdersChanged } from "../services/realtimeBroadcast.js";
+import { notifyUser, notifyOrderChanged, notifyUserOrdersChanged, notifyCreditChanged } from "../services/realtimeBroadcast.js";
 import { sendOrderUpdateWhatsApp } from "../services/whatsapp.service.js";
 import { notifyIfWalletJustBlocked } from "../services/walletNotifications.service.js";
 import { fetchCustomPriceMap, resolveEffectiveBasePrice } from "../../shared/customPricing.js";
@@ -665,13 +665,13 @@ export async function placeOrder(req, res) {
 
             await supabase.rpc("wallet_accrue_commission", { p_order_id: row.order_id });
 
+            void supabase.rpc("sync_seller_customers_from_orders", { p_seller_id: submission.seller_id })
+                .then(({ error: syncErr }) => { if (syncErr) console.error("[customers] sync failed:", syncErr.message); });
+
             if (sellerProfile) {
                 await notifyIfWalletJustBlocked({ sellerId: submission.seller_id, sellerUserId: sellerProfile.user_id });
             }
         }
-
-        void supabase.rpc("sync_seller_customers_from_orders", { p_seller_id: submission.seller_id })
-            .then(({ error: syncErr }) => { if (syncErr) console.error("[customers] sync failed:", syncErr.message); });
     }
 
     res.json({
@@ -770,6 +770,13 @@ export async function getMyOrder(req, res) {
 // POST /api/orders/:id/cancel
 export async function cancelMyOrder(req, res) {
     const { reason } = req.body || {};
+
+    // read BEFORE the RPC flips the status
+    const { data: pre } = await supabase
+        .from("orders").select("status, payment_status, payment_method, buyer_id")
+        .eq("id", req.params.id).eq("buyer_id", req.user.id).maybeSingle();
+    const wasUnpaid = !pre || pre.status === "awaiting_payment" || pre.payment_status === "unpaid";
+
     const { data, error } = await supabase.rpc("update_order_status", {
         p_order_id: req.params.id, p_actor_role: "buyer", p_actor_user_id: req.user.id,
         p_new_status: "cancelled", p_note: reason || "Cancelled by buyer",
@@ -785,13 +792,15 @@ export async function cancelMyOrder(req, res) {
     await notifyOrderChanged(req.params.id, { status: "cancelled" });
     await supabase.rpc("wallet_reverse_commission", { p_order_id: req.params.id });
 
+    // credit order: usage was given back inside update_order_status — tell both screens
+    if (pre?.payment_method === "credit") notifyCreditChanged([pre.buyer_id, row?.notify_user_id]);
+
     if (row?.notify_user_id) {
         const { data: orderForWallet } = await supabase
             .from("orders").select("seller_id").eq("id", req.params.id).maybeSingle();
         if (orderForWallet?.seller_id) {
             await notifyIfWalletJustBlocked({ sellerId: orderForWallet.seller_id, sellerUserId: row.notify_user_id });
         }
-
         await notifyUser(row.notify_user_id, {
             type: "order_status_cancelled",
             title: `Order ${row.order_number} cancelled`,

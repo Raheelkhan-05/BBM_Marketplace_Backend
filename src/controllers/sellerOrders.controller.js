@@ -16,7 +16,7 @@
 //   company, branch, contact) is already on the order from place_order —
 //   this step only asks for the LR number/proof and the bill.
 import { supabase } from "../config/supabase.js";
-import { notifyOrderChanged, notifyUserOrdersChanged, notifyUser } from "../services/realtimeBroadcast.js";
+import { notifyOrderChanged, notifyUserOrdersChanged, notifyUser, notifyCreditChanged } from "../services/realtimeBroadcast.js";
 import { sendOrderUpdateWhatsApp } from "../services/whatsapp.service.js";
 import { notifyIfWalletJustBlocked } from "../services/walletNotifications.service.js";
 import { getTransportOption, transportLabel } from "../../shared/transportOptions.js";
@@ -119,10 +119,12 @@ function transitionHandler(newStatus) {
             await supabase.rpc("wallet_reverse_commission", { p_order_id: req.params.id });
 
             const { data: orderForWallet } = await supabase
-                .from("orders").select("seller_id").eq("id", req.params.id).maybeSingle();
+                .from("orders").select("seller_id, buyer_id, payment_method").eq("id", req.params.id).maybeSingle();
             if (orderForWallet?.seller_id) {
                 await notifyIfWalletJustBlocked({ sellerId: orderForWallet.seller_id, sellerUserId: req.sellerId });
             }
+            // credit order: usage was given back inside update_order_status
+            if (orderForWallet?.payment_method === "credit") notifyCreditChanged([orderForWallet.buyer_id, req.user.id]);
         }
 
         const row = Array.isArray(data) ? data[0] : data;

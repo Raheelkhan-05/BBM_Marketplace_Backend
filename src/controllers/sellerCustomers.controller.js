@@ -1,4 +1,7 @@
-// controllers/sellerCustomers.controller.js — a seller's customers (auto from orders + added by GSTIN)
+// controllers/sellerCustomers.controller.js — a seller's customers (auto from orders + added by GSTIN + credit requests)
+// CHANGED: reads from seller_customers_v (customer + credit state in ONE query),
+// adds "requests" / "credit" filters, credit summary per customer, optional
+// sync skip for realtime refreshes, and returns userId when a customer is added.
 import { supabase, supabaseAdmin } from "../config/supabase.js";
 import { validateGSTIN, fetchGstinDetails } from "../services/gst.service.js";
 
@@ -7,6 +10,7 @@ const isUuid = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f
 const safeSearch = (q) => String(q || "").replace(/[%_,()\\*]/g, " ").trim().slice(0, 80);
 const nameOf = (bp) => bp?.display_name?.trim() || bp?.trade_name?.trim() || bp?.legal_name?.trim() || null;
 const placeOf = (bp) => [bp?.district, bp?.state].filter(Boolean).join(", ") || null;
+const FILTERS = ["active", "invited", "requests", "credit"];
 
 async function sellerUserIdOf(sellerId) {
     const { data } = await supabase.from("seller_profiles").select("user_id").eq("id", sellerId).maybeSingle();
@@ -78,6 +82,7 @@ async function addOne(sellerId, sellerUserId, rawGstin, source) {
     }
     return {
         gstin: r.gstin, name: r.name, location: r.location,
+        userId: data.customer_user_id || null, // NEW: lets the client set credit right after adding
         result: r.state === "registered" ? "added" : "invited",
         customer: { id: data.id, name: data.business_name, gstin: data.gstin },
     };
@@ -85,10 +90,11 @@ async function addOne(sellerId, sellerUserId, rawGstin, source) {
 
 function toDto(row, profile, stats) {
     const ordered = Number(stats?.orders_count || 0) > 0;
+    const registered = !!row.customer_user_id;
     return {
         id: row.id,
         userId: row.customer_user_id || null,
-        status: row.customer_user_id ? "active" : "invited",
+        status: registered ? "active" : "invited",
         name: row.business_name,
         gstin: row.gstin || null,
         location: row.location || null,
@@ -102,28 +108,44 @@ function toDto(row, profile, stats) {
         contactName: ordered ? profile?.name || null : null,
         phone: ordered ? profile?.phone || null : null,
         email: ordered ? profile?.email || null : null,
+        // credit (null for invited customers — no BBM account yet)
+        credit: registered ? {
+            id: row.credit_id || null,
+            status: row.credit_status || "none", // none | pending | approved | rejected | revoked
+            limit: Number(row.credit_limit || 0),
+            used: Number(row.credit_used_effective || 0), // monthly reset already applied
+            increasePending: !!row.credit_increase_pending,
+            attention: !!row.credit_attention,
+        } : null,
     };
 }
 
-// GET /api/seller/customers?q=&filter=all|active|invited&limit=&offset=
+// GET /api/seller/customers?q=&filter=all|active|invited|requests|credit&limit=&offset=&sync=0
 export async function listCustomers(req, res) {
     try {
         const sellerId = req.sellerId;
-        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 12, 1), 30);
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 12, 1), 100);
         const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
-        const filter = ["active", "invited"].includes(req.query.filter) ? req.query.filter : "all";
+        const filter = FILTERS.includes(req.query.filter) ? req.query.filter : "all";
         const q = safeSearch(req.query.q);
 
-        if (offset === 0) {
+        // realtime-triggered refreshes pass sync=0: the order/credit paths already sync.
+        if (offset === 0 && req.query.sync !== "0") {
             const { error } = await supabase.rpc("sync_seller_customers_from_orders", { p_seller_id: sellerId });
             if (error) console.error("[customers] sync failed:", error.message);
         }
 
-        let query = supabase.from("seller_customers").select("*", { count: "exact" }).eq("seller_id", sellerId);
+        let query = supabase.from("seller_customers_v").select("*", { count: "exact" }).eq("seller_id", sellerId);
         if (filter === "active") query = query.not("customer_user_id", "is", null);
         if (filter === "invited") query = query.is("customer_user_id", null);
+        if (filter === "requests") query = query.eq("credit_attention", true);
+        if (filter === "credit") query = query.eq("credit_status", "approved");
         if (q) query = query.or(`business_name.ilike.%${q}%,gstin.ilike.%${q}%`);
-        const { data, count, error } = await query.order("created_at", { ascending: false }).range(offset, offset + limit - 1);
+        const { data, count, error } = await query
+            .order("credit_attention", { ascending: false })
+            .order("created_at", { ascending: false })
+            .order("id", { ascending: true })
+            .range(offset, offset + limit - 1);
         if (error) throw error;
         const rows = data || [];
 
@@ -143,9 +165,15 @@ export async function listCustomers(req, res) {
             hasMore: offset + rows.length < (count ?? 0),
         };
         if (offset === 0) {
-            const head = () => supabase.from("seller_customers").select("id", { count: "exact", head: true }).eq("seller_id", sellerId);
-            const [a, b, c] = await Promise.all([head(), head().not("customer_user_id", "is", null), head().is("customer_user_id", null)]);
-            body.counts = { all: a.count || 0, active: b.count || 0, invited: c.count || 0 };
+            const head = () => supabase.from("seller_customers_v").select("id", { count: "exact", head: true }).eq("seller_id", sellerId);
+            const [a, b, c, d, e] = await Promise.all([
+                head(),
+                head().not("customer_user_id", "is", null),
+                head().is("customer_user_id", null),
+                head().eq("credit_attention", true),
+                head().eq("credit_status", "approved"),
+            ]);
+            body.counts = { all: a.count || 0, active: b.count || 0, invited: c.count || 0, requests: d.count || 0, credit: e.count || 0 };
         }
         res.json(body);
     } catch (error) {

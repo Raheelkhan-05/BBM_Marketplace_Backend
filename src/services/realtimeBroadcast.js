@@ -33,3 +33,13 @@ export async function notifyUserOrdersChanged(userId) {
     try { getIO().to(`user:${userId}`).emit("orders_changed", {}); }
     catch (err) { console.error("[notifyUserOrdersChanged] emit failed:", err.message); }
 }
+
+// Tells both people's open screens that credit USAGE moved (credit order placed / cancelled / rejected / not accepted).
+export function notifyCreditChanged(userIds, payload = {}) {
+    try {
+        const io = getIO();
+        for (const uid of new Set((userIds || []).filter(Boolean))) {
+            io.to(`user:${uid}`).emit("credit:changed", { eventType: "usage_changed", at: new Date().toISOString(), ...payload });
+        }
+    } catch (err) { console.error("[notifyCreditChanged] emit failed:", err.message); }
+}
