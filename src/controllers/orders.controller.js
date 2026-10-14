@@ -6,6 +6,7 @@ import { notifyIfWalletJustBlocked } from "../services/walletNotifications.servi
 import { fetchCustomPriceMap, resolveEffectiveBasePrice } from "../../shared/customPricing.js";
 import { isListingExpired } from "../../shared/listingValidity.js";
 import { processRefundQueue } from "../services/payments.service.js";
+import { attachRepricePreview } from "../services/orderReprice.service.js";
 
 import { getRoadDistanceKm } from "../services/pincodeDistance.js";
 import { purchaseQtyToSaleUnitQty, saleUnitQtyToBaseUnits, getSaleUnit, saleUnitLabel, round2 } from "../../shared/packUnits.js";
@@ -702,7 +703,7 @@ export async function listMyOrders(req, res) {
       buyer_transport_mode, transport_mode, transport_fields, transport_notes, transport_proof_url, transport_confirmed_at, transport_source,
       seller:seller_profiles ( id, display_name, shop_slug, logo_url, city, state ),
       delivered_at, dispute_status, dispute_window_ends_at, settlement_status, settlement_seller_amount, cancel_reason_code, cancel_reason_text,
-      seller_response_due_at, auto_rejected_at, auto_refund_amount,
+      seller_response_due_at, auto_rejected_at, auto_refund_amount, price_revised_from,
       items:order_items (
         id, product_name_snapshot, brand_name_snapshot, image_snapshot, unit_price, base_price_applied,
         discount_percent, unit, quantity, purchase_basis, pack_quantity_snapshot, lead_time_snapshot, line_total,
@@ -718,7 +719,7 @@ export async function listMyOrders(req, res) {
     if (error) return res.status(500).json({ success: false, message: error.message });
 
     const orders = (data || []).map((o) => ({ ...o, group_number: o.order_group?.group_number || null }));
-    res.json({ success: true, orders });
+    res.json({ success: true, orders: await attachRepricePreview(req.user.id, orders) });
 }
 
 // GET /api/orders/:id
@@ -764,7 +765,8 @@ export async function getMyOrder(req, res) {
     }
 
     const { data: events } = await supabase.from("order_events").select("*").eq("order_id", order.id).order("created_at");
-    res.json({ success: true, order, events: events || [] });
+    const [withPrice] = await attachRepricePreview(req.user.id, [order]);
+    res.json({ success: true, order: withPrice, events: events || [] });
 }
 
 // POST /api/orders/:id/cancel

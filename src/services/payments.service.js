@@ -24,11 +24,12 @@ import { notifyIfWalletJustBlocked } from "./walletNotifications.service.js";
 import { sendOrderUpdateWhatsApp } from "./whatsapp.service.js";
 
 export class PaymentError extends Error {
-    constructor(status, message, code) {
+    constructor(status, message, code, details = null) {
         super(message);
         this.name = "PaymentError";
         this.status = status;
         this.code = code || "PAYMENT_ERROR";
+        this.details = details;
     }
 }
 
@@ -58,6 +59,17 @@ const CREATE_ERRORS = {
     TOO_MANY_ATTEMPTS: [429, "Too many payment attempts. Please wait a few minutes and try again."],
 };
 
+const BLOCK_REASON = {
+    LISTING_UNAVAILABLE: "is no longer available from the seller",
+    LISTING_EXPIRED: "is no longer available (the seller's offer has ended)",
+    PACKAGING_CHANGED: "was repackaged by the seller, so this quantity no longer applies",
+    BELOW_MOQ: "is now below the seller's minimum order quantity",
+    OUT_OF_STOCK: "is out of stock",
+    EXCEEDS_AVAILABLE_STOCK: "is now more than the seller has in stock",
+};
+
+const toPaise = (rupees) => Math.round((Number(rupees) || 0) * 100);
+
 // Keep a resumed session only if it still has at least this long to live.
 const RESUME_MIN_REMAINING_MS = 60 * 1000;
 
@@ -76,11 +88,12 @@ async function targetStillUnpaid(purpose, targetId) {
 // Finds a payment session this buyer already opened for the SAME order / cart that can still be
 // completed, and rebuilds its gateway URL from what we stored (redirect_uri + tranCtx).
 // No call to JioPay is made. Returns null when there is nothing to resume.
-async function findResumableAttempt({ purpose, userId, targetId }) {
-    if (purpose !== "order" && purpose !== "order_group") return null; // wallet top-ups always start fresh
+// 3) findResumableAttempt: accept expectedPaise and only resume a session for exactly that amount
+async function findResumableAttempt({ purpose, userId, targetId, expectedPaise = null }) {
+    if (purpose !== "order" && purpose !== "order_group") return null;
 
     const targetCol = purpose === "order" ? "order_id" : "order_group_id";
-    const { data: a, error } = await supabase.from("payment_attempts")
+    let query = supabase.from("payment_attempts")
         .select("id, merchant_txn_no, amount_paise, tran_ctx, redirect_uri, expires_at")
         .eq("purpose", purpose)
         .eq(targetCol, targetId)
@@ -88,16 +101,15 @@ async function findResumableAttempt({ purpose, userId, targetId }) {
         .in("status", ["initiated", "pending"])
         .not("tran_ctx", "is", null)
         .not("redirect_uri", "is", null)
-        .gt("expires_at", new Date(Date.now() + RESUME_MIN_REMAINING_MS).toISOString())
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
+        .gt("expires_at", new Date(Date.now() + RESUME_MIN_REMAINING_MS).toISOString());
+    if (expectedPaise != null) query = query.eq("amount_paise", expectedPaise);
+
+    const { data: a, error } = await query.order("created_at", { ascending: false }).limit(1).maybeSingle();
     if (error) {
         console.error("[payments] resumable attempt lookup failed:", error.message);
         return null;
     }
     if (!a) return null;
-
     if (!(await targetStillUnpaid(purpose, targetId))) return null;
 
     try {
@@ -111,22 +123,70 @@ async function findResumableAttempt({ purpose, userId, targetId }) {
     }
 }
 
+// Reprices the unpaid order / cart under a lock. Returns the amount (paise) the buyer will be charged.
+// Throws PRICE_CHANGED if it differs from what the buyer last saw (expectedTotal, or the stored total
+// when the client sent none), ORDER_UNAVAILABLE if something can no longer be bought.
+async function repriceForPayment({ purpose, userId, targetId, expectedTotal }) {
+    const { data, error } = await supabase.rpc("order_reprice_for_payment", {
+        p_buyer_id: userId, p_purpose: purpose, p_target_id: targetId,
+    });
+    if (error) {
+        const code = (error.message || "").trim();
+        const mapped = CREATE_ERRORS[code];
+        if (mapped) throw new PaymentError(mapped[0], mapped[1], code);
+        console.error("[payments] order_reprice_for_payment failed:", error.message);
+        throw new PaymentError(500, "Couldn't start the payment. Please try again.", "CREATE_FAILED");
+    }
+
+    const what = purpose === "order_group" ? "cart" : "order";
+
+    if (data?.blocked) {
+        const b = (data.blockers || [])[0] || {};
+        const reason = BLOCK_REASON[b.code] || "can't be bought right now";
+        throw new PaymentError(
+            409,
+            `${b.product_name || "An item"} ${reason}. This ${what} can't be paid right now. You can cancel it from My orders.`,
+            "ORDER_UNAVAILABLE",
+            { blockers: data.blockers }
+        );
+    }
+
+    if (data?.changed) await safely("orders refresh", () => notifyUserOrdersChanged(userId));
+
+    const currentPaise = toPaise(data.current_total);
+    const hasExpected = expectedTotal != null && Number.isFinite(Number(expectedTotal));
+    const expectedPaise = hasExpected ? toPaise(expectedTotal) : toPaise(data.previous_total);
+
+    if (currentPaise !== expectedPaise) {
+        const up = currentPaise > expectedPaise;
+        throw new PaymentError(
+            409,
+            `The price changed: your ${what} was ${inr(expectedPaise)} and is now ${inr(currentPaise)} (${up ? "an increase" : "a decrease"}). Please check the new amount in My orders, then pay again.`,
+            "PRICE_CHANGED",
+            { previousTotal: expectedPaise / 100, currentTotal: currentPaise / 100, direction: up ? "up" : "down" }
+        );
+    }
+    return currentPaise;
+}
+
 // purpose: 'order' | 'order_group' | 'wallet_topup'
-export async function createCheckout({ purpose, userId, targetId, amountPaise = null }) {
+// 4) createCheckout: reprice first; final guard after the attempt row is created
+export async function createCheckout({ purpose, userId, targetId, amountPaise = null, expectedTotal = null }) {
     assertJiopayConfigured();
 
-    // 1) Continue the buyer's earlier, still-valid session if there is one (needs no gateway call).
-    const resumable = await findResumableAttempt({ purpose, userId, targetId });
+    let expectedPaise = null;
+    if (purpose === "order" || purpose === "order_group") {
+        expectedPaise = await repriceForPayment({ purpose, userId, targetId, expectedTotal });
+    }
+
+    const resumable = await findResumableAttempt({ purpose, userId, targetId, expectedPaise });
     if (resumable) return resumable;
 
-    // 2) The gateway is known to be refusing us: say so now, BEFORE creating an attempt row.
-    //    (Every failed attempt row counts toward the buyer's "too many attempts" limit.)
     if (isGatewayBlocked()) {
         console.warn(`[payments] checkout refused: gateway paused for another ${gatewayBlockedForSeconds()}s`);
         throw new PaymentError(503, "Payments are temporarily unavailable. Please try again in a few minutes.", "GATEWAY_UNAVAILABLE");
     }
 
-    // 3) Otherwise open a brand-new session.
     const { data: created, error } = await supabase
         .rpc("payment_create_attempt", {
             p_purpose: purpose, p_user_id: userId, p_target_id: targetId,
@@ -145,6 +205,15 @@ export async function createCheckout({ purpose, userId, targetId, amountPaise = 
     const attemptId = created.r_attempt_id;
     const ref = created.r_merchant_txn_no;
     const paise = Number(created.r_amount_paise);
+
+    // Someone changed the price between our reprice and this row (e.g. another tab): never charge an unseen amount.
+    if (expectedPaise != null && paise !== expectedPaise) {
+        await supabase.from("payment_attempts")
+            .update({ status: "failed", gateway_message: "price changed during checkout", completed_at: new Date().toISOString() })
+            .eq("id", attemptId).eq("status", "created");
+        throw new PaymentError(409, "The price of this order just changed. Please review it and try again.", "PRICE_CHANGED",
+            { previousTotal: expectedPaise / 100, currentTotal: paise / 100, direction: paise > expectedPaise ? "up" : "down" });
+    }
 
     const { data: profile } = await supabase.from("profiles").select("name, email, phone").eq("id", userId).maybeSingle();
 

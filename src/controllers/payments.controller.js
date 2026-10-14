@@ -9,10 +9,19 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 
 function fail(res, e, label) {
     if (e instanceof PaymentError) {
-        return res.status(e.status).json({ success: false, code: e.code, message: e.message });
+        return res.status(e.status).json({
+            success: false, code: e.code, message: e.message,
+            ...(e.details ? { details: e.details } : {}),
+        });
     }
     console.error(`[payments] ${label} failed:`, e);
     return res.status(500).json({ success: false, message: "Something went wrong. Please try again." });
+}
+
+function parseExpectedTotal(v) {
+    if (v == null || v === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 && n <= 10000000 ? n : null;
 }
 
 /* ------------------------------------------------------------------ checkout */
@@ -22,7 +31,7 @@ export async function checkoutOrder(req, res) {
     try {
         const { orderId } = req.params;
         if (!UUID_RE.test(orderId)) return res.status(400).json({ success: false, message: "Invalid order." });
-        const out = await createCheckout({ purpose: "order", userId: req.user.id, targetId: orderId });
+        const out = await createCheckout({ purpose: "order", userId: req.user.id, expectedTotal: parseExpectedTotal(req.body?.expectedTotal), targetId: orderId });
         res.json({ success: true, ref: out.ref, redirectUrl: out.redirectUrl });
     } catch (e) { fail(res, e, "checkoutOrder"); }
 }
@@ -32,7 +41,7 @@ export async function checkoutGroup(req, res) {
     try {
         const { groupId } = req.params;
         if (!UUID_RE.test(groupId)) return res.status(400).json({ success: false, message: "Invalid order." });
-        const out = await createCheckout({ purpose: "order_group", userId: req.user.id, targetId: groupId });
+        const out = await createCheckout({ purpose: "order_group", userId: req.user.id, expectedTotal: parseExpectedTotal(req.body?.expectedTotal), targetId: groupId });
         res.json({ success: true, ref: out.ref, redirectUrl: out.redirectUrl });
     } catch (e) { fail(res, e, "checkoutGroup"); }
 }

@@ -33,6 +33,28 @@ function customPatch(s, effectivePrice) {
     return { ...defaultPatch(s), price: Number(effectivePrice), quantity_discounts: [], price_slabs: [], is_custom_priced: true };
 }
 
+// add helper
+async function notifyUnpaidOrderBuyers(submissionId, { buyerIds = null } = {}) {
+    try {
+        const { data, error } = await supabase.from("order_items")
+            .select("order_id, orders!inner ( buyer_id )")
+            .eq("seller_product_submission_id", submissionId)
+            .eq("orders.status", "awaiting_payment")
+            .eq("orders.order_type", "standard");
+        if (error) { console.error("[realtime] unpaid-order lookup failed:", error.message); return; }
+        const only = buyerIds?.length ? new Set(buyerIds.map(String)) : null;
+        const ids = new Set();
+        for (const row of data || []) {
+            const b = row.orders?.buyer_id;
+            if (b && (!only || only.has(String(b)))) ids.add(b);
+        }
+        const io = getIO();
+        ids.forEach((id) => io.to(userRoom(id)).emit("orders_changed", {}));
+    } catch (err) {
+        console.error("[realtime] notifyUnpaidOrderBuyers failed:", err.message);
+    }
+}
+
 /**
  * Re-reads the listing from the DB (so the payload is always the truth)
  * and pushes it to whoever is allowed to see it.
@@ -41,6 +63,7 @@ function customPatch(s, effectivePrice) {
  */
 export async function publishListingChange(submissionId, { buyerIds = null } = {}) {
     try {
+        void notifyUnpaidOrderBuyers(submissionId, { buyerIds });
         const io = getIO();
         const { data: sub } = await supabase.from("seller_product_submissions")
             .select(COLS).eq("id", submissionId).maybeSingle();
@@ -92,6 +115,7 @@ export async function publishListingChange(submissionId, { buyerIds = null } = {
 
 export function publishListingRemoved({ submissionId, brandItemId, sellerId }) {
     try {
+        void notifyUnpaidOrderBuyers(submissionId);
         getIO().to(CATALOG_ROOM).emit("listing:update", {
             brandItemId, submissionId, sellerId, available: false, patch: {}, ts: Date.now(),
         });
