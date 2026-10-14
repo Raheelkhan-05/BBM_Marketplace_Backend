@@ -150,7 +150,7 @@ export async function cancelMyOrder(req, res) {
                 type: "order_status_cancelled",
                 title: `Order ${row.order_number} cancelled`,
                 body: `The buyer cancelled this order. Reason: ${note}`,
-                link: `/seller/orders/${orderId}`,
+                link: `/grow/orders/${orderId}`,
             });
             await notifyUserOrdersChanged(row.notify_user_id);
         }
@@ -240,7 +240,7 @@ export async function raiseDispute(req, res) {
             type: "dispute_raised",
             title: `Dispute raised on order ${row.r_order_number}`,
             body: `The buyer reported: ${category.label}. Your payout for this order is on hold — please respond with your side.`,
-            link: `/seller/orders/${orderId}`,
+            link: `/grow/orders/${orderId}`,
         });
         await notifyUserOrdersChanged(row.r_seller_user_id);
     }
@@ -338,7 +338,7 @@ export async function sellerRespondToDispute(req, res) {
     await notifyOrderChanged(orderId, { status: "delivered", dispute: "responded" });
     await notifyUser(order.buyer_id, {
         type: "dispute_seller_responded", title: `Seller responded on order ${order.order_number}`,
-        body: "The seller has shared their side. Our team will review both and decide.", link: `/orders/${orderId}`,
+        body: "The seller has shared their side. Our team will review both and decide.", link: `/save/orders/${orderId}`,
     });
     await notifyUserOrdersChanged(order.buyer_id);
     await notifyAdmins({

@@ -137,7 +137,7 @@ function transitionHandler(newStatus) {
                 body: newStatus === "shipped"
                     ? "Your order has shipped — the LR details and bill are attached to your order."
                     : (reason || `Your order status was updated to ${newStatus.replace("_", " ")}.`),
-                link: `/orders/${req.params.id}`,
+                link: `/save/orders/${req.params.id}`,
             });
             await notifyUserOrdersChanged(row.notify_user_id);
 

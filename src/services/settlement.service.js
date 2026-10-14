@@ -32,7 +32,7 @@ export async function releaseDueSettlements() {
                     type: "payout_released",
                     title: `Payout released for order ${r.r_order_number}`,
                     body: `${inr(r.r_amount)} has been sent to your bank account (ref ${r.r_reference}).`,
-                    link: `/seller/orders/${r.r_order_id}`,
+                    link: `/grow/orders/${r.r_order_id}`,
                 });
                 await notifyUserOrdersChanged(r.r_seller_user_id);
             }

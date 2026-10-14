@@ -6,7 +6,7 @@ import { publishListingChange } from "./listingRealtime.service.js";
 const BATCH = 500;
 const MAX_BATCHES_PER_RUN = 20;
 // Adjust to your real seller listings route.
-const SELLER_LISTINGS_PATH = "/seller/listings";
+const SELLER_LISTINGS_PATH = "/grow/products";
 
 let running = false;
 

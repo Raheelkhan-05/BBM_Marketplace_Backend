@@ -51,7 +51,7 @@ async function runSideEffects(r) {
             body: refund > 0
                 ? `The seller didn't accept your order in time, so it was cancelled. A full refund of ${inr(refund)} has been initiated (ref ${r.r_reference}).`
                 : "The seller didn't accept your order in time, so it was cancelled. You haven't been charged.",
-            link: `/orders/${r.r_order_id}`,
+            link: `/save/orders/${r.r_order_id}`,
         });
         await notifyUserOrdersChanged(r.r_buyer_id);
     });
@@ -62,7 +62,7 @@ async function runSideEffects(r) {
             type: "order_not_accepted",
             title: `Order ${r.r_order_number} expired`,
             body: "You didn't accept this order in time, so it was marked as not accepted and the buyer has been refunded.",
-            link: `/seller/orders/${r.r_order_id}`,
+            link: `/grow/orders/${r.r_order_id}`,
         });
         await notifyUserOrdersChanged(r.r_seller_user_id);
     });

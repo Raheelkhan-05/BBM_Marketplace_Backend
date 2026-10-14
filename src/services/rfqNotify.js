@@ -28,7 +28,7 @@ export function notifyBuyerRfqApproved(buyerId, name) {
         type: "rfq_approved",
         title: "Your enquiry is live",
         message: `"${name}" has been approved and is now visible to suppliers.`,
-        link: "/rfq?tab=mine",
+        link: "/save/rfq",
     }));
 }
 
@@ -37,6 +37,6 @@ export function notifyBuyerRfqRejected(buyerId, name, reason) {
         type: "rfq_rejected",
         title: "Your enquiry needs changes",
         message: `"${name}" wasn't approved: ${reason}`,
-        link: "/rfq?tab=mine",
+        link: "/save/rfq",
     }));
 }

@@ -188,7 +188,7 @@ export async function proposeRouteOption(req, res) {
                 type: "transport_proposal_received",
                 title: "New transport route proposed",
                 body: `A buyer proposed a new ${mode.replace(/_/g, " ")} option for ${originCity} → ${destCity}.`,
-                link: `/transport-library?tab=manage`,
+                link: `/grow/transport`,
             });
         }
 
@@ -227,7 +227,7 @@ export async function proposeRouteOption(req, res) {
             type: "transport_proposal_received",
             title: "New transport route proposed",
             body: `A buyer proposed a new ${mode.replace(/_/g, " ")} option for ${originCity} → ${destCity}.`,
-            link: `/transport-library?tab=manage`,
+            link: `/grow/transport`,
         });
     }
 
@@ -274,7 +274,7 @@ export async function approveProposal(req, res) {
             type: "transport_proposal_approved",
             title: "Transport option approved",
             body: `The seller approved your proposed transport option for ${row.origin_city} → ${row.dest_city}. You can now select it when ordering.`,
-            link: `/orders`,
+            link: `/save/orders`,
             routeOptionId: row.id,
         });
     }
@@ -323,7 +323,7 @@ export async function rejectProposal(req, res) {
             type: "transport_proposal_rejected",
             title: "Transport option declined",
             body: reason?.trim() || `The seller couldn't accept the proposed transport option for ${row.origin_city} → ${row.dest_city}.`,
-            link: `/orders`,
+            link: `/save/orders`,
             routeOptionId: row.id, // NEW
             reason: reason?.trim() || null,
         });

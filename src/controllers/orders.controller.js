@@ -653,7 +653,7 @@ export async function placeOrder(req, res) {
                 type: "order_placed",
                 title: `New order: ${row.order_number}`,
                 body: "A buyer placed a new order. Check your Sales Orders to confirm it.",
-                link: `/seller/orders/${row.order_id}`,
+                link: `/grow/orders/${row.order_id}`,
             });
         }
 
@@ -807,7 +807,7 @@ export async function cancelMyOrder(req, res) {
             type: "order_status_cancelled",
             title: `Order ${row.order_number} cancelled`,
             body: reason || "The buyer cancelled this order.",
-            link: `/seller/orders/${req.params.id}`,
+            link: `/grow/orders/${req.params.id}`,
         });
         await notifyUserOrdersChanged(row.notify_user_id);
     }
