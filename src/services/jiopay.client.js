@@ -6,7 +6,13 @@
 //
 // Static-IP relay: when JIOPAY_BASE_URL points at our VPS relay, every call carries an
 // X-Relay-Key header (JIOPAY_RELAY_KEY). The relay forwards the request body untouched, so hashes
-// still verify exactly as before.
+// still verify exactly as before. The relay only serves paths under /prod or /uat, so the base URL
+// must be e.g. https://relay.bbm.business/prod.
+//
+// Circuit breaker: when the relay / gateway answers with something that is not JSON and looks like a
+// configuration block (HTTP 401/403/404), further calls fail instantly for a cooldown instead of
+// hammering a door that is shut. Transient failures (timeouts, 5xx) open it after 3 in a row.
+// Any JSON answer from the gateway closes it again.
 //
 // UAT evidence: set JIOPAY_LOG_API_CALLS=true to store every request we send and every response we get
 // in the payment_api_logs table (see sql/payment_api_logs.sql). Off by default: it stores customer
@@ -16,15 +22,71 @@ import { jiopayConfig as cfg, assertJiopayConfigured } from "../config/jiopay.js
 import { supabase } from "../config/supabase.js";
 
 export class JiopayError extends Error {
-    constructor(code, message, { retryable = false } = {}) {
+    constructor(code, message, { retryable = false, gatewayCode = null, gatewayMessage = null } = {}) {
         super(message);
         this.name = "JiopayError";
         this.code = code;
         this.retryable = retryable;
+        this.gatewayCode = gatewayCode;       // JioPay's own response code, e.g. "P1006"
+        this.gatewayMessage = gatewayMessage; // JioPay's own description, e.g. "Limit breached: ..."
     }
 }
 
 const LOG_API_CALLS = ["1", "true", "yes", "on"].includes(String(process.env.JIOPAY_LOG_API_CALLS || "").trim().toLowerCase());
+
+/* ----------------------------------------------------------- circuit breaker */
+
+const clampNum = (n, min, max, fallback) => {
+    const x = Number(n);
+    return Number.isFinite(x) ? Math.min(Math.max(x, min), max) : fallback;
+};
+// How long calls are refused after a configuration-type block (401/403/404).
+const BLOCK_COOLDOWN_MS = clampNum(process.env.JIOPAY_BLOCK_COOLDOWN_SECONDS, 10, 900, 120) * 1000;
+// How long calls are refused after repeated transient failures.
+const TRANSIENT_COOLDOWN_MS = 30 * 1000;
+const TRANSIENT_THRESHOLD = 3;
+
+let blockedUntil = 0;
+let transientFailures = 0;
+
+export function isGatewayBlocked() {
+    return Date.now() < blockedUntil;
+}
+
+export function gatewayBlockedForSeconds() {
+    return Math.max(0, Math.ceil((blockedUntil - Date.now()) / 1000));
+}
+
+function openCircuit(ms, reason) {
+    const wasClosed = !isGatewayBlocked();
+    blockedUntil = Date.now() + ms;
+    if (wasClosed) {
+        console.error(`[jiopay] gateway calls paused for ${Math.round(ms / 1000)}s: ${reason}. Run "node --env-file=.env scripts/jiopay-probe.js" to diagnose.`);
+    }
+}
+
+function noteFailure(httpStatus, reason) {
+    if (httpStatus === 401 || httpStatus === 403 || httpStatus === 404) {
+        transientFailures = 0;
+        openCircuit(BLOCK_COOLDOWN_MS, reason);
+        return;
+    }
+    transientFailures += 1;
+    if (transientFailures >= TRANSIENT_THRESHOLD) {
+        transientFailures = 0;
+        openCircuit(TRANSIENT_COOLDOWN_MS, reason);
+    }
+}
+
+function noteGatewayAnswered() {
+    transientFailures = 0;
+    if (blockedUntil) {
+        if (isGatewayBlocked()) console.log("[jiopay] gateway answered again; resuming calls");
+        blockedUntil = 0;
+    }
+}
+
+/* ------------------------------------------------------------------ logging */
 
 // Fire-and-forget: a logging problem must never affect a payment.
 function logApiCall({ path, request, httpStatus = null, response = null, error = null }) {
@@ -118,8 +180,36 @@ function txnDate(d = new Date()) {
     return `${get("year")}${get("month")}${get("day")}${hh}${get("minute")}${get("second")}`;
 }
 
+// Short, single-line, safe-to-log version of a non-JSON body (HTML error pages, WAF blocks, relay errors).
+const bodySnippet = (text) => String(text || "").replace(/\s+/g, " ").trim().slice(0, 300);
+
+// JioPay's description field is "responseDescription" (older docs / some payloads use "respDescription").
+const gatewayDescription = (data) =>
+    String(data?.responseDescription ?? data?.respDescription ?? data?.message ?? "").trim().slice(0, 300);
+
+// A plain-English guess at who blocked the request, for the server log only.
+function hintForStatus(status) {
+    if (status === 401 || status === 403) {
+        return cfg.relayKey
+            ? "Blocked before reaching JioPay's API. Check: JIOPAY_RELAY_KEY matches the relay's Caddyfile key, JIOPAY_BASE_URL ends in /prod or /uat, and the relay's public IP is whitelisted at JioPay for this environment."
+            : "Blocked before reaching JioPay's API and no relay key is configured (relay=off). Calls leave from this machine's IP, which JioPay does not allow. Set JIOPAY_BASE_URL (relay) and JIOPAY_RELAY_KEY.";
+    }
+    if (status === 404) return "Path not found. Check JIOPAY_BASE_URL (relay: https://relay.bbm.business/prod or /uat; direct UAT must include /tsp; direct production has no prefix).";
+    if (status >= 500) return "The relay or JioPay returned a server error / is unreachable.";
+    return "Unexpected non-JSON answer.";
+}
+
 async function post(path, { json, form }) {
     assertJiopayConfigured();
+
+    if (isGatewayBlocked()) {
+        throw new JiopayError(
+            "GATEWAY_BLOCKED",
+            `Gateway calls are paused for another ${gatewayBlockedForSeconds()}s after repeated blocked responses`,
+            { retryable: true }
+        );
+    }
+
     const url = `${cfg.baseUrl}${path}`;
     const request = json || form;
 
@@ -139,6 +229,7 @@ async function post(path, { json, form }) {
         });
     } catch (e) {
         logApiCall({ path, request, error: String(e?.name || "error") });
+        noteFailure(null, `network error (${e?.name || "error"})`);
         throw new JiopayError("NETWORK", `Gateway request failed: ${e?.name || "error"}`, { retryable: true });
     }
     const text = await res.text();
@@ -146,8 +237,18 @@ async function post(path, { json, form }) {
     try { data = JSON.parse(text); } catch { /* handled below */ }
     logApiCall({ path, request, httpStatus: res.status, response: data ?? { nonJsonBody: text.slice(0, 500) } });
     if (!data || typeof data !== "object" || Array.isArray(data)) {
+        // Diagnostics: who answered, and what did they say? (No secrets: only host+path, status, headers and body text.)
+        console.error(
+            `[jiopay] non-JSON response from ${new URL(url).host}${path} -> HTTP ${res.status}`,
+            `| relay=${cfg.relayKey ? "on" : "off"}`,
+            `| server=${res.headers.get("server") || "-"} via=${res.headers.get("via") || "-"} content-type=${res.headers.get("content-type") || "-"}`,
+            `| body="${bodySnippet(text) || "(empty)"}"`,
+            `| hint: ${hintForStatus(res.status)}`
+        );
+        noteFailure(res.status, `non-JSON answer, HTTP ${res.status}`);
         throw new JiopayError("INVALID_RESPONSE", `Gateway returned a non-JSON response (HTTP ${res.status})`, { retryable: res.status >= 500 });
     }
+    noteGatewayAnswered();
     return { httpStatus: res.status, data };
 }
 
@@ -156,7 +257,7 @@ export function normalizeGatewayPayload(data) {
     const code = String(data.txnResponseCode ?? data.responseCode ?? "").trim();
     return {
         code,
-        message: String(data.respDescription ?? data.responseDescription ?? data.message ?? "").slice(0, 500),
+        message: gatewayDescription(data).slice(0, 500),
         amountPaise: amountToPaise(data.amount),
         gatewayTxnId: data.txnID ? String(data.txnID) : data.paymentID ? String(data.paymentID) : null,
         txnStatus: data.txnStatus ? String(data.txnStatus) : null,
@@ -210,7 +311,12 @@ export async function initiateSale({ merchantTxnNo, amountPaise, email, mobile, 
 
     if (!verifyPayloadHash(data)) throw new JiopayError("BAD_RESPONSE_HASH", "initiateSale response failed hash verification");
     if (String(data.responseCode) !== "R1000") {
-        throw new JiopayError("INITIATE_REJECTED", `initiateSale rejected: ${data.responseCode} ${data.respDescription || ""}`.trim());
+        const gatewayMessage = gatewayDescription(data);
+        throw new JiopayError(
+            "INITIATE_REJECTED",
+            `initiateSale rejected: ${data.responseCode} ${gatewayMessage}`.trim(),
+            { gatewayCode: String(data.responseCode ?? ""), gatewayMessage }
+        );
     }
     if (String(data.merchantTxnNo) !== merchantTxnNo) throw new JiopayError("TXN_MISMATCH", "initiateSale returned a different transaction number");
     if (!data.redirectURI || !data.tranCtx) throw new JiopayError("INVALID_RESPONSE", "initiateSale response is missing redirectURI / tranCtx");

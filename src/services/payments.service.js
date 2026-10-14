@@ -6,12 +6,17 @@
 //      for the exact amount we stored server-side — and (by default) re-confirmed via the status API.
 //   3. The browser return (B2B) never credits anything; it only triggers an authoritative status check.
 //   4. Notifications are best-effort and run AFTER the database commit; they can never undo a payment.
+//   5. A buyer who left mid-payment RESUMES the same gateway session (same reference, stored tranCtx)
+//      while it is still valid, instead of opening a new one.
+//   6. While the gateway/relay is blocked (circuit open) we make NO gateway calls: no new attempt rows,
+//      no status checks, and refunds are not claimed (claiming burns their retry counter).
+//   7. A gateway REJECTION (e.g. merchant limit breached) is reported as such, not as an outage.
 import crypto from "crypto";
 import { supabase } from "../config/supabase.js";
 import { jiopayConfig as cfg, assertJiopayConfigured } from "../config/jiopay.js";
 import {
     initiateSale, statusCheck, issueRefund, verifyPayloadHash, classifyCode,
-    normalizeGatewayPayload, sanitizePayload,
+    normalizeGatewayPayload, sanitizePayload, isGatewayBlocked, gatewayBlockedForSeconds,
 } from "./jiopay.client.js";
 import { notifyUser, notifyUserOrdersChanged } from "./realtimeBroadcast.js";
 import { notifyAdmins } from "./notifications.service.js";
@@ -53,10 +58,75 @@ const CREATE_ERRORS = {
     TOO_MANY_ATTEMPTS: [429, "Too many payment attempts. Please wait a few minutes and try again."],
 };
 
+// Keep a resumed session only if it still has at least this long to live.
+const RESUME_MIN_REMAINING_MS = 60 * 1000;
+
+// Is the thing being paid for still waiting for payment? (Never send a buyer back to pay for a
+// cancelled / already-paid order.)
+async function targetStillUnpaid(purpose, targetId) {
+    if (purpose === "order") {
+        const { data } = await supabase.from("orders").select("status").eq("id", targetId).maybeSingle();
+        return data?.status === "awaiting_payment";
+    }
+    const { data } = await supabase.from("orders")
+        .select("id").eq("order_group_id", targetId).eq("status", "awaiting_payment").limit(1);
+    return !!data?.length;
+}
+
+// Finds a payment session this buyer already opened for the SAME order / cart that can still be
+// completed, and rebuilds its gateway URL from what we stored (redirect_uri + tranCtx).
+// No call to JioPay is made. Returns null when there is nothing to resume.
+async function findResumableAttempt({ purpose, userId, targetId }) {
+    if (purpose !== "order" && purpose !== "order_group") return null; // wallet top-ups always start fresh
+
+    const targetCol = purpose === "order" ? "order_id" : "order_group_id";
+    const { data: a, error } = await supabase.from("payment_attempts")
+        .select("id, merchant_txn_no, amount_paise, tran_ctx, redirect_uri, expires_at")
+        .eq("purpose", purpose)
+        .eq(targetCol, targetId)
+        .eq("user_id", userId)
+        .in("status", ["initiated", "pending"])
+        .not("tran_ctx", "is", null)
+        .not("redirect_uri", "is", null)
+        .gt("expires_at", new Date(Date.now() + RESUME_MIN_REMAINING_MS).toISOString())
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+    if (error) {
+        console.error("[payments] resumable attempt lookup failed:", error.message);
+        return null;
+    }
+    if (!a) return null;
+
+    if (!(await targetStillUnpaid(purpose, targetId))) return null;
+
+    try {
+        const target = new URL(String(a.redirect_uri));
+        if (target.protocol !== "https:") return null;
+        target.searchParams.set("tranCtx", String(a.tran_ctx));
+        console.log("[payments] resuming existing gateway session:", a.merchant_txn_no);
+        return { ref: a.merchant_txn_no, redirectUrl: target.toString(), amountPaise: Number(a.amount_paise), resumed: true };
+    } catch {
+        return null;
+    }
+}
+
 // purpose: 'order' | 'order_group' | 'wallet_topup'
 export async function createCheckout({ purpose, userId, targetId, amountPaise = null }) {
     assertJiopayConfigured();
 
+    // 1) Continue the buyer's earlier, still-valid session if there is one (needs no gateway call).
+    const resumable = await findResumableAttempt({ purpose, userId, targetId });
+    if (resumable) return resumable;
+
+    // 2) The gateway is known to be refusing us: say so now, BEFORE creating an attempt row.
+    //    (Every failed attempt row counts toward the buyer's "too many attempts" limit.)
+    if (isGatewayBlocked()) {
+        console.warn(`[payments] checkout refused: gateway paused for another ${gatewayBlockedForSeconds()}s`);
+        throw new PaymentError(503, "Payments are temporarily unavailable. Please try again in a few minutes.", "GATEWAY_UNAVAILABLE");
+    }
+
+    // 3) Otherwise open a brand-new session.
     const { data: created, error } = await supabase
         .rpc("payment_create_attempt", {
             p_purpose: purpose, p_user_id: userId, p_target_id: targetId,
@@ -87,12 +157,33 @@ export async function createCheckout({ purpose, userId, targetId, amountPaise = 
     } catch (e) {
         console.error("[payments] initiateSale failed:", ref, e?.code || "", e?.message || e);
         await supabase.from("payment_attempts")
-            .update({ status: "failed", gateway_message: String(e?.message || "initiate failed").slice(0, 500), completed_at: new Date().toISOString() })
+            .update({
+                status: "failed", gateway_response_code: e?.gatewayCode || null,
+                gateway_message: String(e?.gatewayMessage || e?.message || "initiate failed").slice(0, 500),
+                completed_at: new Date().toISOString(),
+            })
             .eq("id", attemptId).eq("status", "created");
         await supabase.from("payment_events").insert({
             attempt_id: attemptId, merchant_txn_no: ref, source: "initiate", hash_valid: null,
-            response_code: e?.code || null, payload: { error: String(e?.message || "").slice(0, 300) },
+            response_code: e?.gatewayCode || e?.code || null,
+            payload: { error: String(e?.gatewayMessage || e?.message || "").slice(0, 300) },
         });
+
+        // The gateway ANSWERED and said no (e.g. "Limit breached"): that is not an outage.
+        if (e?.code === "INITIATE_REJECTED") {
+            const limitHit = /limit/i.test(e.gatewayMessage || "");
+            await alertAdmins(
+                limitHit ? "JioPay merchant limit reached" : "JioPay rejected a payment request",
+                `Attempt ${ref} for ${inr(paise)} was rejected by JioPay: ${e.gatewayCode || ""} ${e.gatewayMessage || ""}. ${limitHit ? "Ask JioPay to raise the transaction / daily limits on this merchant account." : "Check the merchant configuration."}`
+            );
+            throw new PaymentError(
+                422,
+                limitHit
+                    ? "This payment is above the amount our payment gateway currently allows. Please contact support, or try again later."
+                    : "The payment gateway couldn't accept this payment. Please contact support.",
+                "GATEWAY_REJECTED"
+            );
+        }
         throw new PaymentError(502, "The payment gateway isn't reachable right now. Please try again in a moment.", "GATEWAY_UNAVAILABLE");
     }
 
@@ -313,7 +404,7 @@ export async function handleWebhook(payload) {
             s = await statusCheck({ merchantTxnNo: ref, amountPaise: Number(attempt.amount_paise) });
         } catch (e) {
             console.error("[payments] could not confirm webhook via status API:", ref, e?.message || e);
-            return { retry: true }; // do not apply on an unconfirmed success; the reconciler will resolve it
+            return { retry: true }; // do not apply on an unconfirmed success; the gateway will retry the webhook
         }
         const confirmed = s.hashValid && classifyCode(s.code) === "success" && s.txnStatus === "SUC";
         if (!confirmed) {
@@ -347,12 +438,13 @@ export async function logReturnEvent(ref, payload) {
 
 /* ============================================================== reconciler */
 
-export async function reconcileAttempt({ id, ref, amountPaise, status, expiresAt }) {
+export async function reconcileAttempt({ id, ref, amountPaise, status, expiresAt, buyerReturned = false }) {
     let s;
     try {
         s = await statusCheck({ merchantTxnNo: ref, amountPaise });
     } catch (e) {
-        console.error("[payments] status check failed:", ref, e?.code || "", e?.message || e);
+        // While the gateway is paused every call fails by design; the pause itself was logged once.
+        if (e?.code !== "GATEWAY_BLOCKED") console.error("[payments] status check failed:", ref, e?.code || "", e?.message || e);
         return null;
     }
 
@@ -365,7 +457,6 @@ export async function reconcileAttempt({ id, ref, amountPaise, status, expiresAt
         outcome = "pending";
     }
 
-    const buyerReturned = arguments[0]?.buyerReturned === true;
     // Only an explicit rejection (REJ) counts as final before expiry. Anything else stays provisional.
     const explicitReject = s.txnStatus === "REJ";
     if (outcome === "failed" && !expired && status !== "expired" && !explicitReject && !buyerReturned) {
@@ -392,12 +483,15 @@ async function inChunks(items, size, fn) {
 }
 
 export async function reconcileTick() {
-    const { data: rows, error } = await supabase.rpc("payment_claim_for_reconcile", { p_limit: 25 });
-    if (error) console.error("[payments] claim for reconcile failed:", error.message);
-    await inChunks(rows || [], 5, (r) => reconcileAttempt({
-        id: r.r_id, ref: r.r_merchant_txn_no, amountPaise: Number(r.r_amount_paise),
-        status: r.r_status, expiresAt: r.r_expires_at,
-    }).catch((e) => console.error("[payments] reconcile error:", r.r_merchant_txn_no, e?.message || e)));
+    // Gateway paused: skip the status checks (claiming rows would only mark them as "checked").
+    if (!isGatewayBlocked()) {
+        const { data: rows, error } = await supabase.rpc("payment_claim_for_reconcile", { p_limit: 25 });
+        if (error) console.error("[payments] claim for reconcile failed:", error.message);
+        await inChunks(rows || [], 5, (r) => reconcileAttempt({
+            id: r.r_id, ref: r.r_merchant_txn_no, amountPaise: Number(r.r_amount_paise),
+            status: r.r_status, expiresAt: r.r_expires_at,
+        }).catch((e) => console.error("[payments] reconcile error:", r.r_merchant_txn_no, e?.message || e)));
+    }
 
     const { error: repairErr } = await supabase.rpc("payment_repair_commissions", { p_limit: 50 });
     if (repairErr) console.error("[payments] commission repair failed:", repairErr.message);
@@ -416,7 +510,7 @@ export async function getAttemptStatusForUser(ref, userId) {
 
     const now = Date.now();
     const stale = !a.last_status_check_at || now - new Date(a.last_status_check_at).getTime() > 5000;
-    if ((LIVE.includes(a.status) || a.status === "expired") && stale && now - new Date(a.created_at).getTime() > 3000) {
+    if (!isGatewayBlocked() && (LIVE.includes(a.status) || a.status === "expired") && stale && now - new Date(a.created_at).getTime() > 3000) {
         await supabase.from("payment_attempts").update({ last_status_check_at: new Date().toISOString() }).eq("id", a.id);
         await reconcileAttempt({
             id: a.id, ref: a.merchant_txn_no, amountPaise: Number(a.amount_paise), status: a.status, expiresAt: a.expires_at,
@@ -463,6 +557,10 @@ export async function processRefundQueue() {
 
     const { error: enqErr } = await supabase.rpc("payment_enqueue_settlement_refunds", { p_limit: 50 });
     if (enqErr) console.error("[payments] enqueue settlement refunds failed:", enqErr.message);
+
+    // Queuing above is database-only and always safe. Claiming a refund counts as one attempt, so while
+    // the gateway is paused we leave them queued instead of using up their retries on calls that cannot succeed.
+    if (isGatewayBlocked()) return;
 
     const { data: claimed, error } = await supabase.rpc("payment_claim_refunds", { p_limit: 20 });
     if (error) { console.error("[payments] claim refunds failed:", error.message); return; }
