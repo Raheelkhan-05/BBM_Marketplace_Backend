@@ -35,6 +35,7 @@ import paymentsPublicRoutes from "./routes/paymentsPublic.routes.js";
 import paymentsRoutes from "./routes/payments.routes.js";
 import adminPaymentsRoutes from "./routes/adminPayments.routes.js";
 import sellerCustomersRoutes from "./routes/sellerCustomers.routes.js";
+import adminFinanceRoutes from "./routes/adminFinance.routes.js";
 
 export function createApp() {
   const app = express();
@@ -107,6 +108,7 @@ export function createApp() {
   app.use("/api/seller", sellerRoutes);
   app.use("/api/admin/auth", adminAuthRoutes);
   // Must stay BEFORE "/api/admin" so it is matched first.
+  app.use("/api/admin/finance", adminFinanceRoutes);
   app.use("/api/admin/payments", adminPaymentsRoutes);
   app.use("/api/admin", adminRoutes);
   app.use("/api/notifications", notificationRoutes);
