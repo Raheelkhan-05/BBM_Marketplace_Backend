@@ -5,6 +5,10 @@
 // ones for (which DO need seller approval, and are deduped against what
 // that seller — or in the suggestions endpoint, ANY seller — already has
 // on that exact route).
+//
+// CHANGED: the "transport_proposal_received" notification now carries the proposal id in its link
+// (/grow/transport?tab=manage&proposal=<id>) so the Console can show Approve / Decline on exactly
+// the right proposal (see utils/notificationActions.js -> proposalIdFromNotification).
 import { supabase } from "../config/supabase.js";
 import { notifyUser } from "../services/realtimeBroadcast.js";
 import { ROUTE_TRANSPORT_FIELDS, routeOptionSummary } from "../../shared/routeTransportFields.js";
@@ -53,6 +57,19 @@ function validateFields(mode, fields) {
         }
     }
     return null;
+}
+
+// NEW: one place that tells the seller about a proposal. The id travels in the link so the Console
+// knows exactly which proposal the notification is about; the manage tab ignores the extra param.
+async function notifySellerOfProposal(sellerId, option, { mode, originCity, destCity }) {
+    const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", sellerId).maybeSingle();
+    if (!sellerProfile?.user_id) return;
+    await notifyUser(sellerProfile.user_id, {
+        type: "transport_proposal_received",
+        title: "New transport route proposed",
+        body: `A buyer proposed a new ${mode.replace(/_/g, " ")} option for ${originCity} → ${destCity}.`,
+        link: `/grow/transport?tab=manage&proposal=${option.id}`,
+    });
 }
 
 // GET /api/transport-library/route-options
@@ -182,15 +199,7 @@ export async function proposeRouteOption(req, res) {
             .single();
         if (reactivateError) return res.status(500).json({ success: false, message: reactivateError.message });
 
-        const { data: sellerProfileForReactivate } = await supabase.from("seller_profiles").select("user_id").eq("id", sellerId).maybeSingle();
-        if (sellerProfileForReactivate?.user_id) {
-            await notifyUser(sellerProfileForReactivate.user_id, {
-                type: "transport_proposal_received",
-                title: "New transport route proposed",
-                body: `A buyer proposed a new ${mode.replace(/_/g, " ")} option for ${originCity} → ${destCity}.`,
-                link: `/grow/transport`,
-            });
-        }
+        await notifySellerOfProposal(sellerId, reactivated, { mode, originCity, destCity });
 
         return res.json({ success: true, reused: false, option: reactivated });
     }
@@ -221,15 +230,7 @@ export async function proposeRouteOption(req, res) {
         return res.status(500).json({ success: false, message: error.message });
     }
 
-    const { data: sellerProfile } = await supabase.from("seller_profiles").select("user_id").eq("id", sellerId).maybeSingle();
-    if (sellerProfile?.user_id) {
-        await notifyUser(sellerProfile.user_id, {
-            type: "transport_proposal_received",
-            title: "New transport route proposed",
-            body: `A buyer proposed a new ${mode.replace(/_/g, " ")} option for ${originCity} → ${destCity}.`,
-            link: `/grow/transport`,
-        });
-    }
+    await notifySellerOfProposal(sellerId, created, { mode, originCity, destCity });
 
     res.json({ success: true, reused: false, option: created });
 }

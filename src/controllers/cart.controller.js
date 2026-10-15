@@ -153,91 +153,92 @@ export async function removeCartItem(req, res) {
 }
 
 export async function checkoutCart(req, res) {
-    const { shippingAddressId, notes, transportPreferences } = req.body || {};
+    const { shippingAddressId, notes, transportPreferences, submissionIds: requestedIds } = req.body || {};
 
-    const { data: cartItems } = await supabase.rpc("cart_list", { p_buyer_id: req.user.id });
-    const sellerIds = [...new Set((cartItems || []).map((i) => i.seller_id))];
+    const { data: allCartItems, error: cartError } = await supabase.rpc("cart_list", { p_buyer_id: req.user.id });
+    if (cartError) return res.status(500).json({ success: false, message: "Couldn't load your cart. Please try again." });
+    const fullCart = allCartItems || [];
+
+    // ---- Which lines are being bought? ----
+    // `submissionIds` omitted  -> whole cart (old behaviour, keeps older clients working).
+    // `submissionIds` provided -> only those lines; everything else stays in the cart.
+    let cartItems = fullCart;
+    let partial = false;
+    if (requestedIds !== undefined) {
+        if (!Array.isArray(requestedIds) || requestedIds.length === 0) {
+            return res.status(400).json({ success: false, code: "NO_ITEMS_SELECTED", message: "Select at least one item to check out." });
+        }
+        const wanted = new Set(requestedIds.map(String));
+        cartItems = fullCart.filter((i) => wanted.has(String(i.submission_id)));
+        if (cartItems.length !== wanted.size) {
+            return res.status(409).json({ success: false, code: "CART_CHANGED", message: "Your cart changed. Please review it and try again." });
+        }
+        partial = cartItems.length < fullCart.length;
+    }
+    if (!cartItems.length) {
+        return res.status(400).json({ success: false, code: "CART_EMPTY", message: "Couldn't place the order." });
+    }
+
+    // From here on, every check runs on the SELECTED lines only.
+    const sellerIds = [...new Set(cartItems.map((i) => i.seller_id))];
+    const sellerIdSet = new Set(sellerIds.map(String));
+
     for (const sid of sellerIds) {
         const { data: status } = await supabase.rpc("wallet_get_status", { p_seller_id: sid }).single();
         if (status?.is_blocked) {
-            return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: "One or more sellers in your cart aren't accepting new orders right now. Please remove their items to continue." });
+            return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: "One or more sellers in your selection aren't accepting new orders right now. Please remove their items to continue." });
         }
     }
 
-    // Defense in depth: re-validate every line against LIVE stock right
-    // before placing the order. Quantities were checked when added/edited,
-    // but stock can move (another buyer, seller adjustment) between then
-    // and checkout, and place_cart_order itself may not enforce this yet.
-    const submissionIds = [...new Set((cartItems || []).map((i) => i.submission_id).filter(Boolean))];
-    if (submissionIds.length) {
-        const { data: stockRows } = await supabase
-            .from("seller_product_submissions")
-            .select("id, stock_type, stock_quantity, pack_size, units_per_master_pack")
-            .in("id", submissionIds);
-        const stockById = new Map((stockRows || []).map((r) => [r.id, r]));
-        for (const item of cartItems || []) {
-            const submission = stockById.get(item.submission_id);
-            const stockError = checkStockLimit(submission, Number(item.quantity), item.purchase_basis || "per_pack");
-            if (stockError) {
-                return res.status(400).json({
-                    success: false, code: "EXCEEDS_AVAILABLE_STOCK",
-                    message: `${item.product_name || "One item"} in your cart: ${stockError}`,
-                });
-            }
+    // Re-validate every selected line against LIVE stock right before placing the order.
+    const submissionIds = [...new Set(cartItems.map((i) => i.submission_id).filter(Boolean))];
+
+    const { data: stockRows } = await supabase
+        .from("seller_product_submissions")
+        .select("id, stock_type, stock_quantity, pack_size, units_per_master_pack, dispatching_locations")
+        .in("id", submissionIds);
+    const submissionById = new Map((stockRows || []).map((r) => [r.id, r]));
+
+    for (const item of cartItems) {
+        const stockError = checkStockLimit(submissionById.get(item.submission_id), Number(item.quantity), item.purchase_basis || "per_pack");
+        if (stockError) {
+            return res.status(400).json({
+                success: false, code: "EXCEEDS_AVAILABLE_STOCK",
+                message: `${item.product_name || "One item"} in your cart: ${stockError}`,
+            });
         }
     }
 
-    // Same order-window + serviceability re-check as placeOrder(), just
-    // applied per seller (window) and per item (location) since a cart
-    // can span multiple sellers.
-    const uniqueSellerIds = [...new Set((cartItems || []).map((i) => i.seller_id))];
-    if (uniqueSellerIds.length) {
-        const { data: sellerProfiles } = await supabase
-            .from("seller_profiles")
-            .select("id, working_days, order_acceptance_start, order_acceptance_end, holidays")
-            .in("id", uniqueSellerIds);
-        const profileById = new Map((sellerProfiles || []).map((p) => [p.id, p]));
-
-    }
-
-    if (submissionIds.length) {
-        const { data: address } = await supabase.from("buyer_addresses").select("state, city").eq("id", shippingAddressId).maybeSingle();
-        const { data: locationRows } = await supabase
-            .from("seller_product_submissions")
-            .select("id, dispatching_locations")
-            .in("id", submissionIds);
-        const locationById = new Map((locationRows || []).map((r) => [r.id, r.dispatching_locations]));
-        for (const item of cartItems || []) {
-            const locationCheck = checkLocationServiceable(locationById.get(item.submission_id), address);
-            if (!locationCheck.serviceable) {
-                return res.status(400).json({
-                    success: false, code: locationCheck.reason,
-                    message: `${item.product_name || "One item"} in your cart: ${locationCheck.message}`,
-                });
-            }
+    // Delivery serviceability per selected item.
+    // NOTE: the old code also loaded seller order-window columns here but never used them (empty block),
+    // so that dead query was dropped. The window is still shown as a warning in the UI; enforce it
+    // here with checkOrderWindow() if you want it to hard-block.
+    const { data: address } = await supabase.from("buyer_addresses").select("state, city").eq("id", shippingAddressId).maybeSingle();
+    for (const item of cartItems) {
+        const locationCheck = checkLocationServiceable(submissionById.get(item.submission_id)?.dispatching_locations, address);
+        if (!locationCheck.serviceable) {
+            return res.status(400).json({
+                success: false, code: locationCheck.reason,
+                message: `${item.product_name || "One item"} in your cart: ${locationCheck.message}`,
+            });
         }
     }
 
-    // NEW: validate any per-seller transport preferences the buyer chose
-    // in the cart UI — exactly the same rule placeOrder() applies for a
-    // single seller: a buyer can only lock in a route option that seller
-    // actually has approved. Invalid entries fail the whole checkout
-    // rather than silently falling back to "no preference", so the buyer
-    // isn't surprised later by a transport choice they didn't actually
-    // get.
+    // Per-seller transport preferences (only for sellers that are actually in this order).
+    // A buyer can only lock in a route option that seller has approved.
     let transportBySeller = {};
-    if (Array.isArray(transportPreferences) && transportPreferences.length) {
-        const routeOptionIds = transportPreferences.map((t) => t?.routeOptionId).filter(Boolean);
-        const { data: routeRows } = routeOptionIds.length
-            ? await supabase
-                .from("transport_route_options")
-                .select("id, seller_id, mode, fields, status")
-                .in("id", routeOptionIds)
-            : { data: [] };
+    const relevantPrefs = Array.isArray(transportPreferences)
+        ? transportPreferences.filter((t) => t?.routeOptionId && t?.sellerId && sellerIdSet.has(String(t.sellerId)))
+        : [];
+    if (relevantPrefs.length) {
+        const routeOptionIds = relevantPrefs.map((t) => t.routeOptionId);
+        const { data: routeRows } = await supabase
+            .from("transport_route_options")
+            .select("id, seller_id, mode, fields, status")
+            .in("id", routeOptionIds);
         const routeById = new Map((routeRows || []).map((r) => [r.id, r]));
 
-        for (const pref of transportPreferences) {
-            if (!pref?.routeOptionId || !pref?.sellerId) continue;
+        for (const pref of relevantPrefs) {
             const route = routeById.get(pref.routeOptionId);
             if (!route || route.seller_id !== pref.sellerId || route.status !== "approved") {
                 return res.status(400).json({
@@ -254,10 +255,18 @@ export async function checkoutCart(req, res) {
         }
     }
 
-    const { data, error } = await supabase.rpc("place_cart_order", {
+    // The selection may differ from whatever was locked in by a previous attempt, so drop any stale
+    // pending group and build a fresh one from exactly what's selected now.
+    await supabase.rpc("cancel_pending_order_group_if_exists", { p_buyer_id: req.user.id });
+
+    const rpcArgs = {
         p_buyer_id: req.user.id, p_shipping_address_id: shippingAddressId, p_buyer_notes: notes || null,
         p_transport_preferences: transportBySeller,
-    }).single();
+    };
+    // Only sent for partial checkouts, so full-cart checkout keeps working with the current SQL function.
+    if (partial) rpcArgs.p_submission_ids = cartItems.map((i) => i.submission_id);
+
+    const { data, error } = await supabase.rpc("place_cart_order", rpcArgs).single();
 
     if (error) {
         const codes = (error.message || "").trim();
@@ -275,13 +284,9 @@ export async function checkoutCart(req, res) {
             if (lookupError || !pending) {
                 return res.status(500).json({ success: false, message: "Couldn't resume your pending payment. Please try again." });
             }
-
             return res.json({
-                success: true,
-                resumed: true, // frontend can use this to skip a "order placed" toast if you show one
-                orderGroupId: pending.id,
-                groupNumber: pending.group_number,
-                totalAmount: pending.total_amount,
+                success: true, resumed: true,
+                orderGroupId: pending.id, groupNumber: pending.group_number, totalAmount: pending.total_amount,
             });
         }
 
