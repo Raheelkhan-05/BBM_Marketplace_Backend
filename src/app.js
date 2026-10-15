@@ -3,6 +3,7 @@ import cors from "cors";
 import helmet from "helmet";
 import compression from "compression";
 import authRoutes from "./routes/auth.routes.js";
+import seoRoutes from "./routes/seo.routes.js";
 import sellerRoutes from "./routes/seller.routes.js";
 import adminRoutes from "./routes/admin.routes.js";
 import notificationRoutes from "./routes/notifications.routes.js";
@@ -99,6 +100,7 @@ export function createApp() {
   });
 
   app.use("/api/auth", authRoutes);
+  app.use("/api/seo", seoRoutes);
   app.use("/api/seller/customers", sellerCustomersRoutes);
   app.use("/api/seller/catalog", sellerCatalogListingsRouter);
   app.use("/api/seller/orders", sellerOrdersRoutes);
