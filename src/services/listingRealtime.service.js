@@ -90,7 +90,19 @@ export async function publishListingChange(submissionId, { buyerIds = null } = {
         };
 
         if (buyerIds?.length) {
-            buyerIds.forEach((id) => io.to(userRoom(id)).emit("listing:update", forBuyer(id)));
+            for (const id of buyerIds) {
+                io.to(userRoom(id)).emit("listing:update", forBuyer(id));
+                try {
+                    const socks = await io.in(userRoom(id)).fetchSockets();
+                    const who = [...new Set(socks.map((s) => s.data?.userId || "unknown"))];
+                    console.log(
+                        `[price-audit] live push → room ${userRoom(id)} | submission ${submissionId} | ` +
+                        `${socks.length} socket(s) | users connected: ${who.join(", ") || "NONE"}`
+                    );
+                } catch (e) {
+                    console.error("[price-audit] fetchSockets failed:", e?.message || e);
+                }
+            }
             return;
         }
 

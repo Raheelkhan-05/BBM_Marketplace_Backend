@@ -14,6 +14,7 @@ import { supabase } from "../config/supabase.js";
 import { resolveEffectiveBasePrice, derivePriceBreakdown } from "../../shared/customPricing.js";
 import { resolveCompanyId, resolveCompanyIds } from "../services/team.service.js";
 import { hasOuterPack } from "../../shared/packUnits.js";
+import { publishListingChange } from "../services/listingRealtime.service.js";
 
 async function loadOwnedSubmission(sellerId, submissionId, columns) {
     const { data, error } = await supabase
@@ -155,6 +156,7 @@ export async function setVisibilityMode(req, res) {
         .eq("id", submissionId).eq("seller_id", sellerId);
     if (error) return res.status(500).json({ success: false, message: error.message });
 
+    void publishListingChange(submissionId);
     res.json({ success: true, visibilityMode: mode });
 }
 
@@ -191,6 +193,10 @@ export async function addVisibilityBuyer(req, res) {
         );
     if (error) return res.status(500).json({ success: false, message: error.message });
 
+    void publishListingChange(submissionId, { buyerIds: [buyerId] });
+
+    void logPriceAudience(req, { action: "VISIBILITY GRANTED", buyerId, submissionIds: [submissionId] });
+
     res.json({ success: true });
 }
 
@@ -203,6 +209,10 @@ export async function removeVisibilityBuyer(req, res) {
         .eq("submission_id", submissionId).eq("seller_id", sellerId)
         .in("buyer_id", [...new Set([String(raw), String(buyerId)])]);
     if (error) return res.status(500).json({ success: false, message: error.message });
+
+    void publishListingChange(submissionId, { buyerIds: [buyerId] });
+
+    void logPriceAudience(req, { action: "VISIBILITY REVOKED", buyerId, submissionIds: [submissionId] });
     res.json({ success: true });
 }
 

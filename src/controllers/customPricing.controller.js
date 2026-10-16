@@ -4,7 +4,7 @@ import { percentFromCustomPrice, resolveEffectiveBasePrice, derivePriceBreakdown
 import { hasOuterPack } from "../../shared/packUnits.js";
 import { publishListingChange, publishListingRemoved } from "../services/listingRealtime.service.js";
 import { CATALOG_REMOVED_REJECTION_REASON } from "./sellerCatalogListings.controller.js";
-import { resolveCompanyId } from "../services/team.service.js";
+import { resolveCompanyId, logPriceAudience } from "../services/team.service.js";
 
 
 export async function listCustomPricingForBuyer(req, res) {
@@ -226,6 +226,12 @@ export async function upsertCustomPricing(req, res) {
     }
 
     rows.forEach((r) => void publishListingChange(r.submission_id, { buyerIds: [buyerId] }));
+    void logPriceAudience(req, {
+        action: "CUSTOM PRICE SET",
+        buyerId,
+        submissionIds: rows.map((r) => r.submission_id),
+        detail: rows.map((r) => ({ submission: r.submission_id, discountPercent: r.discount_percent })),
+    });
     res.json({ success: true, saved: rows.length, rejected: [] });
 }
 
@@ -236,11 +242,11 @@ export async function deleteCustomPricing(req, res) {
     const buyerId = await resolveCompanyId(req.params.buyerId);
     const { submissionId } = req.params;
     const { error } = await supabase
-        .from("buyer_seller_custom_prices")
-        .delete()
+        .from("buyer_seller_custom_prices").delete()
         .eq("seller_id", sellerId).eq("buyer_id", buyerId).eq("submission_id", submissionId);
     if (error) return res.status(500).json({ success: false, message: error.message });
     void publishListingChange(submissionId, { buyerIds: [buyerId] });
+    void logPriceAudience(req, { action: "CUSTOM PRICE REMOVED", buyerId, submissionIds: [submissionId] });
     res.json({ success: true });
 }
 
@@ -264,8 +270,9 @@ export async function bulkClearCustomPricing(req, res) {
     if (Array.isArray(submissionIds) && submissionIds.length) query = query.in("submission_id", submissionIds);
 
     const { error } = await query;
+
     if (error) return res.status(500).json({ success: false, message: error.message });
     ids.forEach((sid) => void publishListingChange(sid, { buyerIds: [buyerId] }));
-
+    void logPriceAudience(req, { action: "CUSTOM PRICES CLEARED", buyerId, submissionIds: ids });
     res.json({ success: true });
 }

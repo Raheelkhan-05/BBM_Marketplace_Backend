@@ -1,6 +1,7 @@
 import { supabase } from "../config/supabase.js";
 import { getParticipantIds } from "./participantsCache.js";
 import { CATALOG_ROOM } from "../services/listingRealtime.service.js";
+import { getTeamContext } from "../services/team.service.js";
 import { emitToConversation } from "./emit.js";
 
 const onlineUsers = new Map(); // userId -> Set<socketId>
@@ -62,8 +63,21 @@ export function registerChatSocket(io) {
     io.on("connection", async (socket) => {
         const userId = socket.userId;
 
+        socket.data.userId = userId;   // visible to fetchSockets(), including across Redis
+
         socket.join(`user:${userId}`);
         socket.join(CATALOG_ROOM);
+
+        // Team mode: a member also listens on the COMPANY's room, so anything sent to the
+        // company id (price changes, visibility, orders, chat, notifications) reaches everyone.
+        try {
+            const ctx = await getTeamContext(userId);
+            if (ctx.companyId && ctx.companyId !== userId) {
+                socket.join(`user:${ctx.companyId}`);
+            }
+        } catch (e) {
+            console.error("[socket] team room join failed:", e?.message || e);
+        }
 
         const justCameOnline = markOnline(userId, socket.id);
         if (justCameOnline) {

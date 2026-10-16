@@ -9,6 +9,7 @@ import {
     isCompanyOnboarded, companyNameOf, contactConflict, newInviteToken, hashToken, enrichStoredRows,
     inviteExpiry, inviteLink, deliverInvite, logActivity,
 } from "../services/team.service.js";
+import { getIO } from "../socket/io.js";
 
 const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET;
 const actorIdOf = (req) => req.actor?.id || req.user.id;
@@ -236,6 +237,7 @@ export async function removeMember(req, res) {
         const { error } = await supabaseAdmin.from("team_members").delete().eq("id", row.id);
         if (error) throw error;
         invalidateTeamContext(targetId);
+        getIO().in(`user:${targetId}`).disconnectSockets(true);
 
         // Free the contact so it can be used again later, and end this person's access.
         // Guarded on onboarding_step so a real company account can never be touched here.

@@ -12,6 +12,47 @@ export const INVITE_TTL_HOURS = Number(process.env.TEAM_INVITE_TTL_HOURS) || 48;
 const PHONE_RE = /^[6-9]\d{9}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// Who belongs to a company (owner + members), with names. Used for audit logs.
+export async function describeCompany(companyId) {
+    const { data: team } = await supabaseAdmin.from("teams").select("id").eq("owner_id", companyId).maybeSingle();
+    let userIds = [String(companyId)];
+    if (team) {
+        const { data: m } = await supabaseAdmin.from("team_members").select("user_id, role").eq("team_id", team.id);
+        userIds = [...new Set([...userIds, ...(m || []).map((x) => String(x.user_id))])];
+    }
+    const { data: profs } = await supabaseAdmin.from("profiles").select("id, name, phone, email").in("id", userIds);
+    const byId = new Map((profs || []).map((p) => [String(p.id), p]));
+    return {
+        companyId: String(companyId),
+        companyName: await companyNameOf(companyId),
+        people: userIds.map((id) => ({
+            userId: id,
+            name: byId.get(id)?.name || byId.get(id)?.email || byId.get(id)?.phone || "unknown",
+            isOwner: id === String(companyId),
+        })),
+    };
+}
+
+// One readable log line: WHO (seller side) changed WHAT for WHICH company, and WHO is affected there.
+export async function logPriceAudience(req, { action, buyerId, submissionIds = [], detail = null }) {
+    try {
+        const [seller, actor, buyer] = await Promise.all([
+            describeCompany(req.sellerId ? req.user.id : req.user.id),
+            nameOf(req.actor?.id || req.user.id),
+            describeCompany(buyerId),
+        ]);
+        console.log(
+            `[price-audit] ${action}\n` +
+            `  by      : ${actor} (user ${req.actor?.id || req.user.id}) of seller company "${seller.companyName}" (${seller.companyId})\n` +
+            `  for     : buyer company "${buyer.companyName}" (${buyer.companyId})\n` +
+            `  listings: ${submissionIds.join(", ") || "-"}${detail ? `\n  detail  : ${JSON.stringify(detail)}` : ""}\n` +
+            `  affects : ${buyer.people.map((p) => `${p.name}${p.isOwner ? " [owner]" : ""} (${p.userId})`).join(", ")}`
+        );
+    } catch (e) {
+        console.error("[price-audit] logging failed:", e?.message || e);
+    }
+}
+
 /* ------------------------------ contacts ------------------------------ */
 export function normalizeContact(raw) {
     const v = String(raw ?? "").trim();
@@ -63,6 +104,23 @@ export async function getTeamContext(userId) {
     if (ctxCache.size > 5000) ctxCache.clear();
     ctxCache.set(userId, { ctx, exp: Date.now() + CACHE_TTL_MS });
     return ctx;
+}
+
+// company ids -> company id + every member's user id (covers sockets keyed on the real person)
+export async function teamUserIdsOf(companyIds) {
+    const ids = new Set((companyIds || []).filter(Boolean).map(String));
+    if (!ids.size) return [];
+    const { data: teams, error } = await supabaseAdmin
+        .from("teams").select("id").in("owner_id", [...ids]);
+    if (error) throw error;
+    const teamIds = (teams || []).map((t) => t.id);
+    if (teamIds.length) {
+        const { data: members, error: mErr } = await supabaseAdmin
+            .from("team_members").select("user_id").in("team_id", teamIds);
+        if (mErr) throw mErr;
+        (members || []).forEach((m) => ids.add(String(m.user_id)));
+    }
+    return [...ids];
 }
 
 // Maps any user id -> the COMPANY id they belong to (themselves if solo/owner).
