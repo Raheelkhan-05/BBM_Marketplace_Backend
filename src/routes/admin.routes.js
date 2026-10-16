@@ -100,8 +100,8 @@ router.post("/disputes/:id/review", requireAuth, requireAdmin, authWriteLimiter,
 router.post("/disputes/:id/message", requireAuth, requireAdmin, authWriteLimiter, adminPostMessage);
 router.post("/disputes/:id/resolve", requireAuth, requireAdmin, authWriteLimiter, adminResolveDispute);
 
-router.get("/gstin-reports", adminListGstinReports);
-router.post("/gstin-reports/:id/resolve", adminResolveGstinReport);
+router.get("/gstin-reports", requireAuth, requireAdmin, adminListGstinReports);
+router.post("/gstin-reports/:id/resolve", requireAuth, requireAdmin, adminResolveGstinReport);
 
 // NEW — RFQ review. /rfq/settings MUST stay above /rfq/:id.
 router.get("/rfq/settings", requireAuth, requireAdmin, getRfqSettings);
