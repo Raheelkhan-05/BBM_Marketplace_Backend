@@ -226,12 +226,12 @@ export async function upsertCustomPricing(req, res) {
     }
 
     rows.forEach((r) => void publishListingChange(r.submission_id, { buyerIds: [buyerId] }));
-    void logPriceAudience(req, {
-        action: "CUSTOM PRICE SET",
-        buyerId,
-        submissionIds: rows.map((r) => r.submission_id),
-        detail: rows.map((r) => ({ submission: r.submission_id, discountPercent: r.discount_percent })),
-    });
+    // void logPriceAudience(req, {
+    //     action: "CUSTOM PRICE SET",
+    //     buyerId,
+    //     submissionIds: rows.map((r) => r.submission_id),
+    //     detail: rows.map((r) => ({ submission: r.submission_id, discountPercent: r.discount_percent })),
+    // });
     res.json({ success: true, saved: rows.length, rejected: [] });
 }
 
@@ -246,7 +246,7 @@ export async function deleteCustomPricing(req, res) {
         .eq("seller_id", sellerId).eq("buyer_id", buyerId).eq("submission_id", submissionId);
     if (error) return res.status(500).json({ success: false, message: error.message });
     void publishListingChange(submissionId, { buyerIds: [buyerId] });
-    void logPriceAudience(req, { action: "CUSTOM PRICE REMOVED", buyerId, submissionIds: [submissionId] });
+    // void logPriceAudience(req, { action: "CUSTOM PRICE REMOVED", buyerId, submissionIds: [submissionId] });
     res.json({ success: true });
 }
 
@@ -273,6 +273,6 @@ export async function bulkClearCustomPricing(req, res) {
 
     if (error) return res.status(500).json({ success: false, message: error.message });
     ids.forEach((sid) => void publishListingChange(sid, { buyerIds: [buyerId] }));
-    void logPriceAudience(req, { action: "CUSTOM PRICES CLEARED", buyerId, submissionIds: ids });
+    // void logPriceAudience(req, { action: "CUSTOM PRICES CLEARED", buyerId, submissionIds: ids });
     res.json({ success: true });
 }

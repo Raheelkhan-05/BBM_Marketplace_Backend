@@ -15,6 +15,7 @@ import { resolveEffectiveBasePrice, derivePriceBreakdown } from "../../shared/cu
 import { resolveCompanyId, resolveCompanyIds } from "../services/team.service.js";
 import { hasOuterPack } from "../../shared/packUnits.js";
 import { publishListingChange } from "../services/listingRealtime.service.js";
+import { logPriceAudience } from "../services/team.service.js";
 
 async function loadOwnedSubmission(sellerId, submissionId, columns) {
     const { data, error } = await supabase
@@ -195,7 +196,7 @@ export async function addVisibilityBuyer(req, res) {
 
     void publishListingChange(submissionId, { buyerIds: [buyerId] });
 
-    void logPriceAudience(req, { action: "VISIBILITY GRANTED", buyerId, submissionIds: [submissionId] });
+    // void logPriceAudience(req, { action: "VISIBILITY GRANTED", buyerId, submissionIds: [submissionId] });
 
     res.json({ success: true });
 }
@@ -212,7 +213,7 @@ export async function removeVisibilityBuyer(req, res) {
 
     void publishListingChange(submissionId, { buyerIds: [buyerId] });
 
-    void logPriceAudience(req, { action: "VISIBILITY REVOKED", buyerId, submissionIds: [submissionId] });
+    // void logPriceAudience(req, { action: "VISIBILITY REVOKED", buyerId, submissionIds: [submissionId] });
     res.json({ success: true });
 }
 
