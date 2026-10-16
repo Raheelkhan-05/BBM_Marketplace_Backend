@@ -138,7 +138,7 @@ export const newInviteToken = () => crypto.randomBytes(32).toString("hex");
 export const hashToken = (t) => crypto.createHash("sha256").update(String(t)).digest("hex");
 export const inviteExpiry = () => new Date(Date.now() + INVITE_TTL_HOURS * 3600_000).toISOString();
 export const inviteLink = (token) =>
-    `${String(process.env.APP_BASE_URL || "").replace(/\/$/, "")}/join-team?token=${token}`;
+    `${String(process.env.FRONTEND_URL || "").replace(/\/$/, "")}/join-team?token=${token}`;
 
 // Returns true only if the message was actually handed to a provider.
 export async function deliverInvite({ channel, value, link, companyName, inviterName }) {
