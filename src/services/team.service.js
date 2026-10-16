@@ -364,26 +364,9 @@ async function conversationInfo(conversationId, companyId) {
     }
 }
 
-// Fills in label / counterpart / link on rows that were stored before enrichment worked.
-export async function enrichStoredRows(rows, companyId) {
-    return Promise.all(rows.map(async (r) => {
-        if (r.category !== "chat" || !r.entity_id || r.meta?.link) return r;
-        const info = await conversationInfo(r.entity_id, companyId);
-        if (!info) return r;
-        return {
-            ...r,
-            label: info.otherName ? `Messaged ${info.otherName}` : r.label,
-            meta: {
-                ...r.meta, conversationId: String(r.entity_id), counterpart: info.otherName || null,
-                link: `${info.asSeller ? "/grow" : "/save"}/chat/${r.entity_id}`,
-            },
-        };
-    }));
-}
-
 // Turns "Sent a chat message / Ref 843e5de6" into who it went to, a preview and a deep link.
-export async function enrichActivity(d, req, ctx) {
-    if (d.category !== "chat" || !d.entityId) return d;
+async function enrichChat(d, req, ctx) {
+    if (!d.entityId) return d;
     const info = await conversationInfo(d.entityId, ctx.companyId);
     const b = req.body || {};
     const text = [b.text, b.message, b.body, b.content].find((x) => typeof x === "string" && x.trim());
@@ -400,4 +383,181 @@ export async function enrichActivity(d, req, ctx) {
             link: info ? `${info.asSeller ? "/grow" : "/save"}/chat/${d.entityId}` : null,
         },
     };
+}
+
+
+/* ------------------------ order + credit enrichment ------------------------ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ORDER_NO_COLS = ["order_number", "order_no", "order_code", "display_id", "short_id", "reference"];
+
+// The shop name for a seller, else the company name. null if neither is known.
+const shopCache = new Map();
+async function shopNameOf(userId) {
+    const hit = shopCache.get(userId);
+    if (hit && hit.exp > Date.now()) return hit.v;
+    const { data } = await supabaseAdmin.from("seller_profiles").select("display_name").eq("user_id", userId).maybeSingle();
+    let v = data?.display_name?.trim() || null;
+    if (!v) { const c = await companyNameOf(userId); v = c !== "a company" ? c : null; }
+    if (shopCache.size > 2000) shopCache.clear();
+    shopCache.set(userId, { v, exp: Date.now() + 5 * 60_000 });
+    return v;
+}
+
+// Order number + the other company. Only answers for orders the company itself is part of.
+const orderCache = new Map();
+async function orderInfo(orderId, companyId) {
+    if (!UUID_RE.test(String(orderId))) return null;
+    const key = `${orderId}:${companyId}`;
+    const hit = orderCache.get(key);
+    if (hit && hit.exp > Date.now()) return hit.v;
+    let v = null;
+    try {
+        const { data: row, error } = await supabaseAdmin.from("orders").select("*").eq("id", orderId).maybeSingle();
+        if (error || !row) {
+            console.warn("[team-activity] order not found:", orderId, error?.message || "");
+        } else {
+            const cols = Object.entries(row).filter(([k, x]) => /^(buyer|seller)(_?user)?(_?id)?$/i.test(k) && typeof x === "string" && UUID_RE.test(x));
+            const mine = cols.find(([, x]) => x === companyId);
+            const other = cols.find(([, x]) => x !== companyId);
+            if (!mine) console.warn("[team-activity] company is not part of order", orderId, "columns:", Object.keys(row).join(","));
+            else {
+                const no = ORDER_NO_COLS.map((c) => row[c]).find((x) => x != null && String(x).trim());
+                const otherName = other ? (/seller/i.test(other[0]) ? await shopNameOf(other[1]) : await partyName(other[1])) : null;
+                v = { no: String(no ?? String(orderId).slice(0, 8).toUpperCase()), otherName };
+            }
+        }
+    } catch (e) { console.error("[team-activity] order lookup failed:", e?.message || e); }
+    if (orderCache.size > 2000) orderCache.clear();
+    orderCache.set(key, { v, exp: Date.now() + (v ? 5 * 60_000 : 60_000) });
+    return v;
+}
+
+const ORDER_VERB = {
+    "Placed an order": "Placed order",
+    "Cancelled an order": "Cancelled order",
+    "Raised a dispute on an order": "Raised a dispute on order",
+    "Responded to a dispute": "Responded to a dispute on order",
+};
+const SELLER_STEP = { confirm: "Confirmed", reject: "Rejected", ship: "Shipped", shipped: "Shipped", dispatch: "Dispatched", deliver: "Delivered", delivered: "Delivered", cancel: "Cancelled" };
+
+function orderVerb(label, path) {
+    if (label === "Updated a sales order") {
+        const seg = String(path || "").split("/").pop().toLowerCase();
+        return `${SELLER_STEP[seg] || "Updated"} order`;
+    }
+    return ORDER_VERB[label] || null;
+}
+
+function orderEntry(verb, action, orderId, info) {
+    const sellerSide = /\/api\/seller\//.test(action);
+    return {
+        label: `${verb} #${info.no}` + (info.otherName ? ` ${sellerSide ? "for" : "with"} ${info.otherName}` : ""),
+        link: sellerSide ? `/seller/orders/${orderId}` : `/orders/${orderId}`,
+        meta: { orderId: String(orderId), orderNo: info.no, counterpart: info.otherName || null },
+    };
+}
+
+// New order ids come back in the response of POST /api/orders.
+function orderIdsFrom(b) {
+    const out = [];
+    const add = (x) => { if (typeof x === "string" && UUID_RE.test(x) && !out.includes(x)) out.push(x); };
+    if (!b || typeof b !== "object") return out;
+    add(b.orderId); add(b.order?.id); add(b.data?.id); add(b.id);
+    (Array.isArray(b.orders) ? b.orders : []).forEach((o) => add(o?.id));
+    (Array.isArray(b.orderIds) ? b.orderIds : []).forEach(add);
+    return out;
+}
+
+async function enrichOrder(d, ctx, resBody) {
+    let orderId = d.entityId;
+    if (d.action === "POST /api/orders") {
+        const ids = orderIdsFrom(resBody);
+        if (!ids.length) return d;
+        if (ids.length > 1) return { ...d, label: `Placed ${ids.length} orders`, entityType: "order", meta: { ...d.meta, link: "/orders" } };
+        orderId = ids[0];
+    }
+    if (!orderId) return d;
+    const verb = orderVerb(d.label, d.meta?.path);
+    if (!verb) return d;
+    const info = await orderInfo(orderId, ctx.companyId);
+    if (!info) return d;
+    const e = orderEntry(verb, d.action, orderId, info);
+    return { ...d, label: e.label, entityType: "order", entityId: String(orderId), meta: { ...d.meta, ...e.meta, link: e.link } };
+}
+
+// credit label -> which side the OTHER company is on, and the new wording
+const CREDIT = {
+    "Requested credit from a seller": ["seller", (n) => `Requested credit from ${n}`],
+    "Requested a higher credit limit": ["seller", (n) => `Requested a higher credit limit from ${n}`],
+    "Gave credit to a buyer": ["buyer", (n) => `Gave credit to ${n}`],
+    "Decided a credit request": ["buyer", (n) => `Decided ${n}'s credit request`],
+    "Turned credit on or off for a buyer": ["buyer", (n) => `Turned credit on or off for ${n}`],
+    "Declined a credit limit increase": ["buyer", (n) => `Declined ${n}'s credit limit increase`],
+    "Changed a credit limit": ["buyer", (n) => `Changed the credit limit for ${n}`],
+};
+
+// Looks through params, body and response for e.g. sellerId / seller_id / seller.
+function findParty(node, role, skip, depth = 0) {
+    if (!node || typeof node !== "object" || depth > 3) return null;
+    const re = new RegExp(role === "seller" ? "^(seller|vendor)(_?user)?(_?id)?$" : "^(buyer|customer)(_?user)?(_?id)?$", "i");
+    for (const [k, v] of Object.entries(node)) {
+        if (typeof v === "string" && UUID_RE.test(v) && v !== skip && re.test(k)) return v;
+    }
+    for (const v of Object.values(node)) {
+        if (v && typeof v === "object") { const f = findParty(v, role, skip, depth + 1); if (f) return f; }
+    }
+    return null;
+}
+
+async function enrichCredit(d, req, ctx, resBody) {
+    const rule = CREDIT[d.label];
+    if (!rule) return d;
+    const [role, words] = rule;
+    const src = { params: req.params || {}, body: req.body || {}, res: resBody || {} };
+    const id = findParty(src, role, ctx.companyId);
+    if (!id) {
+        console.warn("[team-activity] credit: no", role, "found. params:", Object.keys(src.params).join(","),
+            "| body:", Object.keys(src.body).join(","), "| response:", Object.keys(src.res).join(","));
+        return { ...d, meta: { ...d.meta, link: "/credit" } };
+    }
+    const name = role === "seller" ? await shopNameOf(id) : await partyName(id);
+    return {
+        ...d,
+        label: name ? words(name) : d.label,
+        meta: { ...d.meta, counterpart: name || null, counterpartId: id, link: "/credit" },
+    };
+}
+
+export async function enrichActivity(d, req, ctx, resBody) {
+    try {
+        if (d.category === "chat") return await enrichChat(d, req, ctx);
+        if (d.category === "orders") return await enrichOrder(d, ctx, resBody);
+        if (d.category === "credit") return await enrichCredit(d, req, ctx, resBody);
+    } catch (e) { console.error("[team-activity] enrich failed:", e?.message || e); }
+    return d;
+}
+
+// Repairs older rows when the log is opened (only those that kept an id).
+export async function enrichStoredRows(rows, companyId) {
+    return Promise.all(rows.map(async (r) => {
+        if (r.meta?.link || !r.entity_id) return r;
+        if (r.category === "chat") {
+            const info = await conversationInfo(r.entity_id, companyId);
+            if (!info) return r;
+            return {
+                ...r,
+                label: info.otherName ? `Messaged ${info.otherName}` : r.label,
+                meta: { ...r.meta, conversationId: String(r.entity_id), counterpart: info.otherName || null, link: `${info.asSeller ? "/grow" : "/save"}/chat/${r.entity_id}` },
+            };
+        }
+        if (r.category === "orders") {
+            const verb = orderVerb(r.label, r.meta?.path);
+            if (!verb) return r;
+            const info = await orderInfo(r.entity_id, companyId);
+            if (!info) return r;
+            const e = orderEntry(verb, r.action, r.entity_id, info);
+            return { ...r, label: e.label, entity_type: "order", meta: { ...r.meta, ...e.meta, link: e.link } };
+        }
+        return r;
+    }));
 }

@@ -23,12 +23,16 @@ export async function applyTeamContext(req, res) {
     if (ctx.companyId !== req.actor.id) req.user = { ...req.user, id: ctx.companyId };
 
     if (ctx.teamId && MUTATING.has(req.method) && res) {
+        let resBody;
+        const origJson = res.json.bind(res);
+        res.json = (b) => { resBody = b; return origJson(b); };
+
         res.once("finish", async () => {
             if (res.statusCode >= 400) return;
             try {
                 let d = describeRequest(req);
                 if (!d) return;
-                d = await enrichActivity(d, req, ctx);
+                d = await enrichActivity(d, req, ctx, resBody);
                 await logActivity({
                     teamId: ctx.teamId, actorId: ctx.actorId, actorRole: ctx.role,
                     category: d.category, action: d.action, label: d.label,
