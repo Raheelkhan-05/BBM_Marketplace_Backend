@@ -37,6 +37,7 @@ import paymentsRoutes from "./routes/payments.routes.js";
 import adminPaymentsRoutes from "./routes/adminPayments.routes.js";
 import sellerCustomersRoutes from "./routes/sellerCustomers.routes.js";
 import adminFinanceRoutes from "./routes/adminFinance.routes.js";
+import teamRoutes from "./routes/team.routes.js";
 
 export function createApp() {
   const app = express();
@@ -134,6 +135,7 @@ export function createApp() {
   app.use("/api/cart", cartRoutes);
   app.use("/api/help", helpRoutes);
   app.use("/api/transport-library", transportLibraryRoutes);
+  app.use("/api/team", teamRoutes)
 
   app.use((err, req, res, next) => {
     console.error(err);

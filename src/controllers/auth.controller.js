@@ -3,52 +3,62 @@ import { supabaseAdmin, supabase } from "../config/supabase.js";
 import { validateGSTIN, fetchGstinDetails } from "../services/gst.service.js";
 import { channelTokenFor } from "../services/channelToken.js";
 import { sendWelcomeEmail, sendBusinessVerifiedEmail } from "../services/mail.service.js";
+import { getTeamContext } from "../services/team.service.js";
+
+// Team members never register a company of their own; the admin's company is theirs.
+async function blockTeamMember(req, res) {
+  const ctx = await getTeamContext(req.user.id);
+  if (ctx.isMember) {
+    res.status(403).json({ success: false, code: "TEAM_MEMBER", message: "Your account is part of a company team. Only your team admin can change company details." });
+    return true;
+  }
+  return false;
+}
 
 // GET /api/auth/me
 //
-// PERFORMANCE FIX: this now runs the seller_profiles and business_profiles
-// lookups IN PARALLEL instead of one after the other. Neither of those two
-// queries depends on the profile row or on each other — both only need
-// req.user.id, which is already known from the verified JWT before this
-// handler even starts. The original version awaited profile, then
-// (sequentially) seller, then (sequentially) businessProfile — three
-// stacked round trips. Since AuthContext now calls this endpoint
-// immediately on every app load for any signed-in visitor (as part of the
-// auth-speed fix), this endpoint's own latency directly affects how fast
-// the whole app feels — cutting it from three sequential round trips to
-// two (profile first, since its result decides the 401; then seller +
-// businessProfile together) is a real, repeated win, not a one-off.
+// TEAM MODE: for a team member this returns the COMPANY's profile / business / seller data
+// (profile.id is the company id, which is what chat, orders and sockets key on). The person
+// who is actually signed in is in `team.actorId`. Solo users get `team: null` and behave
+// exactly as before.
 //
-// sellerLocation: the seller's ship-from location (registered city/state,
-// plus dispatch district/state when they dispatch from somewhere else).
-// Added to the SAME seller_profiles query as status/shop_slug, so there is
-// no extra round trip. The GROW Transport page uses it to prefill the
-// origin city/state when a seller adds a route manually.
+// Profile, seller and business lookups are independent, so seller + business run in parallel.
+// sellerLocation: the seller's ship-from location, used by the GROW Transport page.
 export async function getMe(req, res) {
-  // console.log("[getMe] req.user.id:", req.user?.id);
+  let ctx;
+  try {
+    ctx = await getTeamContext(req.user.id);
+  } catch (e) {
+    console.error("[getMe] team context failed:", e?.message || e);
+    return res.status(503).json({ success: false, message: "Couldn't load your account. Please try again." });
+  }
+  const companyId = ctx.companyId;
 
   const { data: profile, error } = await supabaseAdmin
     .from("profiles")
     .select("id, phone, phone_verified, email, email_verified, name, onboarding_step, created_at, role")
-    .eq("id", req.user.id)
+    .eq("id", companyId)
     .eq("role", "user")
     .is("deleted_at", null)
     .maybeSingle();
-
-  // console.log("[getMe] query result:", { profile, error });
 
   if (error || !profile) {
     console.log("[getMe] rejecting — error:", error?.message, "profile:", profile);
     return res.status(401).json({ success: false, message: "Session out of date — please log in again." });
   }
 
+  // A team-member profile that is no longer in any team has lost its access.
+  if (!ctx.teamId && profile.onboarding_step === "team_member") {
+    return res.status(401).json({ success: false, code: "TEAM_ACCESS_REMOVED", message: "You no longer have access to this team. Please contact your team admin." });
+  }
+
   const [sellerResult, businessResult] = await Promise.allSettled([
     supabase
       .from("seller_profiles")
       .select("status, shop_slug, city, state, dispatch_same_as_registered, dispatch_district, dispatch_state")
-      .eq("user_id", req.user.id)
+      .eq("user_id", companyId)
       .maybeSingle(),
-    supabaseAdmin.from("business_profiles").select("*").eq("user_id", req.user.id).maybeSingle(),
+    supabaseAdmin.from("business_profiles").select("*").eq("user_id", companyId).maybeSingle(),
   ]);
   const seller = sellerResult.status === "fulfilled" ? sellerResult.value.data : null;
   const businessProfile = businessResult.status === "fulfilled" ? businessResult.value.data : null;
@@ -57,9 +67,10 @@ export async function getMe(req, res) {
     success: true,
     profile,
     businessProfile: businessProfile || null,
-    notificationChannel: channelTokenFor(req.user.id),
+    notificationChannel: channelTokenFor(companyId),
     shop_slug: seller?.shop_slug ?? null,
     seller_status: seller?.status ?? null,
+    team: ctx.teamId ? { id: ctx.teamId, role: ctx.role, isAdmin: ctx.isAdmin, isOwner: !ctx.isMember, actorId: ctx.actorId } : null,
     sellerLocation: seller
       ? {
         city: seller.city ?? null,
@@ -111,9 +122,11 @@ export async function getMeAdmin(req, res) {
     seller_status: seller?.status ?? null,
   });
 }
+
 // POST /api/auth/gst-lookup  { gstin }
-// auth.controller.js — lookupGstin
 export async function lookupGstin(req, res) {
+  if (await blockTeamMember(req, res)) return;
+
   const check = validateGSTIN(req.body?.gstin);
   if (!check.valid) return res.status(400).json({ success: false, message: check.reason });
 
@@ -121,7 +134,7 @@ export async function lookupGstin(req, res) {
     .from("business_profiles")
     .select("user_id, profiles!inner(deleted_at)")
     .eq("gstin", check.gstin)
-    .is("profiles.deleted_at", null)   // <-- only counts as "taken" if the owning profile is still active
+    .is("profiles.deleted_at", null)   // only counts as "taken" if the owning profile is still active
     .maybeSingle();
   if (existing && existing.user_id !== req.user.id) {
     return res.status(409).json({ success: false, message: "This GSTIN is already registered to another account." });
@@ -136,13 +149,14 @@ export async function lookupGstin(req, res) {
 // POST /api/auth/complete-profile
 // { name, gstin, displayName, dispatchSameAsRegistered, dispatchAddress?, dispatchPincode?, dispatchState? }
 export async function completeProfile(req, res) {
+  if (await blockTeamMember(req, res)) return;
+
   const {
     name, gstin, displayName,
     dispatchSameAsRegistered, dispatchAddress, dispatchPincode, dispatchState,
   } = req.body || {};
 
   if (!name || name.trim().length < 2) return res.status(400).json({ success: false, message: "Enter your name." });
-
 
   const gstCheck = validateGSTIN(gstin);
   if (!gstCheck.valid) return res.status(400).json({ success: false, message: gstCheck.reason });
@@ -163,7 +177,6 @@ export async function completeProfile(req, res) {
     return res.status(409).json({ success: false, message: "This GSTIN is already registered to another account." });
   }
 
-  // inside completeProfile, alongside the existing validation
   const { data: currentProfile } = await supabaseAdmin
     .from("profiles").select("phone_verified").eq("id", req.user.id).single();
   if (!currentProfile?.phone_verified) {

@@ -9,10 +9,8 @@ function assertConfigured() {
   if (!AUTH_JWT_SECRET) throw Object.assign(new Error("AUTH_JWT_SECRET is not set."), { status: 500 });
 }
 
-// Finds a profile by EITHER phone or email matching the given value, so a
-// user who started signup on one channel can log back in on the other and
-// land on the same account, rather than getting a fresh blank one.
-// src/controllers/otpAuth.controller.js
+// A team member never goes through company onboarding: the admin already did it for the company.
+const needsOnboarding = (p) => p.onboarding_step !== "done" && p.onboarding_step !== "team_member";
 
 // Finds a profile owning this phone/email. Verified ownership always
 // wins: if some profile has actually verified this value, that's the
@@ -58,7 +56,7 @@ async function findOrCreateProfile(channel, value) {
       await supabaseAdmin.from("profiles").update({ [column]: value, [verifiedColumn]: true }).eq("id", profile.id);
       profile[verifiedColumn] = true;
     }
-    return { profile, isNewUser: profile.onboarding_step !== "done" };
+    return { profile, isNewUser: needsOnboarding(profile) };
   }
 
   const insertPatch = channel === "phone"
@@ -74,7 +72,7 @@ async function findOrCreateProfile(channel, value) {
         .from("profiles").select("*")
         .eq(column, value).eq(verifiedColumn, true).eq("role", "user").is("deleted_at", null).maybeSingle();
       if (racedErr) throw racedErr;
-      if (raced) return { profile: raced, isNewUser: raced.onboarding_step !== "done" };
+      if (raced) return { profile: raced, isNewUser: needsOnboarding(raced) };
     }
     throw insertErr;
   }

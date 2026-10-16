@@ -6,7 +6,16 @@ const FROM = process.env.SMTP_FROM || '"BBM" <communication@bbmpvtltd.com>';
 const BRAND_TEAL = "#047084";
 const BRAND_ORANGE = "#d2462b";
 
-function shell(title, bodyHtml) {
+const DEFAULT_FOOTER = `You're receiving this because an account was created or updated on BBM
+            using this email address. If this wasn't you, you can ignore this email.`;
+
+function esc(v) {
+  return String(v ?? "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function shell(title, bodyHtml, footer = DEFAULT_FOOTER) {
   return `
   <div style="background:#f4f7f8;padding:32px 0;font-family:Arial,Helvetica,sans-serif;">
     <table role="presentation" width="100%" style="max-width:480px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #eef1f2;">
@@ -24,8 +33,7 @@ function shell(title, bodyHtml) {
       <tr>
         <td style="padding:20px 28px 28px;">
           <p style="margin:0;font-size:11.5px;color:#94a3b8;">
-            You're receiving this because an account was created or updated on BBM
-            using this email address. If this wasn't you, you can ignore this email.
+            ${footer}
           </p>
         </td>
       </tr>
@@ -52,7 +60,7 @@ export async function sendWelcomeEmail(toEmail, name) {
        Your account is ready. You can start sourcing materials right away —
        and open a storefront to sell any time, using the same login.
      </p>
-     <a href="https://your-domain.com/home" style="display:inline-block;margin-top:6px;background:${BRAND_ORANGE};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
+     <a href="https://bbm.business/home" style="display:inline-block;margin-top:6px;background:${BRAND_ORANGE};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
        Go to marketplace
      </a>`
   );
@@ -92,7 +100,7 @@ export async function sendBusinessVerifiedEmail(toEmail, businessName) {
        <strong>${businessName}</strong> is verified. You can list products
        and open your storefront whenever you're ready.
      </p>
-     <a href="https://your-domain.com/seller/onboarding" style="display:inline-block;margin-top:6px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
+     <a href="https://bbm.business/grow/dashboard" style="display:inline-block;margin-top:6px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
        Open your shop
      </a>`
   );
@@ -100,6 +108,37 @@ export async function sendBusinessVerifiedEmail(toEmail, businessName) {
     from: FROM,
     to: toEmail,
     subject: "You're verified to sell on BBM",
+    html,
+  });
+  return throwIfResendError(result);
+}
+
+// Team mode: invitation to join a company's team. Called by services/team.service.js
+// (deliverInvite), which treats a thrown error as "not delivered" and shows the admin a copy-link fallback.
+export async function sendTeamInviteEmail({ to, companyName, inviterName, link, hours }) {
+  if (!to) return;
+  const company = esc(companyName || "a company");
+  const inviter = esc(inviterName || "A colleague");
+  const html = shell(
+    `Join ${company}'s team on BBM`,
+    `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
+       ${inviter} invited you to join <strong>${company}</strong> as a team member.
+       You'll work inside the company's account with the same access as the company,
+       and the team admin can see the actions team members take.
+     </p>
+     <a href="${esc(link)}" style="display:inline-block;margin-top:6px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
+       Join the team
+     </a>
+     <p style="margin:16px 0 0;font-size:12.5px;line-height:1.6;color:#64748b;">
+       This link expires in ${esc(hours)} hours. Sign up with <strong>this email address</strong>; a different one won't work.
+     </p>
+     <p style="margin:10px 0 0;font-size:11.5px;line-height:1.5;color:#94a3b8;word-break:break-all;">${esc(link)}</p>`,
+    "You're receiving this because someone invited this email address to join their team on BBM. If you weren't expecting it, you can ignore this email and nothing will change."
+  );
+  const result = await resend.emails.send({
+    from: FROM,
+    to,
+    subject: `${String(inviterName || "A colleague").replace(/[\r\n]+/g, " ")} invited you to join ${String(companyName || "a company").replace(/[\r\n]+/g, " ")} on BBM`,
     html,
   });
   return throwIfResendError(result);

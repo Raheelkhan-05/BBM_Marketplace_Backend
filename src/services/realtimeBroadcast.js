@@ -24,6 +24,12 @@ export async function notifyUser(userId, { type, title, body = null, link = null
     return data;
 }
 
+// Same room notifyUser uses, but a plain event: nothing is stored, no bell entry.
+export function emitToUser(userId, event, payload = {}) {
+    try { getIO().to(`user:${userId}`).emit(event, payload); }
+    catch (err) { console.error("[emitToUser] emit failed:", err.message); }
+}
+
 export async function notifyOrderChanged(orderId, patch) {
     try { getIO().to(`order:${orderId}`).emit("order_updated", patch); }
     catch (err) { console.error("[notifyOrderChanged] emit failed:", err.message); }
