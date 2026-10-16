@@ -94,6 +94,7 @@ import {
     getCommissionPercent, computeMarketplaceFigures,
     normalizeEnteredPrice,
 } from "../services/pricing.service.js";
+import { resolveCompanyIds } from "../services/team.service.js";
 import { resolveMarketingFields } from "../services/marketing.service.js";
 import { resolveEffectiveBasePrice } from "../../shared/customPricing.js";
 
@@ -121,7 +122,20 @@ const GROUP_FIELD_MAP = {
 async function applyBuyerAccessDraft(submissionId, sellerId, draft, defaultPrice) {
     if (!draft || !Array.isArray(draft.buyers) || !draft.buyers.length) return;
 
-    const visibilityRows = draft.buyers.map((b) => ({
+    const map = await resolveCompanyIds(draft.buyers.map((b) => b.buyerId));
+    const byCompany = new Map();                       // dedupe: two teammates -> one company
+    for (const b of draft.buyers) {
+        const cid = map.get(String(b.buyerId));
+        if (cid === String(sellerId)) continue;
+        const prev = byCompany.get(cid);
+        if (!prev || (b.override?.canonicalPrice != null && prev.override?.canonicalPrice == null)) {
+            byCompany.set(cid, { ...b, buyerId: cid });
+        }
+    }
+    const buyers = [...byCompany.values()];
+    if (!buyers.length) return;
+
+    const visibilityRows = buyers.map((b) => ({
         submission_id: submissionId, seller_id: sellerId, buyer_id: b.buyerId,
     }));
     await supabase.from("seller_listing_visibility")
@@ -130,7 +144,7 @@ async function applyBuyerAccessDraft(submissionId, sellerId, draft, defaultPrice
     const base = Number(defaultPrice);
     const clamp = (p) => Math.max(-9999999999, Math.min(9999999999, Math.round(p * 1e6) / 1e6));
 
-    const priceRows = draft.buyers
+    const priceRows = buyers
         .filter((b) => b.override?.canonicalPrice != null && base > 0)
         .map((b) => ({
             seller_id: sellerId,

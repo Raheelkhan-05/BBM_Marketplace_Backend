@@ -65,6 +65,23 @@ export async function getTeamContext(userId) {
     return ctx;
 }
 
+// Maps any user id -> the COMPANY id they belong to (themselves if solo/owner).
+export async function resolveCompanyIds(ids) {
+    const uniq = [...new Set((ids || []).filter(Boolean).map(String))];
+    const map = new Map(uniq.map((id) => [id, id]));
+    if (!uniq.length) return map;
+    const { data, error } = await supabaseAdmin
+        .from("team_members").select("user_id, teams!inner ( owner_id )").in("user_id", uniq);
+    if (error) throw error;
+    (data || []).forEach((r) => map.set(String(r.user_id), String(r.teams.owner_id)));
+    return map;
+}
+
+export async function resolveCompanyId(id) {
+    if (!id) return id;
+    return (await resolveCompanyIds([id])).get(String(id)) ?? id;
+}
+
 // Creates the team lazily the first time the admin invites someone.
 export async function ensureTeam(ownerId) {
     const ctx = await getTeamContext(ownerId);

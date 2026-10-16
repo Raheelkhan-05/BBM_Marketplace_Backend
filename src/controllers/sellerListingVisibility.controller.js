@@ -12,6 +12,7 @@
 // endpoint directly with an arbitrary id.
 import { supabase } from "../config/supabase.js";
 import { resolveEffectiveBasePrice, derivePriceBreakdown } from "../../shared/customPricing.js";
+import { resolveCompanyId, resolveCompanyIds } from "../services/team.service.js";
 import { hasOuterPack } from "../../shared/packUnits.js";
 
 async function loadOwnedSubmission(sellerId, submissionId, columns) {
@@ -161,11 +162,10 @@ export async function setVisibilityMode(req, res) {
 export async function addVisibilityBuyer(req, res) {
     const sellerId = req.sellerId;
     const { id: submissionId } = req.params;
-    const { buyerId } = req.body || {};
-    if (!buyerId) return res.status(400).json({ success: false, message: "buyerId is required." });
+    const rawId = req.body?.buyerId;
+    if (!rawId) return res.status(400).json({ success: false, message: "buyerId is required." });
 
-    // Defense in depth — search already excludes the seller's own id, but
-    // this endpoint can be hit directly with an arbitrary id.
+    const buyerId = await resolveCompanyId(rawId);          // <- company, not the person
     if (String(buyerId) === String(sellerId)) {
         return res.status(400).json({ success: false, message: "You can't add yourself as a buyer." });
     }
@@ -197,20 +197,18 @@ export async function addVisibilityBuyer(req, res) {
 // DELETE /api/seller/catalog/submissions/:id/visibility/buyers/:buyerId
 export async function removeVisibilityBuyer(req, res) {
     const sellerId = req.sellerId;
-    const { id: submissionId, buyerId } = req.params;
-
-    const { error } = await supabase
-        .from("seller_listing_visibility")
-        .delete()
-        .eq("submission_id", submissionId).eq("seller_id", sellerId).eq("buyer_id", buyerId);
+    const { id: submissionId, buyerId: raw } = req.params;
+    const buyerId = await resolveCompanyId(raw);
+    const { error } = await supabase.from("seller_listing_visibility").delete()
+        .eq("submission_id", submissionId).eq("seller_id", sellerId)
+        .in("buyer_id", [...new Set([String(raw), String(buyerId)])]);
     if (error) return res.status(500).json({ success: false, message: error.message });
-
     res.json({ success: true });
 }
 
 // GET /api/seller/catalog/buyers/search?q=&submissionId=
 export async function searchEligibleBuyersForSeller(req, res) {
-    const sellerId = req.sellerId;
+    const sellerId = String(req.sellerId);
     const { q = "", submissionId } = req.query;
     const trimmed = String(q).trim();
     if (trimmed.length < 2) return res.json({ success: true, buyers: [] });
@@ -218,24 +216,48 @@ export async function searchEligibleBuyersForSeller(req, res) {
     let excludeIds = [];
     if (submissionId) {
         const { data: existing } = await supabase
-            .from("seller_listing_visibility")
-            .select("buyer_id")
+            .from("seller_listing_visibility").select("buyer_id")
             .eq("submission_id", submissionId).eq("seller_id", sellerId);
-        excludeIds = (existing || []).map((r) => r.buyer_id);
+        excludeIds = (existing || []).map((r) => String(r.buyer_id));
     }
+    if (!excludeIds.includes(sellerId)) excludeIds.push(sellerId);
 
-    // NEW — a seller is never a legitimate "buyer" of their own listing.
-    // search_eligible_buyers only sees search terms + an exclude list, so
-    // fold the caller's own id into that same list rather than trying to
-    // special-case it downstream.
-    if (sellerId && !excludeIds.includes(sellerId)) excludeIds.push(sellerId);
-
+    // Over-fetch: several hits may collapse into one company.
     const { data, error } = await supabase.rpc("search_eligible_buyers", {
-        p_query: trimmed,
-        p_limit: 8,
-        p_exclude_buyer_ids: excludeIds.length ? excludeIds : null,
+        p_query: trimmed, p_limit: 30, p_exclude_buyer_ids: excludeIds,
     });
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    res.json({ success: true, buyers: data || [] });
+    const rows = data || [];
+    const companyOf = await resolveCompanyIds(rows.map((r) => r.buyer_id));
+    const swapIds = [...new Set(rows.map((r) => companyOf.get(String(r.buyer_id)))
+        .filter((cid, i) => cid !== String(rows[i].buyer_id)))];
+
+    let owners = {};
+    if (swapIds.length) {
+        const { data: profs } = await supabase
+            .from("profiles")
+            .select("id, name, phone, phone_verified, email, email_verified, business_profiles(display_name, trade_name, legal_name)")
+            .in("id", swapIds).is("deleted_at", null);
+        owners = Object.fromEntries((profs || []).map((p) => [String(p.id), p]));
+    }
+
+    const skip = new Set(excludeIds);
+    const seen = new Set();
+    const out = [];
+    for (const r of rows) {
+        const cid = companyOf.get(String(r.buyer_id));
+        if (skip.has(cid) || seen.has(cid)) continue;
+        if (cid === String(r.buyer_id)) { seen.add(cid); out.push(r); continue; }
+        const o = owners[cid];
+        if (!o) continue;
+        const bp = Array.isArray(o.business_profiles) ? o.business_profiles[0] : o.business_profiles;
+        seen.add(cid);
+        out.push({
+            buyer_id: cid, name: o.name || null,
+            phone: o.phone_verified ? o.phone : null, email: o.email_verified ? o.email : null,
+            shop_name: bp?.display_name || bp?.trade_name || bp?.legal_name || null,
+        });
+    }
+    res.json({ success: true, buyers: out.slice(0, 8) });
 }

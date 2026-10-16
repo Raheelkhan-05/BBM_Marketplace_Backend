@@ -4,11 +4,12 @@ import { percentFromCustomPrice, resolveEffectiveBasePrice, derivePriceBreakdown
 import { hasOuterPack } from "../../shared/packUnits.js";
 import { publishListingChange, publishListingRemoved } from "../services/listingRealtime.service.js";
 import { CATALOG_REMOVED_REJECTION_REASON } from "./sellerCatalogListings.controller.js";
+import { resolveCompanyId } from "../services/team.service.js";
 
 
 export async function listCustomPricingForBuyer(req, res) {
     const sellerId = req.sellerId;
-    const { buyerId } = req.params;
+    const buyerId = await resolveCompanyId(req.params.buyerId);
 
     const [{ data: submissions, error: subErr }, { data: overrides, error: ovErr }] = await Promise.all([
         supabase
@@ -150,11 +151,12 @@ export async function listCustomPricingForSubmission(req, res) {
 // path) without doing math themselves.
 export async function upsertCustomPricing(req, res) {
     const sellerId = req.sellerId;
-    const { buyerId } = req.params;
+    const buyerId = await resolveCompanyId(req.params.buyerId);
     const { items } = req.body || {};
     if (!Array.isArray(items) || !items.length) {
         return res.status(400).json({ success: false, message: "No items provided." });
     }
+    if (String(buyerId) === String(sellerId)) return res.status(400).json({ success: false, message: "You can't set a price for your own company." });
 
     const submissionIds = items.map((i) => i.submissionId).filter(Boolean);
     const { data: submissions, error: subErr } = await supabase
@@ -230,7 +232,9 @@ export async function upsertCustomPricing(req, res) {
 // DELETE /api/seller/custom-pricing/:buyerId/:submissionId
 export async function deleteCustomPricing(req, res) {
     const sellerId = req.sellerId;
-    const { buyerId, submissionId } = req.params;
+
+    const buyerId = await resolveCompanyId(req.params.buyerId);
+    const { submissionId } = req.params;
     const { error } = await supabase
         .from("buyer_seller_custom_prices")
         .delete()
@@ -244,8 +248,10 @@ export async function deleteCustomPricing(req, res) {
 // body: { submissionIds?: string[] } — omit to clear ALL for this buyer.
 export async function bulkClearCustomPricing(req, res) {
     const sellerId = req.sellerId;
-    const { buyerId } = req.params;
+    const buyerId = await resolveCompanyId(req.params.buyerId);
     const { submissionIds } = req.body || {};
+
+    if (String(buyerId) === String(sellerId)) return res.status(400).json({ success: false, message: "You can't set a price for your own company." });
 
     let ids = submissionIds;
     if (!Array.isArray(ids) || !ids.length) {
