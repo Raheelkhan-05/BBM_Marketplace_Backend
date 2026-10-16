@@ -36,6 +36,8 @@ import {
   adminUpdateEnquiry, adminApproveEnquiry, adminRejectEnquiry,
 } from "../controllers/adminRfq.controller.js";
 
+import { adminListGstinReports, adminResolveGstinReport } from "../controllers/gstinReport.controller.js";
+
 // NEW — these two functions already existed in wallet.controller.js but were
 // never imported/mounted here, which is why there was no admin route to
 // verify wallet top-ups. Wiring them in now.
@@ -97,6 +99,9 @@ router.get("/disputes/:id", requireAuth, requireAdmin, adminGetDispute);
 router.post("/disputes/:id/review", requireAuth, requireAdmin, authWriteLimiter, adminStartReview);
 router.post("/disputes/:id/message", requireAuth, requireAdmin, authWriteLimiter, adminPostMessage);
 router.post("/disputes/:id/resolve", requireAuth, requireAdmin, authWriteLimiter, adminResolveDispute);
+
+router.get("/gstin-reports", adminListGstinReports);
+router.post("/gstin-reports/:id/resolve", adminResolveGstinReport);
 
 // NEW — RFQ review. /rfq/settings MUST stay above /rfq/:id.
 router.get("/rfq/settings", requireAuth, requireAdmin, getRfqSettings);

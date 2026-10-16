@@ -137,7 +137,7 @@ export async function lookupGstin(req, res) {
     .is("profiles.deleted_at", null)   // only counts as "taken" if the owning profile is still active
     .maybeSingle();
   if (existing && existing.user_id !== req.user.id) {
-    return res.status(409).json({ success: false, message: "This GSTIN is already registered to another account." });
+    return res.status(409).json({ success: false, code: "GSTIN_TAKEN", message: "This GSTIN is already registered to another account." });
   }
 
   const result = await fetchGstinDetails(check.gstin);
@@ -174,7 +174,7 @@ export async function completeProfile(req, res) {
     .is("profiles.deleted_at", null)
     .maybeSingle();
   if (existing && existing.user_id !== req.user.id) {
-    return res.status(409).json({ success: false, message: "This GSTIN is already registered to another account." });
+    return res.status(409).json({ success: false, code: "GSTIN_TAKEN", message: "This GSTIN is already registered to another account." });
   }
 
   const { data: currentProfile } = await supabaseAdmin
@@ -228,7 +228,7 @@ export async function completeProfile(req, res) {
 
   if (bizErr) {
     if (bizErr.code === "23505") {
-      return res.status(409).json({ success: false, message: "This GSTIN is already registered to another account." });
+      return res.status(409).json({ success: false, code: "GSTIN_TAKEN", message: "This GSTIN is already registered to another account." });
     }
     console.error("[complete-profile] business upsert failed:", bizErr.message);
     return res.status(500).json({ success: false, message: "Couldn't save your company details. Try again." });

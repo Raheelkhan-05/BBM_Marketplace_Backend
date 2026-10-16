@@ -162,3 +162,18 @@ export async function sendOtpEmail(email, otp) {
   });
   return throwIfResendError(result);
 }
+
+export async function sendGstinReportUpdateEmail({ to, name, gstin, message }) {
+  if (!to) return;
+  const html = shell(
+    "Update on your GSTIN report",
+    `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
+       Hi ${esc(name || "there")}, our team has looked into your report about GSTIN
+       <strong>${esc(gstin)}</strong>.
+     </p>
+     <p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#0f172a;white-space:pre-line;">${esc(message)}</p>`,
+    "You're receiving this because you reported a GSTIN issue on BBM. If this wasn't you, you can ignore this email."
+  );
+  const result = await resend.emails.send({ from: FROM, to, subject: "Update on your GSTIN report", html });
+  return throwIfResendError(result);
+}
