@@ -13,6 +13,7 @@ import catalogLandingRoutes from "./routes/catalogLanding.routes.js";
 import catalogImportRoutes from "./routes/catalogImport.routes.js";
 import whatsappRoutes from "./routes/whatsapp.routes.js";
 import sellerCatalogListingsRouter from "./routes/sellerCatalogListings.routes.js";
+import bulkListingsRoutes from "./routes/bulkListings.routes.js";
 import adminSellerSubmissionsRouter from "./routes/adminSellerSubmissions.routes.js";
 import catalogSearchRoutes from "./routes/catalogSearch.routes.js";
 import ordersRoutes from "./routes/orders.routes.js";
@@ -104,6 +105,7 @@ export function createApp() {
   app.use("/api/seo", seoRoutes);
   app.use("/api/seller/customers", sellerCustomersRoutes);
   app.use("/api/seller/catalog", sellerCatalogListingsRouter);
+  app.use("/api/seller/bulk", bulkListingsRoutes);
   app.use("/api/seller/orders", sellerOrdersRoutes);
   app.use("/api/seller/wallet", sellerWalletRoutes);
   app.use("/api/seller/custom-pricing", customPricingRoutes);

@@ -134,7 +134,7 @@ export async function getBrandItemDetail(req, res) {
 // compute and return each seller's `total_delivery_days` so the frontend
 // can DISPLAY an estimate even while sorting by price or MOQ.
 export async function getBrandItemSellers(req, res) {
-    console.log("[catalog-debug]", { actor: req.actor?.id, user: req.user?.id, team: req.team?.companyId, route: req.originalUrl });
+    // console.log("[catalog-debug]", { actor: req.actor?.id, user: req.user?.id, team: req.team?.companyId, route: req.originalUrl });
     const { brandItemId } = req.params;
     const { sort = "relevance", destPincode, destState } = req.query;
     const limit = parseIntSafe(req.query.limit, 24);
@@ -219,7 +219,7 @@ export async function unfollowBrandItem(req, res) {
 // product picked yet. categoryId omitted = browse everything.
 // GET /api/catalog/brand-items-feed?categoryId=&q=&sort=&limit=&offset=
 export async function getBrandItemsFeed(req, res) {
-    console.log("[catalog-debug]", { actor: req.actor?.id, user: req.user?.id, team: req.team?.companyId, route: req.originalUrl });
+    // console.log("[catalog-debug]", { actor: req.actor?.id, user: req.user?.id, team: req.team?.companyId, route: req.originalUrl });
     const { categoryId = "", q = "", sort = "relevance", destPincode, destState } = req.query;
     const limit = parseIntSafe(req.query.limit, 24);
     const offset = parseIntSafe(req.query.offset, 0);

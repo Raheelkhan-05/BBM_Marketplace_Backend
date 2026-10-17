@@ -429,7 +429,7 @@ export async function updateSellerTheme(req, res) {
 // controllers/seller.controller.js
 
 export async function uploadSellerFile(req, res) {
-  console.log("[uploadSellerFile] body:", req.body, "user:", req.user);
+  // console.log("[uploadSellerFile] body:", req.body, "user:", req.user);
 
   const { folder = "misc", bucket = "seller-assets" } = req.body;
   const file = req.file;
