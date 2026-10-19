@@ -215,20 +215,46 @@ export const inviteExpiry = () => new Date(Date.now() + INVITE_TTL_HOURS * 3600_
 export const inviteLink = (token) =>
     `${String(process.env.FRONTEND_URL || "").replace(/\/$/, "")}/join-team?token=${token}`;
 
+
+// Frees a contact held by an UNFINISHED sign-up (e.g. the stub created when a removed member tried to log in).
+// Never touches a real account: onboarded, has a business/seller profile, or is in a team.
+export async function releaseStubContact(channel, value, keepId = null) {
+    const col = channel === "phone" ? "phone" : "email";
+    const { data: rows, error } = await supabaseAdmin.from("profiles").select("id, onboarding_step")
+        .eq(col, value).eq(`${col}_verified`, true).eq("role", "user").is("deleted_at", null);
+    if (error) throw error;
+
+    for (const p of rows || []) {
+        if (keepId && p.id === keepId) continue;
+        if (p.onboarding_step === "done" || p.onboarding_step === "team_member") continue;
+        const [{ data: m }, { data: b }, { data: s }] = await Promise.all([
+            supabaseAdmin.from("team_members").select("id").eq("user_id", p.id).maybeSingle(),
+            supabaseAdmin.from("business_profiles").select("id").eq("user_id", p.id).maybeSingle(),
+            supabaseAdmin.from("seller_profiles").select("id").eq("user_id", p.id).maybeSingle(),
+        ]);
+        if (m || b || s) continue;
+        const { error: upErr } = await supabaseAdmin.from("profiles")
+            .update({ [col]: null, [`${col}_verified`]: false }).eq("id", p.id);
+        if (upErr) throw upErr;
+    }
+}
+
+
 // Returns true only if the message was actually handed to a provider.
-export async function deliverInvite({ channel, value, link, companyName, inviterName }) {
+export async function deliverInvite({ channel, value, link, companyName, inviterName, role = "member" }) {
+    const as = role === "salesperson" ? " as a salesperson" : "";
     try {
         if (channel === "phone") {
             await sendOrderUpdateWhatsApp({
                 to: value, name: "there",
-                headline: `${inviterName || "Your colleague"} invited you to join ${companyName}'s team on BBM.`,
+                headline: `${inviterName || "Your colleague"} invited you to join ${companyName}'s team on BBM${as}.`,
                 detail: `Open this link to join (valid for ${INVITE_TTL_HOURS} hours): ${link}`,
                 footer: "Sign up with this same mobile number. If you weren't expecting this, ignore this message.",
             });
             return true;
         }
         if (typeof mail.sendTeamInviteEmail === "function") {
-            await mail.sendTeamInviteEmail({ to: value, companyName, inviterName, link, hours: INVITE_TTL_HOURS });
+            await mail.sendTeamInviteEmail({ to: value, companyName, inviterName, link, hours: INVITE_TTL_HOURS, role });
             return true;
         }
         console.warn("[team] mail.service has no sendTeamInviteEmail — invite not emailed");
@@ -369,7 +395,7 @@ const RULES = [
     [/^POST .*\/chat.*\/messages$/i, "chat", "Sent a chat message"],
 ];
 
-const SKIP = /\/(read|delivered|typing|upload|seen)$|^\/api\/(auth|team)(\/|$)|^\/api\/chat\/conversations\/direct$/;
+const SKIP = /\/(read|delivered|typing|upload|seen)$|^\/api\/(auth|team|sales)(\/|$)|^\/api\/chat\/conversations\/direct$|^\/api\/seller\/customers\/:id\/assign$/;
 
 export function describeRequest(req) {
     const rp = req.route?.path;

@@ -47,6 +47,11 @@ export async function getMe(req, res) {
     return res.status(401).json({ success: false, message: "Session out of date — please log in again." });
   }
 
+  let actor = null;
+  if (ctx.isMember) {
+    const { data } = await supabaseAdmin.from("profiles").select("name, phone, email").eq("id", ctx.actorId).maybeSingle();
+    actor = data || null;
+  }
   // A team-member profile that is no longer in any team has lost its access.
   if (!ctx.teamId && profile.onboarding_step === "team_member") {
     return res.status(401).json({ success: false, code: "TEAM_ACCESS_REMOVED", message: "You no longer have access to this team. Please contact your team admin." });
@@ -70,7 +75,8 @@ export async function getMe(req, res) {
     notificationChannel: channelTokenFor(companyId),
     shop_slug: seller?.shop_slug ?? null,
     seller_status: seller?.status ?? null,
-    team: ctx.teamId ? { id: ctx.teamId, role: ctx.role, isAdmin: ctx.isAdmin, isOwner: !ctx.isMember, actorId: ctx.actorId } : null,
+    // team: ctx.teamId ? { id: ctx.teamId, role: ctx.role, isAdmin: ctx.isAdmin, isOwner: !ctx.isMember, actorId: ctx.actorId } : null,
+    team: ctx.teamId ? { id: ctx.teamId, role: ctx.role, isAdmin: ctx.isAdmin, isOwner: !ctx.isMember, actorId: ctx.actorId, actor } : null,
     sellerLocation: seller
       ? {
         city: seller.city ?? null,

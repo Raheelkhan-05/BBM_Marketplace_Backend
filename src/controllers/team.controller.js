@@ -7,9 +7,10 @@ import {
     TEAM_MAX_MEMBERS, INVITE_TTL_HOURS,
     normalizeContact, maskContact, getTeamContext, invalidateTeamContext, ensureTeam,
     isCompanyOnboarded, companyNameOf, contactConflict, newInviteToken, hashToken, enrichStoredRows,
-    inviteExpiry, inviteLink, deliverInvite, logActivity,
+    inviteExpiry, inviteLink, deliverInvite, logActivity, releaseStubContact,
 } from "../services/team.service.js";
 import { getIO } from "../socket/io.js";
+import { unassignCustomersOf } from "../services/salesSync.service.js";
 
 const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET;
 const actorIdOf = (req) => req.actor?.id || req.user.id;
@@ -38,6 +39,7 @@ const shapeInvite = (i) => ({
     id: i.id, channel: i.channel, value: i.value, maskedValue: maskContact(i.channel, i.value),
     status: i.expires_at < new Date().toISOString() && i.status === "pending" ? "expired" : i.status,
     expiresAt: i.expires_at, createdAt: i.created_at,
+    role: i.role || "member"
 });
 
 /* ------------------------------- GET /api/team ------------------------------- */
@@ -78,7 +80,7 @@ export async function getTeam(req, res) {
         let invites = [];
         if (isAdmin && ctx.teamId) {
             const { data } = await supabaseAdmin
-                .from("team_invites").select("id, channel, value, status, expires_at, created_at")
+                .from("team_invites").select("id, channel, value, status, expires_at, created_at, role")
                 .eq("team_id", ctx.teamId).eq("status", "pending").order("created_at", { ascending: false });
             invites = (data || []).map(shapeInvite);
         }
@@ -99,6 +101,9 @@ export async function createInvite(req, res) {
     try {
         const ctx = await requireAdmin(req, res); if (!ctx) return;
         const parsed = normalizeContact(req.body?.value ?? req.body?.identifier);
+        const role = req.body?.role === undefined ? "member" : req.body.role;
+        if (role !== "member" && role !== "salesperson") return res.status(400).json({ success: false, message: "Invalid role." });
+
         if (!parsed) return res.status(400).json({ success: false, message: "Enter a valid 10-digit mobile number or email address." });
 
         if (!(await isCompanyOnboarded(ctx.companyId))) {
@@ -131,9 +136,9 @@ export async function createInvite(req, res) {
 
         const token = newInviteToken();
         const { data: invite, error } = await supabaseAdmin.from("team_invites").insert({
-            team_id: teamId, channel: parsed.channel, value: parsed.value,
+            team_id: teamId, channel: parsed.channel, value: parsed.value, role: role,
             token_hash: hashToken(token), invited_by: actorIdOf(req), expires_at: inviteExpiry(),
-        }).select("id, channel, value, status, expires_at, created_at").single();
+        }).select("id, channel, value, status, expires_at, created_at, role").single();
         if (error) {
             if (error.code === "23505") {
                 return res.status(409).json({ success: false, code: "INVITE_PENDING", message: "An invite is already pending for this contact. Resend or revoke it from the list." });
@@ -143,11 +148,11 @@ export async function createInvite(req, res) {
 
         const link = inviteLink(token);
         const companyName = await companyNameOf(ctx.companyId);
-        const delivered = await deliverInvite({ ...parsed, link, companyName, inviterName: me?.name });
+        const delivered = await deliverInvite({ ...parsed, link, companyName, inviterName: me?.name, role });
 
         await logActivity({
             teamId, actorId: actorIdOf(req), actorRole: "admin", category: "team", action: "team.invite_sent",
-            label: `Invited ${maskContact(parsed.channel, parsed.value)} to the team`,
+            label: `Invited ${maskContact(parsed.channel, parsed.value)} to the team${role === "salesperson" ? " as a salesperson" : ""}`,
             entityType: "invite", entityId: invite.id, meta: { channel: parsed.channel, delivered }, ip: ipOf(req),
         });
 
@@ -173,9 +178,9 @@ export async function resendInvite(req, res) {
 
         const token = newInviteToken();
         const { data: updated, error } = await supabaseAdmin.from("team_invites")
-            .update({ token_hash: hashToken(token), status: "pending", expires_at: inviteExpiry() })
+            .update({ token_hash: hashToken(token), status: "pending", expires_at: inviteExpiry(), role })
             .eq("id", inv.id).in("status", ["pending", "expired"])
-            .select("id, channel, value, status, expires_at, created_at").maybeSingle();
+            .select("id, channel, value, status, expires_at, created_at, role").maybeSingle();
         if (error) throw error;
         if (!updated) return res.status(400).json({ success: false, message: "This invite can't be resent." });
 
@@ -184,7 +189,7 @@ export async function resendInvite(req, res) {
             companyNameOf(ctx.companyId),
             supabaseAdmin.from("profiles").select("name").eq("id", ctx.companyId).maybeSingle(),
         ]);
-        const delivered = await deliverInvite({ channel: inv.channel, value: inv.value, link, companyName, inviterName: me?.name });
+        const delivered = await deliverInvite({ channel: inv.channel, value: inv.value, link, companyName, inviterName: me?.name, role: inv.role });
 
         await logActivity({
             teamId: ctx.teamId, actorId: actorIdOf(req), actorRole: "admin", category: "team", action: "team.invite_resent",
@@ -251,6 +256,8 @@ export async function removeMember(req, res) {
             entityType: "member", entityId: targetId,
             meta: { name: prof?.name || null, phone: prof?.phone || null, email: prof?.email || null }, ip: ipOf(req),
         });
+        await unassignCustomersOf(targetId, ctx.companyId);
+
         res.json({ success: true });
     } catch (e) { serverError(res, e, "removeMember"); }
 }
@@ -263,7 +270,7 @@ export async function setMemberRole(req, res) {
             return res.status(403).json({ success: false, code: "OWNER_ONLY", message: "Only the company owner can change roles." });
         }
         const role = req.body?.role;
-        if (role !== "admin" && role !== "member") {
+        if (role !== "admin" && role !== "member" && role !== "salesperson") {
             return res.status(400).json({ success: false, message: "Invalid role." });
         }
         const targetId = req.params.userId;
@@ -286,9 +293,10 @@ export async function setMemberRole(req, res) {
         await logActivity({
             teamId: ctx.teamId, actorId: actorIdOf(req), actorRole: "admin", category: "team",
             action: role === "admin" ? "team.member_promoted" : "team.member_demoted",
-            label: role === "admin" ? `Made ${who} a team admin` : `Changed ${who} to a regular member`,
+            label: role === "admin" ? `Made ${who} a team admin` : role === "salesperson" ? `Made ${who} a salesperson` : `Changed ${who} to a regular member`,
             entityType: "member", entityId: targetId, ip: ipOf(req),
         });
+        if (row.role === "salesperson" && role !== "salesperson") await unassignCustomersOf(targetId, ctx.companyId);
         res.json({ success: true, role });
     } catch (e) { serverError(res, e, "setMemberRole"); }
 }
@@ -349,23 +357,21 @@ export async function getInviteInfo(req, res) {
         res.json({
             success: true, companyName: await companyNameOf(team.owner_id),
             channel: inv.channel, maskedValue: maskContact(inv.channel, inv.value), expiresAt: inv.expires_at,
+            role: inv.role || "member",
         });
     } catch (e) { serverError(res, e, "getInviteInfo"); }
 }
 
-// Validates the OPTIONAL second contact a joiner adds (the channel opposite to the invited one).
 // Validates the second contact a joiner must add (the channel opposite to the invited one).
+// Same rule as the invited contact: only a real account blocks it, an unfinished sign-up doesn't.
 async function resolveExtraContact(inv, raw) {
     const want = inv.channel === "phone" ? "email" : "phone";
     const extra = normalizeContact(raw);
     if (!extra || extra.channel !== want) {
         return { error: { status: 400, message: `Enter a valid ${want === "email" ? "email address" : "10-digit mobile number"}.` } };
     }
-    const col = want === "phone" ? "phone" : "email";
-    const { data: rows, error } = await supabaseAdmin.from("profiles").select("id")
-        .eq(col, extra.value).eq(`${col}_verified`, true).eq("role", "user").is("deleted_at", null).limit(1);
-    if (error) throw error;
-    if (rows?.length) {
+    const conflict = await contactConflict(extra, inv.team_id);
+    if (conflict) {
         return { error: { status: 409, message: `This ${want === "email" ? "email" : "mobile number"} is already registered with another account.` } };
     }
     return { extra };
@@ -446,6 +452,9 @@ export async function acceptInvite(req, res) {
             .eq(col, inv.value).eq(vcol, true).eq("role", "user").is("deleted_at", null).maybeSingle();
 
         let { data: prof } = await findVerified();
+        // A leftover unfinished profile may hold the second contact (e.g. after being removed from another team).
+        // Free it first so this profile can take it. Real accounts are never touched.
+        await releaseStubContact(extra.channel, extra.value, prof?.id);
         if (prof) {
             const { error } = await supabaseAdmin.from("profiles").update(profilePatch).eq("id", prof.id);
             if (error) throw error;
@@ -475,7 +484,9 @@ export async function acceptInvite(req, res) {
         const companyName = await companyNameOf(joined.r_owner_id);
         await logActivity({
             teamId: joined.r_team_id, actorId: prof.id, actorRole: "member", category: "team", action: "team.member_joined",
-            label: `${name} joined the team`, entityType: "member", entityId: prof.id,
+            // label: `${name} joined the team`, entityType: "member", entityId: prof.id,
+            label: `${name} joined the team${inv.role === "salesperson" ? " as a salesperson" : ""}`,
+
             meta: {
                 channel: inv.channel, contact: maskContact(inv.channel, inv.value),
                 extraContact: maskContact(extra.channel, extra.value),
@@ -483,11 +494,11 @@ export async function acceptInvite(req, res) {
         });
         notifyUser(joined.r_owner_id, {
             type: "team_member_joined", title: `${name} joined your team`,
-            body: `${name} accepted your invite and can now work on behalf of ${companyName}.`, link: "/home",
+            body: `${name} accepted your invite and can now work on behalf of ${companyName}.`, link: inv.role === "salesperson" ? "/home" : "/home",
         }).catch(() => { });
 
         const token = jwt.sign({ sub: prof.id }, AUTH_JWT_SECRET, { expiresIn: "168h" });
-        res.json({ success: true, token, isNewUser: false, companyName });
+        res.json({ success: true, token, isNewUser: false, companyName, role: inv.role || "member" });
     } catch (e) {
         if (createdProfileId) await supabaseAdmin.from("profiles").delete().eq("id", createdProfileId).then(() => { }, () => { });
         if (e?.code === "23505") {

@@ -113,32 +113,40 @@ export async function sendBusinessVerifiedEmail(toEmail, businessName) {
   return throwIfResendError(result);
 }
 
-// Team mode: invitation to join a company's team. Called by services/team.service.js
-// (deliverInvite), which treats a thrown error as "not delivered" and shows the admin a copy-link fallback.
-export async function sendTeamInviteEmail({ to, companyName, inviterName, link, hours }) {
+// Team mode: invitation to join a company's team. Called by services/team.service.js (deliverInvite).
+export async function sendTeamInviteEmail({ to, companyName, inviterName, link, hours, role = "member" }) {
   if (!to) return;
+  const isSales = role === "salesperson";
   const company = esc(companyName || "a company");
   const inviter = esc(inviterName || "A colleague");
+  const roleText = isSales ? "a salesperson" : "a team member";
+  const about = isSales
+    ? `You'll get your own sales workspace for <strong>${company}</strong>, where you see and add only your own customers. Marketplace, orders and chats are not part of this role.`
+    : `You'll work inside the company's account with the same access as the company, and the team admin can see the actions team members take.`;
+
   const html = shell(
-    `Join ${company}'s team on BBM`,
+    isSales ? `Join ${company} as a salesperson on BBM` : `Join ${company}'s team on BBM`,
     `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
-       ${inviter} invited you to join <strong>${company}</strong> as a team member.
-       You'll work inside the company's account with the same access as the company,
-       and the team admin can see the actions team members take.
+       ${inviter} invited you to join <strong>${company}</strong> as ${roleText}.
+       ${about}
      </p>
      <a href="${esc(link)}" style="display:inline-block;margin-top:6px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
-       Join the team
+       ${isSales ? "Join as salesperson" : "Join the team"}
      </a>
      <p style="margin:16px 0 0;font-size:12.5px;line-height:1.6;color:#64748b;">
        This link expires in ${esc(hours)} hours. Sign up with <strong>this email address</strong>; a different one won't work.
      </p>
+     <p style="margin:10px 0 0;font-size:12.5px;line-height:1.6;color:#64748b;">
+       Used BBM before, or were part of another company's team? That's fine. Use the same email address and you'll be set up under this company.
+     </p>
      <p style="margin:10px 0 0;font-size:11.5px;line-height:1.5;color:#94a3b8;word-break:break-all;">${esc(link)}</p>`,
     "You're receiving this because someone invited this email address to join their team on BBM. If you weren't expecting it, you can ignore this email and nothing will change."
   );
+  const clean = (v, d) => String(v || d).replace(/[\r\n]+/g, " ");
   const result = await resend.emails.send({
     from: FROM,
     to,
-    subject: `${String(inviterName || "A colleague").replace(/[\r\n]+/g, " ")} invited you to join ${String(companyName || "a company").replace(/[\r\n]+/g, " ")} on BBM`,
+    subject: `${clean(inviterName, "A colleague")} invited you to join ${clean(companyName, "a company")} on BBM${isSales ? " as a salesperson" : ""}`,
     html,
   });
   return throwIfResendError(result);

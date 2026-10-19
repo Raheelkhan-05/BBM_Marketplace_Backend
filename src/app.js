@@ -39,6 +39,7 @@ import adminPaymentsRoutes from "./routes/adminPayments.routes.js";
 import sellerCustomersRoutes from "./routes/sellerCustomers.routes.js";
 import adminFinanceRoutes from "./routes/adminFinance.routes.js";
 import teamRoutes from "./routes/team.routes.js";
+import salesRoutes from "./routes/sales.routes.js";
 
 export function createApp() {
   const app = express();
@@ -103,6 +104,7 @@ export function createApp() {
 
   app.use("/api/auth", authRoutes);
   app.use("/api/seo", seoRoutes);
+  app.use("/api/sales", salesRoutes);
   app.use("/api/seller/customers", sellerCustomersRoutes);
   app.use("/api/seller/catalog", sellerCatalogListingsRouter);
   app.use("/api/seller/bulk", bulkListingsRoutes);
