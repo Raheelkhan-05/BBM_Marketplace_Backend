@@ -1,126 +1,116 @@
+// src/routes/seo.routes.js  (REPLACES the existing file; already mounted at /api/seo in app.js)
+// Keeps your existing GET /api/seo/sitemap (used by the Vercel /sitemap.xml rewrite).
 import { Router } from "express";
+import rateLimit from "express-rate-limit";
 import { supabaseAdmin } from "../config/supabase.js";
+import { requireSeoAdmin } from "../middleware/seoAuth.middleware.js";
+import { seoRequestLogger } from "../middleware/seoRequestLogger.middleware.js";
+import {
+    SITE, normalizeSlug, getSeo, listSeo, upsertSeo, getSsrMeta,
+    getSitemap, requestIndexing, logChange, FIELDS,
+} from "../services/seo.service.js";
 
 const router = Router();
+router.use(seoRequestLogger);
 
-const SITE = "https://www.bbm.business";
-const PAGE = 60;
-const MAX_PAGES = 400;          // safety stop
-const MAX_URLS = 50000;         // Google's limit per sitemap file
-const TTL_MS = 60 * 60 * 1000;  // 1 hour
-
-// Product pages are NOT in the sitemap until /brand-item/:slug/sellers is a live, real page.
-// Set SITEMAP_INCLUDE_PRODUCTS=1 on the server only after that route works.
-const INCLUDE_PRODUCTS = process.env.SITEMAP_INCLUDE_PRODUCTS === "1";
-
-const esc = (s) =>
-    String(s)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&apos;");
-
-// Walks an RPC page by page until hasMore is false.
-async function collect(rpcName, args, pick) {
-    const out = [];
-    for (let i = 0; i < MAX_PAGES; i++) {
-        const { data, error } = await supabaseAdmin.rpc(rpcName, { ...args, p_limit: PAGE, p_offset: i * PAGE });
-        if (error) throw new Error(`${rpcName}: ${error.message}`);
-        const rows = pick(data) || [];
-        out.push(...rows);
-        if (!data?.hasMore || !rows.length) break;
-    }
-    return out;
-}
-
-async function buildPaths() {
-    const [brands, sellers, products] = await Promise.all([
-        collect("catalog_brands_page", { p_q: "" }, (d) => d?.brands),
-        collect(
-            "catalog_sellers_page",
-            { p_q: "", p_seller_id: null, p_buyer_id: null }, // guest view
-            (d) => d?.sellers
-        ),
-        INCLUDE_PRODUCTS
-            ? collect(
-                "catalog_browse_feed",
-                {
-                    p_category_id: null, p_q: "", p_sort: "relevance",
-                    p_seller_id: null, p_buyer_id: null, p_followed_only: false,
-                    p_shop_slug: null, p_dest_pincode: null, p_dest_state: null,
-                },
-                (d) => d?.items
-            )
-            : Promise.resolve([]),
-    ]);
-
-    const paths = ["/", "/brands", "/sellers", "/grow/details", "/save"];
-
-    const seenBrands = new Set();
-    for (const b of brands) {
-        const name = String(b.brand_name || "").trim();
-        if (!name || name.includes("/")) continue;           // a "/" would break the /brands/:brandName route
-        if (Number(b.item_count) <= 0) continue;
-        const key = name.toLowerCase();
-        if (seenBrands.has(key)) continue;
-        seenBrands.add(key);
-        paths.push(`/brands/${encodeURIComponent(name)}`);
-    }
-
-    const seenShops = new Set();
-    for (const s of sellers) {
-        const slug = String(s.shop_slug || "").trim();
-        if (!slug || seenShops.has(slug)) continue;
-        seenShops.add(slug);
-        paths.push(`/sellers/${encodeURIComponent(slug)}`);
-    }
-
-    const seenItems = new Set();
-    for (const it of products) {
-        if (it.lowest_price == null || seenItems.has(it.id)) continue; // skip items nobody can buy
-        seenItems.add(it.id);
-        paths.push(`/brand-item/${encodeURIComponent(it.slug || it.id)}/sellers`);
-    }
-
-    return paths.slice(0, MAX_URLS);
-}
-
-let cache = { xml: null, t: 0 };
-let inflight = null;
-
-async function getSitemapXml() {
-    if (cache.xml && Date.now() - cache.t < TTL_MS) return cache.xml;
-    if (inflight) return inflight; // many requests at once share one build
-
-    inflight = (async () => {
-        try {
-            const paths = await buildPaths();
-            const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-${paths.map((p) => `  <url><loc>${esc(SITE + p)}</loc></url>`).join("\n")}
-</urlset>`;
-            cache = { xml, t: Date.now() };
-            return xml;
-        } catch (e) {
-            console.error("[seo] sitemap build failed:", e.message);
-            if (cache.xml) return cache.xml; // serve the stale copy rather than an error
-            throw e;
-        } finally {
-            inflight = null;
-        }
-    })();
-    return inflight;
-}
-
-router.get("/sitemap", async (req, res) => {
-    try {
-        const xml = await getSitemapXml();
-        res.set("Cache-Control", "public, max-age=3600");
-        res.type("application/xml").send(xml);
-    } catch {
-        res.status(500).type("text/plain").send("Sitemap unavailable");
-    }
+const writeLimiter = rateLimit({
+    windowMs: 60_000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: "Too many requests. Max 60/min." },
 });
+
+const wrap = (fn) => (req, res) =>
+    fn(req, res).catch((e) => {
+        console.error("[seo]", e);
+        res.status(e.status || 500).json({
+            success: false,
+            message: e.status ? e.message : "Something went wrong.",
+            request_id: req.seoRequestId,
+        });
+    });
+
+/* ───── public reads ───── */
+router.get("/", wrap(async (req, res) => {
+    if (!req.query.slug) return res.status(400).json({ success: false, message: "slug is required" });
+    res.json(await getSeo(normalizeSlug(req.query.slug)));
+}));
+
+router.get("/all", wrap(async (req, res) => {
+    res.json(await listSeo({ limit: req.query.limit, offset: req.query.offset }));
+}));
+
+router.get("/ssr-meta", wrap(async (req, res) => {
+    if (!req.query.path) return res.status(400).json({ success: false, message: "path is required" });
+    res.set("Cache-Control", "public, s-maxage=300, stale-while-revalidate=600");
+    res.json(await getSsrMeta(normalizeSlug(req.query.path)));
+}));
+
+// /sitemap = your existing path (Vercel rewrite target); /sitemap.xml = same thing
+const sendSitemap = wrap(async (req, res) => {
+    const { xml } = await getSitemap();
+    res.set("Cache-Control", "public, max-age=3600");
+    res.type("application/xml").send(xml);
+});
+router.get("/sitemap", sendSitemap);
+router.get("/sitemap.xml", sendSitemap);
+
+/* ───── admin writes ───── */
+router.put("/", requireSeoAdmin, writeLimiter, wrap(async (req, res) => {
+    const rawSlug = req.body?.slug || req.query.slug;
+    if (!rawSlug) return res.status(400).json({ success: false, message: "slug is required" });
+    const slug = normalizeSlug(rawSlug);
+
+    const input = Object.fromEntries(FIELDS.filter((f) => req.body?.[f] !== undefined).map((f) => [f, req.body[f]]));
+    const out = await upsertSeo(slug, input, { actor: req.seoActor, requestId: req.seoRequestId });
+    if (out.errors) return res.status(422).json({ success: false, errors: out.errors, request_id: req.seoRequestId });
+    res.json({ success: true, changed: out.changed, created: !!out.created, request_id: req.seoRequestId, data: out.data });
+}));
+
+router.post("/sitemap/regenerate", requireSeoAdmin, writeLimiter, wrap(async (req, res) => {
+    const { stats } = await getSitemap({ force: true });
+    await logChange({
+        requestId: req.seoRequestId, entityType: "sitemap", entityKey: "sitemap.xml",
+        action: "regenerate", actor: req.seoActor, result: stats,
+    });
+    res.json({ success: true, ...stats, sitemap_url: `${SITE}/sitemap.xml`, request_id: req.seoRequestId });
+}));
+
+router.post("/request-indexing", requireSeoAdmin, writeLimiter, wrap(async (req, res) => {
+    const urls = Array.isArray(req.body?.urls) ? [...new Set(req.body.urls.map(String))] : [];
+    if (!urls.length || urls.length > 100) {
+        return res.status(400).json({ success: false, message: "urls must have 1-100 items" });
+    }
+    const results = await requestIndexing(urls, { actor: req.seoActor, requestId: req.seoRequestId });
+    res.json({ submitted: results.filter((r) => r.status === "submitted").length, results, request_id: req.seoRequestId });
+}));
+
+/* ───── admin: read the logs ───── */
+// GET /api/seo/logs/requests?limit=50&method=PUT&status=422&source=automation&actor=run-1&since=2026-10-20
+router.get("/logs/requests", requireSeoAdmin, wrap(async (req, res) => {
+    let q = supabaseAdmin.from("seo_request_log").select("*").order("ts", { ascending: false })
+        .limit(Math.min(Number(req.query.limit) || 50, 500));
+    if (req.query.method) q = q.eq("method", String(req.query.method).toUpperCase());
+    if (req.query.status) q = q.eq("status", Number(req.query.status));
+    if (req.query.source) q = q.eq("source", req.query.source);
+    if (req.query.actor) q = q.eq("actor", req.query.actor);
+    if (req.query.since) q = q.gte("ts", req.query.since);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ items: data });
+}));
+
+// GET /api/seo/logs/changes?slug=/brands/zerust&entity_type=page&request_id=<uuid>
+router.get("/logs/changes", requireSeoAdmin, wrap(async (req, res) => {
+    let q = supabaseAdmin.from("seo_change_log").select("*").order("ts", { ascending: false })
+        .limit(Math.min(Number(req.query.limit) || 50, 500));
+    if (req.query.slug) q = q.eq("entity_key", normalizeSlug(req.query.slug));
+    if (req.query.entity_type) q = q.eq("entity_type", req.query.entity_type);
+    if (req.query.request_id) q = q.eq("request_id", req.query.request_id);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ items: data });
+}));
 
 export default router;
