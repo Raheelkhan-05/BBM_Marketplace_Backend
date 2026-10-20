@@ -143,6 +143,7 @@ export async function addCustomer(req, res) {
         if (!sellerId) return res.status(409).json({ success: false, message: "Your company isn't set up to sell yet." });
         const c = parseOptional(req.body);
         if (c.error) return res.status(400).json({ success: false, message: c.error });
+        if (!c.phone && !c.email) return res.status(400).json({ success: false, message: "Enter a mobile number or an email address." });
 
         const out = await addOne(sellerId, companyId, req.body?.gstin, "gst", {
             assigned_to: actorId, assigned_by: actorId, assigned_kind: "self", assigned_at: new Date().toISOString(),

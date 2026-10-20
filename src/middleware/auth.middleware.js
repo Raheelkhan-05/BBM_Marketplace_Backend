@@ -6,7 +6,8 @@ import { getTeamContext } from "../services/team.service.js";
 const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET;
 
 // A salesperson may only reach these. Everything else is refused, whatever the UI does.
-const SALES_ALLOWED = [/^\/api\/auth\/me$/, /^\/api\/sales(\/|$)/];
+// const SALES_ALLOWED = [/^\/api\/auth\/me$/, /^\/api\/sales(\/|$)/];
+const SALES_ALLOWED = [/^\/api\/auth\/me$/, /^\/api\/sales(\/|$)/, /^\/api\/geo(\/|$)/];
 const pathOf = (req) => String(req.originalUrl || req.url || "").split("?")[0].replace(/\/+$/, "");
 const salesAllowed = (req) => SALES_ALLOWED.some((re) => re.test(pathOf(req)));
 
