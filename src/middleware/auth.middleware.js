@@ -6,10 +6,16 @@ import { getTeamContext } from "../services/team.service.js";
 const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET;
 
 // A salesperson may only reach these. Everything else is refused, whatever the UI does.
-// const SALES_ALLOWED = [/^\/api\/auth\/me$/, /^\/api\/sales(\/|$)/];
 const SALES_ALLOWED = [/^\/api\/auth\/me$/, /^\/api\/sales(\/|$)/, /^\/api\/geo(\/|$)/];
+// Read-only (GET) access to the team roster, same view a regular member gets.
+const SALES_READONLY = [/^\/api\/team$/];
+
 const pathOf = (req) => String(req.originalUrl || req.url || "").split("?")[0].replace(/\/+$/, "");
-const salesAllowed = (req) => SALES_ALLOWED.some((re) => re.test(pathOf(req)));
+const salesAllowed = (req) => {
+  const p = pathOf(req);
+  if (SALES_ALLOWED.some((re) => re.test(p))) return true;
+  return req.method === "GET" && SALES_READONLY.some((re) => re.test(p));
+};
 
 async function isSalesperson(actorId) {
   const ctx = await getTeamContext(actorId); // cached (15s), already warmed by applyTeamContext

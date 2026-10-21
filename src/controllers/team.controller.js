@@ -176,6 +176,7 @@ export async function resendInvite(req, res) {
         const conflict = await contactConflict({ channel: inv.channel, value: inv.value }, ctx.teamId);
         if (conflict) return res.status(409).json({ success: false, code: conflict, message: CONFLICT_MSG(inv.channel)[conflict] });
 
+        const role = inv.role || "member";
         const token = newInviteToken();
         const { data: updated, error } = await supabaseAdmin.from("team_invites")
             .update({ token_hash: hashToken(token), status: "pending", expires_at: inviteExpiry(), role })
@@ -189,7 +190,7 @@ export async function resendInvite(req, res) {
             companyNameOf(ctx.companyId),
             supabaseAdmin.from("profiles").select("name").eq("id", ctx.companyId).maybeSingle(),
         ]);
-        const delivered = await deliverInvite({ channel: inv.channel, value: inv.value, link, companyName, inviterName: me?.name, role: inv.role });
+        const delivered = await deliverInvite({ channel: inv.channel, value: inv.value, link, companyName, inviterName: me?.name, role });
 
         await logActivity({
             teamId: ctx.teamId, actorId: actorIdOf(req), actorRole: "admin", category: "team", action: "team.invite_resent",
