@@ -1,6 +1,6 @@
 // routes/rfq.routes.js
 import { Router } from "express";
-import { requireAuth } from "../middleware/auth.middleware.js";
+import { requireAuth, optionalAuth } from "../middleware/auth.middleware.js";
 import { requireApprovedSeller } from "../middleware/requireApprovedSeller.js";
 import { authWriteLimiter } from "../middleware/rateLimiter.js";
 import {
@@ -9,7 +9,6 @@ import {
 import { getQuoteOptions, submitQuote, withdrawQuote, listEnquiryQuotes } from "../controllers/rfqQuote.controller.js";
 
 const router = Router();
-router.use(requireAuth);
 
 // Sets req.sellerId for approved sellers but never blocks anyone (buyers use these same GET routes).
 const softSeller = (req, res, next) => {
@@ -19,8 +18,16 @@ const softSeller = (req, res, next) => {
     try { Promise.resolve(requireApprovedSeller(req, probe, go)).catch(go); } catch { go(); }
 };
 
+// Guests (no token, expired token, salespeople) have req.user = null, so there is nobody to check as a seller.
+const softSellerIfUser = (req, res, next) => (req.user ? softSeller(req, res, next) : next());
+
+// PUBLIC: a single live enquiry can be opened by anyone (shared links). Must stay ABOVE requireAuth.
+// Quoting, listing, posting etc. below still need a login.
+router.get("/:id", optionalAuth, softSellerIfUser, getEnquiry);
+
+router.use(requireAuth);
+
 router.get("/", softSeller, listEnquiries);
-router.get("/:id", softSeller, getEnquiry);
 router.get("/:id/quotes", softSeller, listEnquiryQuotes);
 router.post("/", authWriteLimiter, createEnquiry);
 router.post("/bulk", authWriteLimiter, bulkCreateEnquiries); // before /:id

@@ -87,24 +87,32 @@ export async function listEnquiries(req, res) {
     }
 }
 
-// GET /api/rfq/:id — live enquiries, or your own in any status
+// GET /api/rfq/:id — PUBLIC for live (and closed) enquiries; the owner can also open their own in any status.
+// Guests (req.user is null) get the requirement only: no buyer id, no quotes, no "my quote".
 export async function getEnquiry(req, res) {
     try {
         const { id } = req.params;
         if (!isUuid(id)) return res.status(404).json({ success: false, message: "Enquiry not found." });
         const { data, error } = await supabase.from("rfq_enquiries").select("*").eq("id", id).maybeSingle();
         if (error) throw error;
-        const mine = data?.buyer_id === req.user.id;
-        if (!data || (!mine && data.status !== "approved")) {
+
+        const userId = req.user?.id || null;
+        const mine = !!userId && data?.buyer_id === userId;
+        const publicStatus = data && ["approved", "closed"].includes(data.status);
+        if (!data || (!mine && !publicStatus)) {
             return res.status(404).json({ success: false, message: "Enquiry not found." });
         }
+
         res.set("Cache-Control", "no-store");
         let enquiry = {
             ...toDto(data, { owner: mine }),
             isMine: mine,
-            ...(mine ? {} : { buyerId: data.buyer_id }),
+            ...(mine || !userId ? {} : { buyerId: data.buyer_id }), // guests never get the buyer's id
         };
-        try { [enquiry] = await attachQuotes([enquiry], [data], req.user.id, sellerIdsOf(req)); } catch (e) { console.error("[rfq] attachQuotes failed:", e.message); }
+        if (userId) {
+            try { [enquiry] = await attachQuotes([enquiry], [data], userId, sellerIdsOf(req)); }
+            catch (e) { console.error("[rfq] attachQuotes failed:", e.message); }
+        }
         res.json({ success: true, enquiry });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
