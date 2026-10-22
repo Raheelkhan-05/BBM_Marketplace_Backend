@@ -342,23 +342,108 @@ export async function getBrandItemSellerOffer(req, res) {
     return res.json({ success: true, item: data.item, offer: data.offer });
 }
 
+// ── Shared product link (/p/:submissionId) ───────────────────────────
+// Logged in  -> full payload (unchanged), plus the shop name.
+// Logged out -> a PRICE-FREE preview, and only for live, PUBLIC listings.
+//               Restricted listings answer LOGIN_REQUIRED.
+//
+// The guest payload is built from an ALLOW-LIST, never by deleting price fields, so a price
+// column added to the database function later can never leak to a logged-out visitor.
+const GUEST_PRODUCT_KEYS = [
+    "id", "brandItemId", "brand_item_id", "slug", "name",
+    "brand_name", "brandName", "brand_image", "brandImage",
+    "image", "images", "model_no", "modelNo",
+    "category_name", "categoryName", "subcategory_name", "subcategoryName",
+];
+const GUEST_SELLER_KEYS = [
+    "submission_id", "shop_name", "unit", "moq", "stock_type",
+    "dispatch_time_days", "production_lead_time_days", "delivery_timeline",
+    "return_policy", "warranty", "freight_included",
+    "dispatch_district", "dispatch_state",
+    "pack_size", "units_per_master_pack",
+    "sample_available", "sample_quantity",
+];
+const pickKeys = (obj, keys) =>
+    Object.fromEntries(keys.filter((k) => obj && obj[k] !== undefined).map((k) => [k, obj[k]]));
+
+// The name buyers should see is the SHOP name (seller_profiles.display_name), not the person's name.
+async function shopNameForSeller(sellerId) {
+    if (!sellerId || !UUID_RE.test(String(sellerId))) return null;
+    const { data } = await supabaseAdmin
+        .from("seller_profiles")
+        .select("display_name")
+        .or(`user_id.eq.${sellerId},id.eq.${sellerId}`)
+        .is("deleted_at", null)
+        .limit(1);
+    return data?.[0]?.display_name || null;
+}
+
+// GET /api/catalog/shared/:submissionId   (optional auth)
 export async function getSharedProductLink(req, res) {
     const { submissionId } = req.params;
-    // req.user is guaranteed here — the route below now requires auth —
-    // so p_buyer_id is always a real id, never null.
+    if (!UUID_RE.test(String(submissionId))) {
+        return res.status(404).json({ success: false, message: "This product link is no longer available." });
+    }
+    const buyerId = req.user?.id || null;
+    const isGuest = !buyerId;
+
+    // Guests: check the listing itself first. Only a live, public listing may be previewed.
+    let guestSellerId = null;
+    if (isGuest) {
+        const { data: sub, error: subErr } = await supabaseAdmin
+            .from("seller_product_submissions")
+            .select("seller_id, visibility_mode, review_status, is_active, expires_at")
+            .eq("id", submissionId)
+            .maybeSingle();
+        if (subErr) {
+            console.error("[catalog] getSharedProductLink (guest check) failed:", subErr.message);
+            return res.status(500).json({ success: false, message: "Couldn't load this link right now." });
+        }
+        const live = sub
+            && sub.review_status === "approved"
+            && sub.is_active !== false
+            && !(sub.expires_at && new Date(sub.expires_at) <= new Date());
+        if (!live) {
+            return res.status(404).json({ success: false, message: "This product link is no longer available." });
+        }
+        if (sub.visibility_mode !== "public") {
+            return res.status(401).json({ success: false, code: "LOGIN_REQUIRED", message: "Login to view this product." });
+        }
+        guestSellerId = sub.seller_id;
+    }
+
     const { data, error } = await supabaseAdmin.rpc("catalog_shared_product_link", {
         p_submission_id: submissionId,
-        p_buyer_id: req.user.id,
+        p_buyer_id: buyerId,
     });
     if (error) {
         console.error("[catalog] getSharedProductLink failed:", error.message);
         return res.status(500).json({ success: false, message: "Couldn't load this link right now." });
     }
-    if (!data) return res.status(404).json({ success: false, message: "This product link is no longer available." });
-    if (data.restricted) {
-        return res.status(403).json({ success: false, code: "RESTRICTED", message: "This product isn't available for your account. Ask the seller to add you." });
+    if (!data || !data.seller) {
+        return res.status(404).json({ success: false, message: "This product link is no longer available." });
     }
-    return res.json({ success: true, ...data });
+    if (data.restricted) {
+        return isGuest
+            ? res.status(401).json({ success: false, code: "LOGIN_REQUIRED", message: "Login to view this product." })
+            : res.status(403).json({ success: false, code: "RESTRICTED", message: "This product isn't available for your account. Ask the seller to add you." });
+    }
+
+    const shop_name = await shopNameForSeller(data.seller.seller_id || guestSellerId);
+
+    if (isGuest) {
+        res.set("Cache-Control", "public, max-age=30");
+        res.set("Vary", "Authorization");
+        return res.json({
+            success: true,
+            preview: true,
+            product: pickKeys(data.product, GUEST_PRODUCT_KEYS),
+            seller: pickKeys({ ...data.seller, shop_name }, GUEST_SELLER_KEYS),
+        });
+    }
+
+    res.set("Cache-Control", "private, no-store");
+    return res.json({ success: true, ...data, seller: { ...data.seller, shop_name } });
 }
 
 // GET /api/seller-listing/lowest-price/:genericProductBrandId

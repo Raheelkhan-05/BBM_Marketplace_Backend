@@ -43,8 +43,8 @@ router.get("/sellers", optionalAuth, optionalSellerProfile, getSellersPage);
 router.get("/brand-items-feed", optionalAuth, optionalSellerProfile, getBrandItemsFeed);
 router.get("/brand-items/:brandItemId/sellers", optionalAuth, optionalSellerProfile, getBrandItemSellers);
 router.get("/brand-items/:brandItemId/seller-offer", optionalAuth, optionalSellerProfile, getBrandItemSellerOffer);
-// router.get("/shared/:submissionId", optionalSellerProfile, getSharedProductLink);
-router.get("/shared/:submissionId", requireAuth, optionalSellerProfile, getSharedProductLink);
+// Shared product link: guests get a price-free preview of PUBLIC listings; the controller decides.
+router.get("/shared/:submissionId", optionalAuth, optionalSellerProfile, getSharedProductLink);
 router.get("/seller-listing/lowest-price/:genericProductBrandId", optionalAuth, optionalSellerProfile, getLowestPriceForBrandItem);
 
 export default router;
