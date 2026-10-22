@@ -1,6 +1,7 @@
 import { supabase } from "../config/supabase.js";
 import { notifyAdmins, notifyUser } from "../utils/notify.js";
 import { sendOtp, verifyOtpCode } from "../utils/otp.js";
+import { publishQueuedForUser } from "../services/stagedListings.service.js";
 
 // const REQUIRED_FIELDS = [
 //   "display_name", "business_type", "year_established",
@@ -319,6 +320,9 @@ export async function submitSellerOnboarding(req, res) {
 
   // Intentionally no notifyAdmins(...) call here anymore — sellers go
   // live immediately, so there's nothing for admin to review at this step.
+
+  // Products an admin staged for this GSTIN go live now (background, never blocks onboarding).
+  void publishQueuedForUser(userId).catch((e) => console.error("[submitSellerOnboarding] publish staged failed", e?.message || e));
 
   res.json({ success: true, seller: data });
 }

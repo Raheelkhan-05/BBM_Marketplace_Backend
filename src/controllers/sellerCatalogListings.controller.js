@@ -461,6 +461,7 @@ async function resolvePolicyText(kind, key) {
 /* ------------------------- create submission (brand-new-or-matched flow) ------------------------- */
 
 export async function createSubmission(req, res) {
+    const forceApprove = req.adminForceApprove === true;
     const sellerId = req.sellerId;
     const body = req.body || {};
 
@@ -511,9 +512,15 @@ export async function createSubmission(req, res) {
                 packSize: body.packSize,
                 masterPackSize: body.masterPackSize,
                 gstPercent: body.gstPercent,
-                approved: fromEnquiry,
+                approved: fromEnquiry || forceApprove,
             });
             isNewBrandItem = true;
+        }
+        if (forceApprove && brand.review_status !== "approved") {
+            const { error: apErr } = await supabase.from("hs_generic_product_brands")
+                .update({ review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: null }).eq("id", brand.id);
+            if (apErr) throw apErr;
+            brand = { ...brand, review_status: "approved" };
         }
     } catch (err) {
         return res.status(500).json({ success: false, message: err.message });
@@ -538,7 +545,7 @@ export async function createSubmission(req, res) {
     // check above already ruled out any other status) — that resubmission
     // still goes through review even if the brand is approved, since
     // admin flagged something about THIS seller's specific listing.
-    const autoApprove = brand.review_status === "approved" && !existingRow;
+    const autoApprove = forceApprove || (brand.review_status === "approved" && !existingRow);
 
     const sellerDispatch = await getSellerDispatchInfo(sellerId);
     const row = toListingRow(body, brand, sellerDispatch);
@@ -574,7 +581,7 @@ export async function createSubmission(req, res) {
         return res.status(500).json({ success: false, message: error.message });
     }
 
-    await autoSaveSellerDefaults(sellerId, body);
+    if (!forceApprove) await autoSaveSellerDefaults(sellerId, body);
     await applyBuyerAccessDraft(inserted.id, sellerId, body.buyerAccessDraft, inserted.price);
     void publishListingChange(inserted.id);
 
@@ -690,6 +697,7 @@ export async function getCommissionInfo(req, res) {
 }
 
 export async function createListingForExistingBrand(req, res) {
+    const forceApprove = req.adminForceApprove === true;
     const sellerId = req.sellerId;
     const body = req.body || {};
     delete body.marketingCommissionPercent; // creates must choose services; a client percent is never trusted
@@ -708,7 +716,13 @@ export async function createListingForExistingBrand(req, res) {
         .maybeSingle();
     if (brandErr) return res.status(500).json({ success: false, message: brandErr.message });
     if (!brand) return res.status(400).json({ success: false, message: "That item wasn't found." });
-    if (brand.review_status !== "approved") return res.status(400).json({ success: false, message: "This item isn't available to list under yet." });
+    if (brand.review_status !== "approved") {
+        if (!forceApprove) return res.status(400).json({ success: false, message: "This item isn't available to list under yet." });
+        const { error: apErr } = await supabase.from("hs_generic_product_brands")
+            .update({ review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: null }).eq("id", brand.id);
+        if (apErr) return res.status(500).json({ success: false, message: apErr.message });
+        brand.review_status = "approved";
+    }
 
     // NEW — this brand item predates packaging being tracked (or was
     // otherwise created without it). The frontend detects this via
@@ -756,7 +770,7 @@ export async function createListingForExistingBrand(req, res) {
     // submission through here always goes live immediately. A rejected
     // existingRow still goes back through review on resubmit — same
     // reasoning as createSubmission above.
-    const autoApprove = !existingRow;
+    const autoApprove = forceApprove || !existingRow;
 
     const sellerDispatch = await getSellerDispatchInfo(sellerId);
     const row = toListingRow(merged, effectiveBrand, sellerDispatch);
@@ -787,7 +801,7 @@ export async function createListingForExistingBrand(req, res) {
         return res.status(500).json({ success: false, message: error.message });
     }
 
-    await autoSaveSellerDefaults(sellerId, body);
+    if (!forceApprove) await autoSaveSellerDefaults(sellerId, body);
     await applyBuyerAccessDraft(result.id, sellerId, body.buyerAccessDraft, result.price);
     void publishListingChange(result.id);
 
@@ -907,6 +921,7 @@ export async function getSubmissionDetail(req, res) {
 }
 
 export async function updateSubmission(req, res) {
+    const forceApprove = req.adminForceApprove === true;
     const sellerId = req.sellerId;
     const { id } = req.params;
     const body = req.body || {};
@@ -994,9 +1009,12 @@ export async function updateSubmission(req, res) {
     // flagged something about it specifically), goes through review again
     // on edit — same as before this change.
     const staysApproved = existing.review_status === "approved";
+    const adminApprove = forceApprove && !staysApproved; // admin edits a pending / rejected listing: it goes live
     const statusPatch = staysApproved
         ? {}
-        : { review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null };
+        : adminApprove
+            ? { review_status: "approved", rejection_reason: null, reviewed_at: new Date().toISOString(), reviewed_by: null, ...liveClock(row.validity_hours) }
+            : { review_status: "pending_review", rejection_reason: null, reviewed_at: null, reviewed_by: null };
 
     // Changing validity on a live listing restarts its countdown from now.
     // An already-expired listing only stores the new value; it takes effect on Refresh.
@@ -1011,10 +1029,10 @@ export async function updateSubmission(req, res) {
 
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    await autoSaveSellerDefaults(sellerId, body);
+    if (!forceApprove) await autoSaveSellerDefaults(sellerId, body);
     void publishListingChange(updated.id);
 
-    if (!staysApproved) {
+    if (!staysApproved && !adminApprove) {
         await notifyAdmins({
             type: "seller_submission",
             title: "Listing edited and resubmitted for review",
@@ -1032,7 +1050,7 @@ export async function updateSubmission(req, res) {
         success: true,
         submission: updated,
         marketplace,
-        message: staysApproved ? "Changes saved — your listing is still live." : "Changes submitted for review.",
+        message: staysApproved || adminApprove ? "Changes saved. The listing is live." : "Changes submitted for review.",
     });
 }
 

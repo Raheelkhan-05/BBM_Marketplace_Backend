@@ -39,7 +39,9 @@ import adminPaymentsRoutes from "./routes/adminPayments.routes.js";
 import sellerCustomersRoutes from "./routes/sellerCustomers.routes.js";
 import adminFinanceRoutes from "./routes/adminFinance.routes.js";
 import teamRoutes from "./routes/team.routes.js";
+import adminSellerListingsRoutes from "./routes/adminSellerListings.routes.js";
 import salesRoutes from "./routes/sales.routes.js";
+import { impersonationGuard } from "./middleware/impersonationGuard.middleware.js";
 
 export function createApp() {
   const app = express();
@@ -92,6 +94,10 @@ export function createApp() {
 
   app.use(express.json({ limit: "6mb" }));
 
+  // Admin "act as seller" sessions only. Normal tokens pass straight through (no signature check, no cost).
+  // Must stay BEFORE every /api router below, so a restricted session can never reach an unlisted route.
+  app.use("/api", impersonationGuard);
+
   app.get("/health", (req, res) => res.json({ ok: true }));
   app.get("/api/my-ip", async (req, res) => {
     const response = await fetch("https://api.ipify.org?format=json");
@@ -111,6 +117,7 @@ export function createApp() {
   app.use("/api/seller/orders", sellerOrdersRoutes);
   app.use("/api/seller/wallet", sellerWalletRoutes);
   app.use("/api/seller/custom-pricing", customPricingRoutes);
+  app.use("/api/admin/seller-listings", adminSellerListingsRoutes);
   app.use("/api/admin/seller-submissions", adminSellerSubmissionsRouter);
   app.use("/api/seller", sellerRoutes);
   app.use("/api/admin/auth", adminAuthRoutes);
