@@ -23,6 +23,9 @@ function parseIntSafe(v, fallback) {
     return Number.isFinite(n) ? n : fallback;
 }
 
+// A generic product with >= this many visible variants is collapsed into one group card.
+const GROUP_THRESHOLD = Math.max(0, parseIntSafe(process.env.CATALOG_GROUP_THRESHOLD, 6));
+
 // GET /api/catalog/categories/:categoryId/generic-products?q=&subcategoryIds=&sort=&limit=&offset=
 export async function getCategoryGenericProducts(req, res) {
     const { categoryId } = req.params;
@@ -234,6 +237,12 @@ export async function getBrandItemsFeed(req, res) {
         return res.status(401).json({ success: false, message: "Login required." });
     }
 
+    const groupRaw = String(req.query.group || "").trim();
+    if (groupRaw && !UUID_RE.test(groupRaw)) {
+        return res.status(400).json({ success: false, message: "Invalid group." });
+    }
+    const groupId = groupRaw || null;
+
     const { data, error } = await supabaseAdmin.rpc("catalog_browse_feed", {
         p_category_id: categoryId || null,
         p_q: q,
@@ -246,6 +255,8 @@ export async function getBrandItemsFeed(req, res) {
         p_shop_slug: shop,
         p_dest_pincode: destPincode || null,
         p_dest_state: destState || null,
+        p_group_threshold: groupId ? 0 : GROUP_THRESHOLD,
+        p_generic_product_id: groupId,
         ...(brands.length ? { p_brand_names: brands } : {}),
     });
 
@@ -513,21 +524,21 @@ export async function attachPriceTrends({ buyerId, scope = "", items }) {
         if (!buyerId || !Array.isArray(items) || !items.length) return items;
         const obs = [];
         for (const it of items) {
-            if (it.lowest_price == null || isRowOutOfStock(it)) continue;
+            if (it.row_type === "group" || it.lowest_price == null || isRowOutOfStock(it)) continue;
             const ppu = pricePerBaseUnit(it.lowest_price, it.lowest_price_pack_size, it.lowest_price_master_pack_size);
             if (ppu != null) obs.push({ id: it.id, ppu });
         }
-        if (!obs.length) return items.map((it) => ({ ...it, price_trend: null }));
+        if (!obs.length) return items.map((it) => (it.row_type === "group" ? it : { ...it, price_trend: null }));
 
         const { data, error } = await supabaseAdmin.rpc("catalog_record_price_trend", {
             p_buyer_id: buyerId, p_scope: scope, p_obs: obs,
         });
         if (error) {
             console.error("[catalog] attachPriceTrends failed:", error.message);
-            return items; // price_trend stays undefined => frontend treats as "not tracked"
+            return items;
         }
         const map = data || {};
-        return items.map((it) => ({ ...it, price_trend: map[it.id] ?? null }));
+        return items.map((it) => (it.row_type === "group" ? it : { ...it, price_trend: map[it.id] ?? null }));
     } catch (e) {
         console.error("[catalog] attachPriceTrends threw:", e?.message);
         return items;
@@ -549,6 +560,7 @@ export async function observePriceTrends(req, res) {
     const { data, error } = await supabaseAdmin.rpc("catalog_record_price_trend", {
         p_buyer_id: req.user.id, p_scope: "", p_obs: obs,
     });
+
     if (error) {
         console.error("[catalog] observePriceTrends failed:", error.message);
         return res.status(500).json({ success: false, message: "Couldn't update price trends." });
