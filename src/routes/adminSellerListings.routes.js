@@ -7,7 +7,7 @@ import {
     listDrafts, createDrafts, updateDraft, deleteDraft, clearDrafts,
 } from "../controllers/adminSellerListings.controller.js";
 import { setListingImages, setStagedImages, setDraftImages } from "../controllers/adminListingImages.controller.js";
-import { deleteDraftsBulk, deleteStagedBulk, softDeleteListings } from "../controllers/adminListingBulk.controller.js";
+import { deleteDraftsBulk, deleteStagedBulk, softDeleteListings, setStagedMapping } from "../controllers/adminListingBulk.controller.js";
 
 const router = express.Router();
 router.use(requireAuth, requireAdmin);
@@ -20,6 +20,7 @@ router.post("/staged", stageListing);
 router.post("/staged/publish", publishStagedNow);
 router.post("/staged/images", setStagedImages);
 router.post("/staged/delete", deleteStagedBulk);
+router.post("/staged/map", setStagedMapping);
 router.delete("/staged/:id", deleteStaged);
 
 router.get("/drafts", listDrafts);

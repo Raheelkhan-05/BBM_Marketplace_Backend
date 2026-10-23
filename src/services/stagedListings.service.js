@@ -1,6 +1,8 @@
 // Resolves a GSTIN to a seller and publishes staged listings through the SAME controllers sellers use.
 import { supabase } from "../config/supabase.js";
 import { createSubmission, createListingForExistingBrand } from "../controllers/sellerCatalogListings.controller.js";
+import { genericProductUsable, mapBrandItems } from "./catalogMapping.service.js";
+
 
 const TABLE = "admin_staged_listings";
 const STALE_MS = 10 * 60 * 1000;
@@ -15,6 +17,24 @@ export async function resolveSellerByGstin(gstin) {
     const { data: seller } = await supabase
         .from("seller_profiles").select("id, status, display_name, shop_slug").eq("user_id", business.user_id).maybeSingle();
     return { kind: seller?.status === "approved" ? "live" : "no_seller", userId: business.user_id, business, seller };
+}
+
+// After a successful publish: put the new catalog item under the admin's chosen generic product.
+// Never throws. Returns a note to store on the row, or null.
+async function applyStagedMapping(submissionId, parentId) {
+    try {
+        if (!submissionId) return "Published, but the listing could not be found to map it.";
+        const { data, error } = await supabase.from("seller_product_submissions")
+            .select("generic_product_brand_id").eq("id", submissionId).maybeSingle();
+        if (error) throw error;
+        if (!data?.generic_product_brand_id) return "Published, but it has no catalog item to map.";
+        if (!(await genericProductUsable(parentId))) return "Published, but the chosen generic product is no longer available. Map it from the catalog.";
+        await mapBrandItems([data.generic_product_brand_id], parentId, { onlyUnmapped: true });
+        return null;
+    } catch (e) {
+        console.error("[stagedListings] mapping:", e?.message || e);
+        return "Published, but mapping failed. Map it from the catalog.";
+    }
 }
 
 // Runs an express controller without HTTP and returns { status, body }.
@@ -57,16 +77,17 @@ export async function publishQueuedForGstin(gstin) {
     // atomic claim: a concurrent run matches zero rows
     const { data: rows, error } = await supabase.from(TABLE)
         .update({ status: "publishing", claimed_at: now, error: null })
-        .eq("gstin", gstin).in("status", ["staged", "failed"]).select("id, payload").order("created_at", { ascending: true });
+        .eq("gstin", gstin).in("status", ["staged", "failed"]).select("id, payload, map_parent_id").order("created_at", { ascending: true });
     if (error) throw error;
 
     const sum = { waiting: false, published: 0, failed: 0, skipped: 0 };
     for (const row of rows || []) {
         const out = await publishOne(r.userId, row.payload || {});
         const ok = !!out.body?.success, dup = out.status === 409;
+        const mapNote = ok && row.map_parent_id ? await applyStagedMapping(out.body.submission?.id, row.map_parent_id) : null;
         await supabase.from(TABLE).update({
             status: ok ? "published" : dup ? "skipped" : "failed",
-            error: ok ? null : (out.body?.message || "Could not publish."),
+            error: ok ? mapNote : (out.body?.message || "Could not publish."),
             submission_id: ok ? (out.body.submission?.id ?? null) : null,
             published_at: ok ? new Date().toISOString() : null,
             claimed_at: null, updated_at: new Date().toISOString(),

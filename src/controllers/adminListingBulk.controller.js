@@ -9,6 +9,7 @@ import { publishListingRemoved } from "../services/listingRealtime.service.js";
 import { notifySellerSubmissionsChanged, notifyAdminSubmissionsChanged } from "../services/notifications.service.js";
 // Same exact reason every seller-facing query already hides (see listMySubmissions, getSubmissionDetail, ...).
 import { CATALOG_REMOVED_REJECTION_REASON } from "./sellerCatalogListings.controller.js";
+import { genericProductUsable } from "../services/catalogMapping.service.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_IDS = 300;
@@ -26,6 +27,27 @@ function parse(req) {
     const ids = [...new Set((Array.isArray(req.body?.ids) ? req.body.ids : []).filter((x) => UUID_RE.test(String(x))))];
     if (!ids.length || ids.length > MAX_IDS) return { error: `Select between 1 and ${MAX_IDS} products at a time.` };
     return { gstin, ids };
+}
+
+
+// POST /staged/map { gstin, ids, parentId }  -- parentId null clears the mapping. Waiting/Failed rows only.
+export async function setStagedMapping(req, res) {
+    const p = parse(req);
+    if (p.error) return res.status(400).json({ success: false, message: p.error });
+    const parentId = req.body?.parentId ?? null;
+    if (parentId !== null && !UUID_RE.test(String(parentId))) return res.status(400).json({ success: false, message: "Pick a generic product." });
+    try {
+        if (parentId && !(await genericProductUsable(parentId))) return res.status(400).json({ success: false, message: "Selected generic product wasn't found." });
+        const done = [];
+        for (const c of chunks(p.ids, 100)) {
+            const { data, error } = await supabase.from("admin_staged_listings")
+                .update({ map_parent_id: parentId, updated_at: new Date().toISOString() })
+                .eq("gstin", p.gstin).in("status", ["staged", "failed"]).in("id", c).select("id");
+            if (error) throw error;
+            done.push(...(data || []).map((r) => r.id));
+        }
+        res.json({ success: true, updated: done.length, skipped: p.ids.length - done.length, ids: done });
+    } catch (e) { return fail(res, e, "map staged"); }
 }
 
 // POST /drafts/delete { gstin, ids } -- unfinished bulk-upload products

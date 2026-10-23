@@ -1,6 +1,5 @@
 // controllers/adminCatalogBulkMap.controller.js
-// Admin-only. Map many catalog brand items to one generic product (same write as "Fix mapping", in bulk).
-import { supabase } from "../config/supabase.js";
+import { genericProductUsable, mapBrandItems } from "../services/catalogMapping.service.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_IDS = 1000;
@@ -13,18 +12,8 @@ export async function bulkMapBrandItems(req, res) {
     if (!unique.length || unique.length > MAX_IDS) return res.status(400).json({ success: false, message: `Select between 1 and ${MAX_IDS} catalog items.` });
 
     try {
-        const { data: gp, error: gpErr } = await supabase.from("hs_generic_products")
-            .select("id, review_status").eq("id", parentId).is("deleted_at", null).maybeSingle();
-        if (gpErr) throw gpErr;
-        if (!gp || gp.review_status === "rejected") return res.status(400).json({ success: false, message: "Selected generic product wasn't found." });
-
-        let updated = 0;
-        for (let i = 0; i < unique.length; i += 100) {
-            const { data, error } = await supabase.from("hs_generic_product_brands")
-                .update({ generic_product_id: parentId }).in("id", unique.slice(i, i + 100)).is("deleted_at", null).select("id");
-            if (error) throw error;
-            updated += data?.length || 0;
-        }
+        if (!(await genericProductUsable(parentId))) return res.status(400).json({ success: false, message: "Selected generic product wasn't found." });
+        const updated = await mapBrandItems(unique, parentId);
         res.json({ success: true, updated, requested: unique.length });
     } catch (e) {
         console.error("[adminCatalogBulkMap]", e?.message || e);

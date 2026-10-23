@@ -100,7 +100,7 @@ export async function listStaged(req, res) {
     const gstin = gstinOf(req.query.gstin);
     if (!gstin) return res.status(400).json({ success: false, message: "Invalid GSTIN." });
     const { data, error } = await supabase.from("admin_staged_listings")
-        .select("id, product_name, brand_name, image, status, error, submission_id, created_at, published_at")
+        .select("id, product_name, brand_name, image, status, error, submission_id, created_at, published_at, map_parent_id, map_parent:hs_generic_products(id, name)")
         .eq("gstin", gstin).order("created_at", { ascending: false }).limit(500);
     if (error) return fail(res, error, "list staged");
     res.json({ success: true, items: data || [] });
