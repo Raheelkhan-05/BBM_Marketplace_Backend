@@ -3,6 +3,7 @@
 import { supabase } from "../config/supabase.js";
 import { validateGSTIN } from "../services/gst.service.js";
 import { resolveSellerByGstin } from "../services/stagedListings.service.js";
+import { sellerOwnerIds } from "../services/adminSellerKeys.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_IDS = 300, MAX_IMAGES = 5;
@@ -40,12 +41,17 @@ export async function setListingImages(req, res) {
         const r = await resolveSellerByGstin(p.gstin);
         if (r.kind !== "live") return res.status(409).json({ success: false, code: "NOT_A_LIVE_SELLER", message: "This business is not an approved seller yet." });
 
+        const owners = await sellerOwnerIds(r);
+        if (!owners.length) return res.status(409).json({ success: false, message: "Could not identify this seller." });
+
         const rows = [];
         for (const c of chunks(p.ids, 100)) {
-            const { data, error } = await supabase.from("seller_product_submissions").select("id, image, images").eq("seller_id", r.userId).in("id", c);
+            const { data, error } = await supabase.from("seller_product_submissions")
+                .select("id, image, images").in("seller_id", owners).is("deleted_at", null).in("id", c);
             if (error) throw error;
             rows.push(...(data || []));
         }
+        if (!rows.length) return res.status(404).json({ success: false, message: "These listings were not found for this seller. Refresh the page and try again." });
 
         // rows that end up with the same photos are updated together in one query
         const groups = new Map();
@@ -60,7 +66,8 @@ export async function setListingImages(req, res) {
         }
         for (const g of groups.values()) {
             for (const c of chunks(g.ids, 100)) {
-                const { error } = await supabase.from("seller_product_submissions").update({ images: g.next, image: g.next[0] || null }).eq("seller_id", r.userId).in("id", c);
+                const { error } = await supabase.from("seller_product_submissions")
+                    .update({ images: g.next, image: g.next[0] || null }).in("seller_id", owners).in("id", c);
                 if (error) throw error;
             }
         }
