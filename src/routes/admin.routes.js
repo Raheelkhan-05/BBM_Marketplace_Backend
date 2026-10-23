@@ -43,6 +43,9 @@ import { adminListGstinReports, adminResolveGstinReport } from "../controllers/g
 // verify wallet top-ups. Wiring them in now.
 import { adminListWalletPayments, adminVerifyWalletPayment } from "../controllers/wallet.controller.js";
 
+// NEW — bulk "map many brand items to one generic product".
+import { bulkMapBrandItems } from "../controllers/adminCatalogBulkMap.controller.js";
+
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
 
 
@@ -114,5 +117,8 @@ router.post("/rfq/:id/reject", requireAuth, requireAdmin, authWriteLimiter, admi
 
 router.get("/catalog-bulk/excel-template", requireAuth, requireAdmin, downloadFullCatalogTemplate);
 router.post("/catalog-bulk/excel-upload", requireAuth, requireAdmin, upload.single("file"), bulkUploadFullCatalog);
+
+// NEW — map many brand items to one generic product at once.
+router.post("/catalog-bulk/map-brand-items", requireAuth, requireAdmin, authWriteLimiter, bulkMapBrandItems);
 
 export default router;
