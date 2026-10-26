@@ -46,6 +46,12 @@ import { adminListWalletPayments, adminVerifyWalletPayment } from "../controller
 // NEW — bulk "map many brand items to one generic product".
 import { bulkMapBrandItems } from "../controllers/adminCatalogBulkMap.controller.js";
 
+// NEW — admin-curated 16:9 banners for product groups on the Home page.
+import {
+  bannerImageUpload, adminListGroupBanners, adminUpsertGroupBanner, adminPatchGroupBanner,
+  adminDeleteGroupBanner, adminReorderGroupBanners, adminScanGroups,
+} from "../controllers/groupBanners.controller.js";
+
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
 
 
@@ -120,5 +126,13 @@ router.post("/catalog-bulk/excel-upload", requireAuth, requireAdmin, upload.sing
 
 // NEW — map many brand items to one generic product at once.
 router.post("/catalog-bulk/map-brand-items", requireAuth, requireAdmin, authWriteLimiter, bulkMapBrandItems);
+
+// NEW — Home page group banners. /group-banners/order and /scan MUST stay above /:groupId.
+router.get("/group-banners", requireAuth, requireAdmin, adminListGroupBanners);
+router.put("/group-banners/order", requireAuth, requireAdmin, authWriteLimiter, adminReorderGroupBanners);
+router.post("/group-banners/scan", requireAuth, requireAdmin, authWriteLimiter, adminScanGroups);
+router.put("/group-banners/:groupId", requireAuth, requireAdmin, authWriteLimiter, bannerImageUpload, adminUpsertGroupBanner);
+router.patch("/group-banners/:groupId", requireAuth, requireAdmin, authWriteLimiter, adminPatchGroupBanner);
+router.delete("/group-banners/:groupId", requireAuth, requireAdmin, authWriteLimiter, adminDeleteGroupBanner);
 
 export default router;
