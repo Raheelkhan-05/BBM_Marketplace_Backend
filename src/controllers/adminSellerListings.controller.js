@@ -2,7 +2,7 @@
 import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.js";
 import { validateGSTIN, fetchGstinDetails } from "../services/gst.service.js";
-import { resolveSellerByGstin, publishQueuedForGstin } from "../services/stagedListings.service.js";
+import { resolveSellerByGstin, startPublishInBackground } from "../services/stagedListings.service.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SESSION_HOURS = 4;
@@ -11,8 +11,15 @@ const DRAFT_COLS = "id, batch_id, file_name, row_no, data, created_at";
 
 const gstinOf = (v) => { const c = validateGSTIN(v); return c?.valid ? c.gstin : null; };
 const fail = (res, e, label) => {
-    console.error(`[adminSellerListings] ${label}:`, e?.message || e);
-    return res.status(500).json({ success: false, message: "Something went wrong. Please try again." });
+    console.error(`[adminSellerListings] ${label}:`, e?.stack || e?.message || e);
+    return res.status(500).json({
+        success: false,
+        message: "Something went wrong. Please try again.",
+        // Admin-only endpoints: expose the underlying error so failures are debuggable from the browser.
+        detail: e?.message || String(e),
+        code: e?.code || null,
+        step: label,
+    });
 };
 const validData = (d, max) => d && typeof d === "object" && !Array.isArray(d) && JSON.stringify(d).length <= max;
 
@@ -117,13 +124,17 @@ export async function deleteStaged(req, res) {
 }
 
 // POST /staged/publish { gstin }
+// Starts publishing in the background and returns right away (202).
+// Progress: poll GET /lookup?gstin=... and watch `queue` (staged / publishing / published / failed / skipped).
 export async function publishStagedNow(req, res) {
     const gstin = gstinOf(req.body?.gstin);
     if (!gstin) return res.status(400).json({ success: false, message: "Invalid GSTIN." });
     try {
-        const out = await publishQueuedForGstin(gstin);
+        const out = await startPublishInBackground(gstin);
         if (out.waiting) return res.status(409).json({ success: false, message: "This business is not an approved seller yet." });
-        res.json({ success: true, ...out });
+        if (out.alreadyRunning) return res.status(202).json({ success: true, started: false, alreadyRunning: true, message: "Publishing is already in progress." });
+        if (!out.started) return res.json({ success: true, started: false, queued: 0, message: "Nothing is waiting to be published." });
+        res.status(202).json({ success: true, started: true, queued: out.queued });
     } catch (e) { return fail(res, e, "publish"); }
 }
 

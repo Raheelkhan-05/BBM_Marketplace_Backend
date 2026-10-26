@@ -6,6 +6,12 @@ import { genericProductUsable, mapBrandItems } from "./catalogMapping.service.js
 
 const TABLE = "admin_staged_listings";
 const STALE_MS = 10 * 60 * 1000;
+const CONCURRENCY = Math.max(1, Math.min(Number(process.env.PUBLISH_CONCURRENCY) || 5, 10));
+const BATCH = 10;          // rows a worker claims at a time
+const MAX_QUEUE = 5000;    // rows picked up per run
+
+// GSTINs being published right now on this server instance
+const running = new Set();
 
 export async function resolveSellerByGstin(gstin) {
     const { data: business, error } = await supabase
@@ -51,53 +57,105 @@ function runController(fn, req) {
     });
 }
 
-const makeReq = (userId, payload) => ({
-    sellerId: userId, user: { id: userId }, params: {}, query: {},
+// sellerId must be seller_profiles.id (what seller_product_submissions.seller_id references),
+// while user.id stays the account's user id.
+const makeReq = (userId, sellerId, payload) => ({
+    sellerId, user: { id: userId }, params: {}, query: {},
     body: structuredClone(payload), adminForceApprove: true,
 });
 
-async function publishOne(userId, payload) {
+async function publishOne(userId, sellerId, payload) {
     const first = payload.genericProductBrandId ? createListingForExistingBrand : createSubmission;
-    let out = await runController(first, makeReq(userId, payload));
+    let out = await runController(first, makeReq(userId, sellerId, payload));
     // the catalogue item it pointed to is gone: let createSubmission resolve / create it again
     if (!out.body?.success && out.status === 400 && payload.genericProductBrandId && /wasn't found|isn't available/i.test(out.body?.message || "")) {
-        out = await runController(createSubmission, makeReq(userId, { ...payload, genericProductBrandId: null }));
+        out = await runController(createSubmission, makeReq(userId, sellerId, { ...payload, genericProductBrandId: null }));
     }
     return out;
 }
 
-export async function publishQueuedForGstin(gstin) {
-    const r = await resolveSellerByGstin(gstin);
-    if (r.kind !== "live") return { waiting: true, published: 0, failed: 0, skipped: 0 };
+// Publishes one claimed row and records the result on it.
+async function processRow(r, row, sum) {
+    let out;
+    try {
+        out = await publishOne(r.userId, r.seller.id, row.payload || {});
+    } catch (e) {
+        out = { status: 500, body: { success: false, message: e?.message || "Could not publish." } };
+    }
+    const ok = !!out.body?.success, dup = out.status === 409;
+    const mapNote = ok && row.map_parent_id ? await applyStagedMapping(out.body.submission?.id, row.map_parent_id) : null;
+    const { error } = await supabase.from(TABLE).update({
+        status: ok ? "published" : dup ? "skipped" : "failed",
+        error: ok ? mapNote : (out.body?.message || "Could not publish."),
+        submission_id: ok ? (out.body.submission?.id ?? null) : null,
+        published_at: ok ? new Date().toISOString() : null,
+        claimed_at: null, updated_at: new Date().toISOString(),
+    }).eq("id", row.id);
+    if (error) console.error("[stagedListings] result save:", error.message);
+    if (ok) sum.published += 1; else if (dup) sum.skipped += 1; else sum.failed += 1;
+}
 
-    const now = new Date().toISOString();
+// The publish run: several workers, each claiming a few rows at a time.
+async function runPublish(gstin, r) {
+    const sum = { waiting: false, published: 0, failed: 0, skipped: 0 };
+
     // free rows a crashed worker left in "publishing"
     await supabase.from(TABLE).update({ status: "staged", claimed_at: null })
         .eq("gstin", gstin).eq("status", "publishing").lt("claimed_at", new Date(Date.now() - STALE_MS).toISOString());
-    // atomic claim: a concurrent run matches zero rows.
-    // NOTE: no .order() here. On an UPDATE, PostgREST orders only the returned columns,
-    // so ordering by a column that isn't selected fails. We sort in JS instead.
-    const { data: claimed, error } = await supabase.from(TABLE)
-        .update({ status: "publishing", claimed_at: now, error: null })
-        .eq("gstin", gstin).in("status", ["staged", "failed"]).select("id, payload, map_parent_id, created_at");
-    if (error) throw error;
-    const rows = (claimed || []).sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
-    const sum = { waiting: false, published: 0, failed: 0, skipped: 0 };
-    for (const row of rows) {
-        const out = await publishOne(r.userId, row.payload || {});
-        const ok = !!out.body?.success, dup = out.status === 409;
-        const mapNote = ok && row.map_parent_id ? await applyStagedMapping(out.body.submission?.id, row.map_parent_id) : null;
-        await supabase.from(TABLE).update({
-            status: ok ? "published" : dup ? "skipped" : "failed",
-            error: ok ? mapNote : (out.body?.message || "Could not publish."),
-            submission_id: ok ? (out.body.submission?.id ?? null) : null,
-            published_at: ok ? new Date().toISOString() : null,
-            claimed_at: null, updated_at: new Date().toISOString(),
-        }).eq("id", row.id);
-        if (ok) sum.published += 1; else if (dup) sum.skipped += 1; else sum.failed += 1;
-    }
+    // snapshot of what to publish, oldest first (rows that fail now are not re-picked in this run)
+    const { data: idRows, error } = await supabase.from(TABLE).select("id")
+        .eq("gstin", gstin).in("status", ["staged", "failed"])
+        .order("created_at", { ascending: true }).limit(MAX_QUEUE);
+    if (error) throw error;
+    const queue = (idRows || []).map((x) => x.id);
+    let next = 0;
+
+    const worker = async () => {
+        while (next < queue.length) {
+            const slice = queue.slice(next, next + BATCH);
+            next += slice.length;
+            // atomic claim: a concurrent run matches zero rows
+            const { data: claimed, error: cErr } = await supabase.from(TABLE)
+                .update({ status: "publishing", claimed_at: new Date().toISOString(), error: null })
+                .in("id", slice).in("status", ["staged", "failed"])
+                .select("id, payload, map_parent_id, created_at");
+            if (cErr) { console.error("[stagedListings] claim:", cErr.message); continue; }
+            const rows = (claimed || []).sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+            for (const row of rows) await processRow(r, row, sum);
+        }
+    };
+    const workers = Math.min(CONCURRENCY, Math.ceil(queue.length / BATCH));
+    await Promise.all(Array.from({ length: workers }, worker));
     return sum;
+}
+
+// Waits for the whole run. Used by the onboarding hook.
+export async function publishQueuedForGstin(gstin) {
+    const r = await resolveSellerByGstin(gstin);
+    if (r.kind !== "live" || !r.seller?.id) return { waiting: true, published: 0, failed: 0, skipped: 0 };
+    if (running.has(gstin)) return { waiting: false, alreadyRunning: true, published: 0, failed: 0, skipped: 0 };
+    running.add(gstin);
+    try { return await runPublish(gstin, r); }
+    finally { running.delete(gstin); }
+}
+
+// Returns immediately; the publishing continues in the background. Used by the admin "Publish" button.
+export async function startPublishInBackground(gstin) {
+    const r = await resolveSellerByGstin(gstin);
+    if (r.kind !== "live" || !r.seller?.id) return { waiting: true };
+    if (running.has(gstin)) return { started: false, alreadyRunning: true };
+
+    const { count } = await supabase.from(TABLE).select("id", { count: "exact", head: true })
+        .eq("gstin", gstin).in("status", ["staged", "failed"]);
+    if (!count) return { started: false, queued: 0 };
+
+    running.add(gstin);
+    runPublish(gstin, r)
+        .then((sum) => console.log(`[stagedListings] ${gstin} done:`, JSON.stringify(sum)))
+        .catch((e) => console.error("[stagedListings] run failed:", e?.message || e))
+        .finally(() => running.delete(gstin));
+    return { started: true, queued: count };
 }
 
 // Called when someone finishes seller onboarding.
