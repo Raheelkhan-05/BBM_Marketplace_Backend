@@ -29,6 +29,8 @@ export async function sendOtpViaMapthrust(phone, otp) {
         throw new Error("[mapthrust] env vars not set.");
     }
 
+    // console.log("OTP sent to", phone, otp);
+
     const params = new URLSearchParams({
         authorization: API_KEY,
         route: "dlt_manual",

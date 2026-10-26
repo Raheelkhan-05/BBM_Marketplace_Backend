@@ -74,14 +74,17 @@ export async function publishQueuedForGstin(gstin) {
     // free rows a crashed worker left in "publishing"
     await supabase.from(TABLE).update({ status: "staged", claimed_at: null })
         .eq("gstin", gstin).eq("status", "publishing").lt("claimed_at", new Date(Date.now() - STALE_MS).toISOString());
-    // atomic claim: a concurrent run matches zero rows
-    const { data: rows, error } = await supabase.from(TABLE)
+    // atomic claim: a concurrent run matches zero rows.
+    // NOTE: no .order() here. On an UPDATE, PostgREST orders only the returned columns,
+    // so ordering by a column that isn't selected fails. We sort in JS instead.
+    const { data: claimed, error } = await supabase.from(TABLE)
         .update({ status: "publishing", claimed_at: now, error: null })
-        .eq("gstin", gstin).in("status", ["staged", "failed"]).select("id, payload, map_parent_id").order("created_at", { ascending: true });
+        .eq("gstin", gstin).in("status", ["staged", "failed"]).select("id, payload, map_parent_id, created_at");
     if (error) throw error;
+    const rows = (claimed || []).sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
     const sum = { waiting: false, published: 0, failed: 0, skipped: 0 };
-    for (const row of rows || []) {
+    for (const row of rows) {
         const out = await publishOne(r.userId, row.payload || {});
         const ok = !!out.body?.success, dup = out.status === 409;
         const mapNote = ok && row.map_parent_id ? await applyStagedMapping(out.body.submission?.id, row.map_parent_id) : null;

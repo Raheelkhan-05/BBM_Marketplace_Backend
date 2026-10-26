@@ -21,7 +21,7 @@ export async function sendOtpViaStartMessaging(phone, otp, expiryMinutes = 5) {
         throw new Error("[startmessaging] env vars not set.");
     }
 
-    console.log("OTP sent to", phone, otp, expiryMinutes);
+    // console.log("OTP sent to", phone, otp, expiryMinutes);
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
