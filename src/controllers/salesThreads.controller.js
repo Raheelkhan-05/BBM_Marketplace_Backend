@@ -1,0 +1,489 @@
+// controllers/salesThreads.controller.js
+// A salesperson's private enquiry threads: create, log notes + files, send quotations (WhatsApp / email).
+// Every query is scoped to the CALLING salesperson, so other salespeople of the same team never see a thread.
+import { randomUUID } from "node:crypto";
+import { supabase } from "../config/supabase.js";
+import { isUuid, RFQ_UNITS } from "../services/rfqValidation.js";
+import { sameUnit } from "../services/rfqQuotes.service.js";
+import { sendSalesQuotationWhatsApp } from "../services/whatsapp.service.js";
+import { sendSalesQuotationEmail } from "../services/mail.service.js";
+import {
+    BUCKET, GSTIN_RE, getSalesActor, str, safeSearch, cleanGstin, cleanPhone, cleanEmail, round4,
+    saleUnits, priceLine, listingProblem, listingDescription, productUrl, clipPreview, ping,
+    threadDto, entryDto, quoteDto, hydrateEntries, inr, fmtDate, whatsappItemsLine,
+} from "../services/salesThreads.service.js";
+
+const ENTRY_PAGE = 60;
+const MAX_FILES = 10;
+const MAX_BYTES = 15 * 1024 * 1024;
+const ALLOWED_EXT = new Set(["jpg", "jpeg", "png", "webp", "gif", "heic", "pdf", "doc", "docx", "xls", "xlsx", "csv", "txt", "ppt", "pptx"]);
+const VALIDITY = [1, 3, 7, 15, 30];
+const CHANNELS = ["whatsapp", "email"];
+
+const fail = (res, status, message) => res.status(status).json({ success: false, message });
+const errText = (e) => String(e?.error?.error?.message || e?.error?.message || e?.message || e || "Failed").slice(0, 200);
+const NO_SELLER = "Your company's seller account isn't approved yet, so products can't be quoted.";
+
+// ---- loading -------------------------------------------------------------------------------------------
+async function loadOwnThread(req, res) {
+    const { actorId, ownerId } = getSalesActor(req);
+    const { id } = req.params;
+    if (!isUuid(id)) { fail(res, 404, "Enquiry not found."); return null; }
+    const { data, error } = await supabase.from("rfq_enquiries").select("*")
+        .eq("id", id).eq("source", "sales").eq("created_by_actor_id", actorId).eq("buyer_id", ownerId).maybeSingle();
+    if (error) throw error;
+    if (!data) { fail(res, 404, "Enquiry not found."); return null; }
+    return data;
+}
+
+async function touch(enquiryId, preview) {
+    await supabase.from("rfq_enquiries")
+        .update({ last_activity_at: new Date().toISOString(), last_entry_preview: preview }).eq("id", enquiryId);
+}
+
+// ---- GET /sales/threads --------------------------------------------------------------------------------
+export async function listThreads(req, res) {
+    try {
+        res.set("Cache-Control", "no-store");
+        const { actorId, ownerId } = getSalesActor(req);
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 15, 1), 100);
+        const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+        const q = safeSearch(req.query.q);
+        const status = ["open", "closed"].includes(req.query.status) ? req.query.status : "";
+
+        const scoped = (qb) => qb.eq("source", "sales").eq("created_by_actor_id", actorId).eq("buyer_id", ownerId);
+        const count = () => scoped(supabase.from("rfq_enquiries").select("id", { count: "exact", head: true }));
+
+        let query = scoped(supabase.from("rfq_enquiries").select("*", { count: "exact" }));
+        if (status === "open") query = query.neq("status", "closed");
+        if (status === "closed") query = query.eq("status", "closed");
+        if (q) query = query.or(`product_name.ilike.%${q}%,customer_name.ilike.%${q}%,customer_gstin.ilike.%${q}%`);
+
+        const [list, all, open, closed] = await Promise.all([
+            query.order("last_activity_at", { ascending: false }).range(offset, offset + limit - 1),
+            count(), count().neq("status", "closed"), count().eq("status", "closed"),
+        ]);
+        if (list.error) throw list.error;
+
+        const rows = list.data || [];
+        const qCount = new Map();
+        if (rows.length) {
+            const { data: qs, error: qErr } = await supabase.from("sales_quotes").select("enquiry_id").in("enquiry_id", rows.map((r) => r.id));
+            if (qErr) throw qErr;
+            for (const x of qs || []) qCount.set(x.enquiry_id, (qCount.get(x.enquiry_id) || 0) + 1);
+        }
+        const items = rows.map((r) => threadDto(r, { quotesCount: qCount.get(r.id) || 0 }));
+
+        res.json({
+            success: true, items, total: list.count ?? items.length,
+            hasMore: offset + items.length < (list.count ?? 0),
+            counts: { all: all.count || 0, open: open.count || 0, closed: closed.count || 0 },
+        });
+    } catch (e) { fail(res, 500, e.message); }
+}
+
+// ---- POST /sales/threads -------------------------------------------------------------------------------
+export async function createThread(req, res) {
+    try {
+        const { actorId, actorName, ownerId } = getSalesActor(req);
+        const b = req.body || {};
+
+        const customerName = str(b.customerName, 160);
+        const gstin = cleanGstin(b.customerGstin);
+        if (gstin && !GSTIN_RE.test(gstin)) return fail(res, 400, "Enter a valid 15-character GST number, or leave it empty.");
+        if (!customerName && !gstin) return fail(res, 400, "Enter the customer's GST number or company name.");
+
+        const phoneRaw = str(b.customerPhone, 20), emailRaw = str(b.customerEmail, 200);
+        const phone = phoneRaw ? cleanPhone(phoneRaw) : "";
+        const email = emailRaw ? cleanEmail(emailRaw) : "";
+        if (phoneRaw && !phone) return fail(res, 400, "Enter a valid 10-digit mobile number.");
+        if (emailRaw && !email) return fail(res, 400, "Enter a valid email address.");
+
+        const productName = str(b.productName, 200);
+        if (productName.length < 2) return fail(res, 400, "Product name must be at least 2 characters.");
+        const quantity = Number(b.quantity);
+        if (!(quantity > 0) || quantity > 1e9) return fail(res, 400, "Enter a valid quantity.");
+        if (!RFQ_UNITS.includes(b.unit)) return fail(res, 400, "Select a valid unit.");
+
+        const now = new Date().toISOString();
+        const { data, error } = await supabase.from("rfq_enquiries").insert({
+            buyer_id: ownerId,                       // belongs to the company, so the team sees it on the Save page
+            source: "sales", visibility: "private",  // never listed publicly
+            status: "approved", published_at: now,   // no admin review: it is not shown to suppliers
+            product_name: productName, quantity, unit: b.unit, pack_size: 1,
+            specifications: str(b.specifications, 2000) || null,
+            accept_equivalent: false, images: [], supplier_locations: [],
+            payment_terms: "flexible", consumption_type: "one_time",
+            customer_name: customerName || null, customer_gstin: gstin || null,
+            customer_phone: phone || null, customer_email: email || null,
+            created_by_actor_id: actorId, created_by_actor_name: actorName,
+            last_activity_at: now, last_entry_preview: "Enquiry created",
+        }).select("*").single();
+        if (error) throw error;
+
+        await supabase.from("sales_thread_entries").insert({
+            enquiry_id: data.id, author_id: actorId, author_name: actorName, kind: "system",
+            body: `Enquiry created: ${productName} · ${quantity} ${b.unit}`,
+        });
+
+        ping([ownerId, actorId], { enquiryId: data.id });
+        res.json({ success: true, thread: threadDto(data, { quotesCount: 0 }), message: "Enquiry created." });
+    } catch (e) { fail(res, 500, e.message); }
+}
+
+// ---- GET /sales/threads/:id?before= --------------------------------------------------------------------
+export async function getThread(req, res) {
+    try {
+        res.set("Cache-Control", "no-store");
+        const row = await loadOwnThread(req, res); if (!row) return;
+        let q = supabase.from("sales_thread_entries").select("*").eq("enquiry_id", row.id)
+            .order("created_at", { ascending: false }).limit(ENTRY_PAGE + 1);
+        if (req.query.before) q = q.lt("created_at", String(req.query.before));
+        const { data, error } = await q;
+        if (error) throw error;
+        const hasOlder = (data || []).length > ENTRY_PAGE;
+        const page = (data || []).slice(0, ENTRY_PAGE).reverse();
+        const { count } = await supabase.from("sales_quotes").select("id", { count: "exact", head: true }).eq("enquiry_id", row.id);
+        res.json({ success: true, thread: threadDto(row, { quotesCount: count || 0 }), entries: await hydrateEntries(page), hasOlder });
+    } catch (e) { fail(res, 500, e.message); }
+}
+
+// ---- PATCH /sales/threads/:id  (customer details) ------------------------------------------------------
+export async function updateThread(req, res) {
+    try {
+        const { actorId, ownerId } = getSalesActor(req);
+        const row = await loadOwnThread(req, res); if (!row) return;
+        const b = req.body || {};
+        const patch = {};
+
+        if ("customerName" in b) patch.customer_name = str(b.customerName, 160) || null;
+        if ("customerGstin" in b) {
+            const g = cleanGstin(b.customerGstin);
+            if (g && !GSTIN_RE.test(g)) return fail(res, 400, "Enter a valid 15-character GST number.");
+            patch.customer_gstin = g || null;
+        }
+        if ("customerPhone" in b) {
+            const raw = str(b.customerPhone, 20), p = raw ? cleanPhone(raw) : "";
+            if (raw && !p) return fail(res, 400, "Enter a valid 10-digit mobile number.");
+            patch.customer_phone = p || null;
+        }
+        if ("customerEmail" in b) {
+            const raw = str(b.customerEmail, 200), e = raw ? cleanEmail(raw) : "";
+            if (raw && !e) return fail(res, 400, "Enter a valid email address.");
+            patch.customer_email = e || null;
+        }
+        if (!Object.keys(patch).length) return fail(res, 400, "Nothing to update.");
+
+        const name = "customer_name" in patch ? patch.customer_name : row.customer_name;
+        const gst = "customer_gstin" in patch ? patch.customer_gstin : row.customer_gstin;
+        if (!name && !gst) return fail(res, 400, "Keep either the company name or the GST number.");
+
+        const { data, error } = await supabase.from("rfq_enquiries").update(patch).eq("id", row.id).select("*").single();
+        if (error) throw error;
+        ping([ownerId, actorId], { enquiryId: row.id });
+        res.json({ success: true, thread: threadDto(data) });
+    } catch (e) { fail(res, 500, e.message); }
+}
+
+// ---- PATCH /sales/threads/:id/status  { status: "open" | "closed" } ------------------------------------
+export async function setThreadStatus(req, res) {
+    try {
+        const { actorId, actorName, ownerId } = getSalesActor(req);
+        const row = await loadOwnThread(req, res); if (!row) return;
+        const next = req.body?.status;
+        if (!["open", "closed"].includes(next)) return fail(res, 400, "Invalid status.");
+        const dbStatus = next === "closed" ? "closed" : "approved";
+        if (row.status === dbStatus) return res.json({ success: true, thread: threadDto(row) });
+
+        const body = next === "closed" ? "Enquiry closed" : "Enquiry reopened";
+        const { data, error } = await supabase.from("rfq_enquiries")
+            .update({ status: dbStatus, last_activity_at: new Date().toISOString(), last_entry_preview: body })
+            .eq("id", row.id).select("*").single();
+        if (error) throw error;
+        await supabase.from("sales_thread_entries").insert({ enquiry_id: row.id, author_id: actorId, author_name: actorName, kind: "system", body });
+        ping([ownerId, actorId], { enquiryId: row.id });
+        res.json({ success: true, thread: threadDto(data) });
+    } catch (e) { fail(res, 500, e.message); }
+}
+
+// ---- POST /sales/threads/:id/attachments/sign  { name, type, size } ------------------------------------
+// The browser uploads straight to private storage with the returned URL, so the API never handles file bytes.
+export async function signAttachment(req, res) {
+    try {
+        const row = await loadOwnThread(req, res); if (!row) return;
+        const name = str(req.body?.name, 150);
+        const size = Number(req.body?.size);
+        const ext = (name.split(".").pop() || "").toLowerCase();
+        if (!name || !ALLOWED_EXT.has(ext)) return fail(res, 400, "This file type isn't supported. Use photos, PDF, Word, Excel, PowerPoint, CSV or text files.");
+        if (!(size > 0) || size > MAX_BYTES) return fail(res, 400, "Files can be up to 15 MB.");
+
+        const path = `${row.id}/${randomUUID()}.${ext}`;
+        const { data, error } = await supabase.storage.from(BUCKET).createSignedUploadUrl(path);
+        if (error) throw error;
+        res.json({ success: true, uploadUrl: data.signedUrl, path });
+    } catch (e) { fail(res, 500, e.message); }
+}
+
+function cleanAttachments(list, enquiryId) {
+    if (list == null) return [];
+    if (!Array.isArray(list) || list.length > MAX_FILES) return null;
+    const out = [];
+    for (const a of list) {
+        const path = typeof a?.path === "string" ? a.path : "";
+        if (!path.startsWith(`${enquiryId}/`) || path.includes("..") || path.length > 200) return null;
+        out.push({ path, name: str(a.name, 150) || "file", type: str(a.type, 100), size: Math.max(0, Math.min(Number(a.size) || 0, MAX_BYTES)) });
+    }
+    return out;
+}
+
+// ---- POST /sales/threads/:id/entries  { body, attachments } --------------------------------------------
+export async function addEntry(req, res) {
+    try {
+        const { actorId, actorName, ownerId } = getSalesActor(req);
+        const row = await loadOwnThread(req, res); if (!row) return;
+        if (row.status === "closed") return fail(res, 409, "This enquiry is closed. Reopen it to add updates.");
+
+        const body = str(req.body?.body, 4000);
+        const attachments = cleanAttachments(req.body?.attachments, row.id);
+        if (attachments === null) return fail(res, 400, "Attachments are invalid.");
+        if (!body && !attachments.length) return fail(res, 400, "Write an update or attach a file.");
+
+        const { data, error } = await supabase.from("sales_thread_entries")
+            .insert({ enquiry_id: row.id, author_id: actorId, author_name: actorName, kind: "note", body, attachments })
+            .select("*").single();
+        if (error) throw error;
+        await touch(row.id, clipPreview(body, attachments.length));
+        ping([ownerId, actorId], { enquiryId: row.id });
+        const [entry] = await hydrateEntries([data]);
+        res.json({ success: true, entry });
+    } catch (e) { fail(res, 500, e.message); }
+}
+
+// ---- GET /sales/threads/:id/products?q=&limit=&offset= -------------------------------------------------
+// The company's own products (unavailable ones carry a `reason`), with the price last quoted to THIS customer (by GST number).
+export async function listQuoteProducts(req, res) {
+    try {
+        res.set("Cache-Control", "no-store");
+        const { sellerId } = getSalesActor(req);
+        if (!sellerId) return fail(res, 409, NO_SELLER);
+        const row = await loadOwnThread(req, res); if (!row) return;
+
+        // console.log("row : ", row);
+
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
+        const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+        const q = safeSearch(req.query.q);
+
+        // console.log("listQuoteProducts", ownerId, row.id, "limit", limit, "offset", offset, "q", q);
+
+        let query = supabase.from("seller_product_submissions")
+            .select("*, hs_generic_product_brands!inner(id, name, brand_name, image, deleted_at)", { count: "exact" })
+            .eq("seller_id", sellerId).neq("review_status", "rejected")
+            .is("hs_generic_product_brands.deleted_at", null);
+        if (q) query = query.or(`product_name.ilike.%${q}%,brand_name.ilike.%${q}%`);
+
+        const { data, count, error } = await query.order("created_at", { ascending: false }).range(offset, offset + limit - 1);
+        // console.log("data", data);
+        // console.log("count", count);
+        // console.log("error", error);
+        if (error) throw error;
+        const subs = (data || []).map(({ hs_generic_product_brands, ...rest }) => ({ ...rest, brand: hs_generic_product_brands || null }));
+
+        const last = new Map();
+        if (row.customer_gstin && subs.length) {
+            const { data: cp, error: cErr } = await supabase.from("sales_customer_prices").select("submission_id, unit_price_incl")
+                .eq("seller_id", sellerId).eq("customer_gstin", row.customer_gstin).in("submission_id", subs.map((s) => s.id));
+            if (cErr) throw cErr;
+            for (const c of cp || []) last.set(c.submission_id, Number(c.unit_price_incl));
+        }
+
+        const items = subs.map((s) => {
+            const pack = Number(s.pack_size) > 0 ? Number(s.pack_size) : 1;
+            const master = Number(s.units_per_master_pack) > 0 ? Number(s.units_per_master_pack) : 1;
+            const list = Number(s.price) > 0 ? round4(Number(s.price) / saleUnits(pack, master)) : null;
+            return {
+                submissionId: s.id,
+                productName: s.brand?.name || s.product_name,
+                brandName: s.brand?.brand_name || s.brand_name || "",
+                image: s.image || s.brand?.image || null,
+                description: listingDescription(s),
+                unit: s.unit, packSize: pack, masterPackSize: master,
+                gstPercent: Number(s.gst_percent) || 0,
+                moq: s.moq != null ? Number(s.moq) : null,
+                listUnitPriceIncl: list,
+                lastUnitPriceIncl: last.get(s.id) ?? null,
+                unitMatches: sameUnit(s.unit, row.unit),
+                reason: listingProblem(s),   // "In review" / "Paused" / "Expired" ... or null when it can be quoted
+                url: productUrl(s.id),
+            };
+        });
+        res.json({ success: true, items, total: count ?? items.length, hasMore: offset + items.length < (count ?? 0) });
+    } catch (e) { fail(res, 500, e.message); }
+}
+
+// ---- delivery ------------------------------------------------------------------------------------------
+async function deliver({ quote, thread, sellerName, actorName, actorEmail, channels }) {
+    const items = quote.items;
+    const out = {};
+    const run = async (channel, fn) => {
+        try { out[channel] = await fn(); }
+        catch (e) { out[channel] = { status: "failed", error: errText(e), at: new Date().toISOString() }; }
+    };
+    const tasks = [];
+    if (channels.includes("whatsapp")) tasks.push(run("whatsapp", async () => {
+        const r = await sendSalesQuotationWhatsApp({
+            to: thread.customer_phone,
+            customerName: thread.customer_name || "there",
+            sellerName, enquiryProduct: thread.product_name,
+            itemsLine: whatsappItemsLine(items),
+            total: inr(quote.total), validUntil: fmtDate(quote.valid_until),
+            closing: quote.note || "Please get in touch with us to confirm your order.",
+        });
+        return r.success
+            ? { status: "sent", at: new Date().toISOString() }
+            : { status: "failed", error: r.skipped ? "WhatsApp isn't configured or the number is invalid." : errText(r.error), at: new Date().toISOString() };
+    }));
+    if (channels.includes("email")) tasks.push(run("email", async () => {
+        await sendSalesQuotationEmail({
+            to: thread.customer_email, customerName: thread.customer_name || "there",
+            sellerName, salespersonName: actorName, enquiryProduct: thread.product_name,
+            items, subtotal: quote.subtotal, gstAmount: quote.gst_amount, total: quote.total,
+            validUntil: fmtDate(quote.valid_until), note: quote.note || "", replyTo: actorEmail || undefined,
+        });
+        return { status: "sent", at: new Date().toISOString() };
+    }));
+    await Promise.all(tasks);
+    return out;
+}
+
+async function sellerNameOf(sellerId) {
+    const { data } = await supabase.from("seller_profiles").select("display_name").eq("id", sellerId).maybeSingle();
+    return data?.display_name || "Our team";
+}
+
+function contactCheck(thread, channels) {
+    if (!channels.length) return "Choose WhatsApp, email or both.";
+    if (channels.includes("whatsapp") && !thread.customer_phone) return "Add the customer's mobile number to send on WhatsApp.";
+    if (channels.includes("email") && !thread.customer_email) return "Add the customer's email address to send by email.";
+    return null;
+}
+
+const cleanChannels = (list) => [...new Set((Array.isArray(list) ? list : []).filter((c) => CHANNELS.includes(c)))];
+
+// ---- POST /sales/threads/:id/quotes --------------------------------------------------------------------
+// { items: [{ submissionId, quantity, price, gstInclusive }], channels, validityDays, note }
+export async function sendQuote(req, res) {
+    try {
+        const { actorId, actorName, actorEmail, ownerId, sellerId } = getSalesActor(req);
+        const thread = await loadOwnThread(req, res); if (!thread) return;
+        if (thread.status === "closed") return fail(res, 409, "This enquiry is closed. Reopen it to send a quotation.");
+        if (!sellerId) return fail(res, 409, NO_SELLER);
+
+        const b = req.body || {};
+        if (!thread.customer_gstin) return fail(res, 400, "Add the customer's GST number before sending a quotation.");
+        const channels = cleanChannels(b.channels);
+        const contactErr = contactCheck(thread, channels);
+        if (contactErr) return fail(res, 400, contactErr);
+
+        const validityDays = VALIDITY.includes(Number(b.validityDays)) ? Number(b.validityDays) : 7;
+        const raw = Array.isArray(b.items) ? b.items : [];
+        if (!raw.length || raw.length > 20) return fail(res, 400, "Add between 1 and 20 products.");
+        const ids = raw.map((i) => i?.submissionId);
+        if (ids.some((id) => !isUuid(id)) || new Set(ids).size !== ids.length) return fail(res, 400, "The product list is invalid.");
+
+        const { data: subs, error: sErr } = await supabase.from("seller_product_submissions")
+            .select("*, hs_generic_product_brands!inner(id, name, brand_name, image, deleted_at)")
+            .eq("seller_id", sellerId).in("id", ids).is("hs_generic_product_brands.deleted_at", null);
+        if (sErr) throw sErr;
+        const byId = new Map((subs || []).map(({ hs_generic_product_brands, ...r }) => [r.id, { ...r, brand: hs_generic_product_brands || null }]));
+
+        const items = [];
+        for (const r of raw) {
+            const s = byId.get(r.submissionId);
+            if (!s) return fail(res, 404, "One of the products is not in your company's catalog.");
+            const why = listingProblem(s);
+            if (why) return fail(res, 409, `"${s.brand?.name || s.product_name}" can't be quoted right now (${why.toLowerCase()}).`);
+            const price = Number(r.price), quantity = Number(r.quantity);
+            if (!(price > 0) || price > 1e7) return fail(res, 400, `Enter a valid price for ${s.brand?.name || s.product_name}.`);
+            if (!(quantity > 0) || quantity > 1e9) return fail(res, 400, `Enter a valid quantity for ${s.brand?.name || s.product_name}.`);
+            const gstPercent = Number(s.gst_percent) || 0;
+            const gstInclusive = r.gstInclusive !== false;
+            items.push({
+                submissionId: s.id, productName: s.brand?.name || s.product_name, brandName: s.brand?.brand_name || s.brand_name || "",
+                description: listingDescription(s), image: s.image || s.brand?.image || null, unit: s.unit,
+                quantity, gstPercent, gstInclusive, enteredPrice: price,
+                ...priceLine({ price, gstInclusive, gstPercent, quantity }),
+                url: productUrl(s.id),
+            });
+        }
+
+        const total = items.reduce((a, i) => a + i.totalIncl, 0);
+        const subtotal = items.reduce((a, i) => a + i.taxable, 0);
+        const validUntil = new Date(Date.now() + validityDays * 86400000).toISOString();
+
+        const { data: quote, error: qErr } = await supabase.from("sales_quotes").insert({
+            enquiry_id: thread.id, seller_id: sellerId, actor_id: actorId, actor_name: actorName,
+            customer_name: thread.customer_name, customer_gstin: thread.customer_gstin,
+            customer_phone: thread.customer_phone, customer_email: thread.customer_email,
+            items, subtotal: Math.round(subtotal * 100) / 100, total: Math.round(total * 100) / 100,
+            gst_amount: Math.round((total - subtotal) * 100) / 100,
+            note: str(b.note, 500) || null, validity_days: validityDays, valid_until: validUntil, channels,
+        }).select("*").single();
+        if (qErr) throw qErr;
+
+        // Remember this price for this customer's GST number (pre-filled next time).
+        const { error: pErr } = await supabase.from("sales_customer_prices").upsert(
+            items.map((i) => ({
+                seller_id: sellerId, customer_gstin: thread.customer_gstin, submission_id: i.submissionId,
+                unit_price_incl: i.unitPriceIncl, updated_by: actorId, updated_at: new Date().toISOString(),
+            })), { onConflict: "seller_id,customer_gstin,submission_id" });
+        if (pErr) console.error("[sales] customer price save failed:", pErr.message);
+
+        const { data: entryRow, error: eErr } = await supabase.from("sales_thread_entries").insert({
+            enquiry_id: thread.id, author_id: actorId, author_name: actorName, kind: "quote", quote_id: quote.id,
+            body: `Quotation sent · ${inr(quote.total)}`,
+        }).select("*").single();
+        if (eErr) throw eErr;
+
+        const delivery = await deliver({ quote, thread, sellerName: await sellerNameOf(sellerId), actorName, actorEmail, channels });
+        const { data: done } = await supabase.from("sales_quotes").update({ delivery }).eq("id", quote.id).select("*").single();
+        await touch(thread.id, `Quotation sent · ${inr(quote.total)}`);
+        ping([ownerId, actorId], { enquiryId: thread.id });
+
+        const okCount = Object.values(delivery).filter((d) => d.status === "sent").length;
+        res.json({
+            success: true, delivery,
+            quote: quoteDto(done || { ...quote, delivery }),
+            entry: entryDto(entryRow, quoteDto(done || { ...quote, delivery })),
+            message: okCount === channels.length ? "Quotation sent." : okCount ? "Quotation sent on some channels. Retry the others from the thread." : "Quotation saved, but it couldn't be delivered. Retry from the thread.",
+        });
+    } catch (e) { fail(res, 500, e.message); }
+}
+
+// ---- POST /sales/threads/:id/quotes/:quoteId/resend  { channels } --------------------------------------
+export async function resendQuote(req, res) {
+    try {
+        const { actorId, actorName, actorEmail, ownerId, sellerId } = getSalesActor(req);
+        const thread = await loadOwnThread(req, res); if (!thread) return;
+        if (!isUuid(req.params.quoteId)) return fail(res, 404, "Quotation not found.");
+        const { data: quote, error } = await supabase.from("sales_quotes").select("*")
+            .eq("id", req.params.quoteId).eq("enquiry_id", thread.id).maybeSingle();
+        if (error) throw error;
+        if (!quote) return fail(res, 404, "Quotation not found.");
+        if (new Date(quote.valid_until).getTime() <= Date.now()) return fail(res, 409, "This quotation has expired. Send a new one.");
+
+        const channels = cleanChannels(req.body?.channels);
+        const contactErr = contactCheck(thread, channels);
+        if (contactErr) return fail(res, 400, contactErr);
+
+        const sent = await deliver({ quote, thread, sellerName: await sellerNameOf(sellerId), actorName, actorEmail, channels });
+        const delivery = { ...(quote.delivery || {}), ...sent };
+        const merged = [...new Set([...(quote.channels || []), ...channels])];
+        const { data: upd, error: uErr } = await supabase.from("sales_quotes").update({ delivery, channels: merged }).eq("id", quote.id).select("*").single();
+        if (uErr) throw uErr;
+        await touch(thread.id, "Quotation resent");
+        ping([ownerId, actorId], { enquiryId: thread.id });
+        const failed = Object.values(sent).some((d) => d.status !== "sent");
+        res.json({ success: true, quote: quoteDto(upd), message: failed ? "Couldn't deliver on every channel." : "Quotation sent again." });
+    } catch (e) { fail(res, 500, e.message); }
+}

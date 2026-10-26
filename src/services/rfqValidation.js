@@ -115,6 +115,7 @@ export function toDto(row, { owner = false, admin = false } = {}) {
         creditDays: row.credit_days,
         deliveryCity: row.delivery_city,
         deliveryState: row.delivery_state,
+        source: row.source || "marketplace",
         supplierLocations: row.supplier_locations || [],
         consumptionType: row.consumption_type,
         recurringFrequency: row.recurring_frequency,
@@ -127,6 +128,12 @@ export function toDto(row, { owner = false, admin = false } = {}) {
         dto.deliveryPincode = row.delivery_pincode;
         dto.deliveryAddress = row.delivery_address || "";
         dto.reviewNote = row.review_note || "";
+        dto.customerName = row.customer_name || "";
+        dto.customerGstin = row.customer_gstin || "";
+        dto.customerPhone = row.customer_phone || "";
+        dto.customerEmail = row.customer_email || "";
+        dto.salespersonName = row.created_by_actor_name || "";
+        dto.lastActivityAt = row.last_activity_at || null;
         dto.reviewedAt = row.reviewed_at;
     }
     if (admin) {

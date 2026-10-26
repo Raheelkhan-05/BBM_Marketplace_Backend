@@ -34,7 +34,8 @@ async function loadQuotableEnquiry(id, sellerId) {
     if (!isUuid(id)) return { status: 404, message: "Enquiry not found." };
     const { data, error } = await supabase.from("rfq_enquiries").select("*").eq("id", id).maybeSingle();
     if (error) throw error;
-    if (!data || data.status !== "approved") return { status: 404, message: "This enquiry is no longer open for quotes." };
+    // if (!data || data.status !== "approved") return { status: 404, message: "This enquiry is no longer open for quotes." };
+    if (!data || data.status !== "approved" || data.visibility === "private") return { status: 404, message: "This enquiry is no longer open for quotes." };
     if (data.buyer_id === sellerId) return { status: 403, message: "You can't quote on your own enquiry." };
     return { enquiry: data };
 }
@@ -364,7 +365,8 @@ export async function listEnquiryQuotes(req, res) {
             const rows = (await fetchActiveQuotes([id])).get(id) || [];
             return res.json({ success: true, quotes: rows.map((q) => quoteToDto(q, enquiry, { forBuyer: true })) });
         }
-        if (enquiry.status !== "approved") return res.status(404).json({ success: false, message: "Enquiry not found." });
+        // if (enquiry.status !== "approved") return res.status(404).json({ success: false, message: "Enquiry not found." });
+        if (enquiry.status !== "approved" || enquiry.visibility === "private") return res.status(404).json({ success: false, message: "Enquiry not found." });
         const mine = (await fetchMyQuotes([id], [req.user.id, req.sellerId])).get(id);
         res.json({ success: true, quotes: mine ? [quoteToDto(mine, enquiry)] : [] });
     } catch (error) {

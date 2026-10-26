@@ -93,3 +93,33 @@ export async function sendOrderUpdateWhatsApp({ to, name, headline, detail, foot
         ],
     });
 }
+
+
+//
+// You must create this UTILITY template in Meta WhatsApp Manager, name: sales_quotation, language: English (en).
+// Body (7 variables, in this exact order):
+//
+//   Hello {{1}},
+//
+//   {{2}} has shared a quotation for your enquiry: {{3}}.
+//
+//   Items: {{4}}
+//
+//   Total (incl. GST): {{5}}
+//   Valid until: {{6}}
+//
+//   {{7}}
+//
+// Sample values for approval: Acme Traders / BBM Supplies / Stainless Steel Hinges / 1) Hinge 4 inch - 500 Kg x ₹2.47 = ₹1,235.00 - https://bbm.business/p/123 / ₹1,235.00 / 30 Oct 2026 / Please get in touch with us to confirm your order.
+// =====================================================================================================
+const SALES_QUOTE_TEMPLATE_NAME = "sales_quotation";
+
+export async function sendSalesQuotationWhatsApp({ to, customerName, sellerName, enquiryProduct, itemsLine, total, validUntil, closing }) {
+    const v = (x, fallback = "-") => String(x ?? "").replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").trim() || fallback;
+    return sendWhatsAppTemplate({
+        to,
+        templateName: SALES_QUOTE_TEMPLATE_NAME,
+        bodyParams: [v(customerName, "there"), v(sellerName), v(enquiryProduct), v(itemsLine), v(total), v(validUntil), v(closing)],
+    });
+}
+

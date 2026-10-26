@@ -3,6 +3,7 @@ import { supabase } from "../config/supabase.js";
 import { sanitizeEnquiry, toDto, isUuid, RFQ_STATUSES } from "../services/rfqValidation.js";
 import { notifyAdminsNewRfq } from "../services/rfqNotify.js";
 import { attachQuotes, countQuotesForBuyer } from "../services/rfqQuotes.service.js";
+import { attachSalesQuotes } from "../services/salesThreads.service.js";
 
 const MAX_BULK = 50;       // keep within express.json's default 100kb body limit, or raise that limit for this route
 const MAX_PENDING = 100;   // per-user cap on enquiries waiting for review
@@ -52,6 +53,7 @@ export async function listEnquiries(req, res) {
         } else {
             query = query
                 .eq("status", "approved")
+                .eq("visibility", "public")
                 .neq("buyer_id", req.user.id)
                 .order("published_at", { ascending: false });
         }
@@ -79,7 +81,8 @@ export async function listEnquiries(req, res) {
         if (quotesError) body.quotesError = quotesError; // visible in DevTools instead of silently empty
 
         if (scope === "mine") {
-            try { body.quotesTotal = await countQuotesForBuyer(req.user.id); } catch { /* tile falls back to a dash */ }
+            try { items = await attachSalesQuotes(items); }
+            catch (e) { console.error("[rfq] attachSalesQuotes failed:", e.message); }
         }
         res.json(body);
     } catch (error) {
@@ -98,7 +101,7 @@ export async function getEnquiry(req, res) {
 
         const userId = req.user?.id || null;
         const mine = !!userId && data?.buyer_id === userId;
-        const publicStatus = data && ["approved", "closed"].includes(data.status);
+        const publicStatus = data && ["approved", "closed"].includes(data.status) && data.visibility !== "private";
         if (!data || (!mine && !publicStatus)) {
             return res.status(404).json({ success: false, message: "Enquiry not found." });
         }
@@ -197,11 +200,11 @@ export async function updateOwnEnquiry(req, res) {
         if (!v.ok) return res.status(400).json({ success: false, message: v.message });
 
         const { data: current, error: curErr } = await supabase
-            .from("rfq_enquiries").select("id, status").eq("id", id).eq("buyer_id", req.user.id).maybeSingle();
+            .from("rfq_enquiries").select("id, status, source").eq("id", id).eq("buyer_id", req.user.id).maybeSingle();
         if (curErr) throw curErr;
         if (!current) return res.status(404).json({ success: false, message: "Enquiry not found." });
-        if (!["pending_review", "rejected"].includes(current.status)) {
-            return res.status(409).json({ success: false, message: "Live or closed enquiries can't be edited. Close it and post a new one." });
+        if (current.source === "sales") {
+            return res.status(409).json({ success: false, message: "This enquiry is managed by your salesperson in the Sales workspace." });
         }
 
         const { data, error } = await supabase

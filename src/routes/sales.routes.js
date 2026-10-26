@@ -4,6 +4,7 @@ import { requireSalesperson } from "../middleware/requireSalesperson.js";
 import { authWriteLimiter } from "../middleware/rateLimiter.js";
 import { getSummary, listMyCustomers, lookupCustomer, addCustomer } from "../controllers/sales.controller.js";
 import { listSalesEnquiries, createSalesEnquiry, updateSalesEnquiry, closeSalesEnquiry } from "../controllers/salesEnquiries.controller.js";
+import salesThreadRoutes from "./salesThreads.routes.js";
 
 const router = Router();
 router.use(requireAuth, requireSalesperson);
@@ -16,4 +17,6 @@ router.get("/enquiries", listSalesEnquiries);
 router.post("/enquiries", authWriteLimiter, createSalesEnquiry);
 router.patch("/enquiries/:id", authWriteLimiter, updateSalesEnquiry);
 router.post("/enquiries/:id/close", authWriteLimiter, closeSalesEnquiry);
+
+router.use("/threads", salesThreadRoutes);
 export default router;

@@ -185,3 +185,53 @@ export async function sendGstinReportUpdateEmail({ to, name, gstin, message }) {
   const result = await resend.emails.send({ from: FROM, to, subject: "Update on your GSTIN report", html });
   return throwIfResendError(result);
 }
+
+
+const inrMail = (n, max = 2) => "₹" + Number(n || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: max });
+const qtyMail = (n) => Number(n).toLocaleString("en-IN", { maximumFractionDigits: 4 });
+
+export async function sendSalesQuotationEmail({
+  to, customerName, sellerName, salespersonName, enquiryProduct,
+  items, subtotal, gstAmount, total, validUntil, note, replyTo,
+}) {
+  if (!to) return;
+  const rows = (items || []).map((i) => `
+    <div style="margin:0 0 12px;padding:12px 14px;border:1px solid #e5eaee;border-radius:12px;">
+      <div style="font-size:14px;font-weight:700;color:#0f172a;">${esc(i.productName)}${i.brandName ? ` <span style="font-weight:400;color:#64748b;">· ${esc(i.brandName)}</span>` : ""}</div>
+      ${i.description ? `<div style="margin-top:4px;font-size:12.5px;line-height:1.5;color:#64748b;">${esc(i.description)}</div>` : ""}
+      <div style="margin-top:8px;font-size:13px;color:#334155;">
+        ${esc(qtyMail(i.quantity))} ${esc(i.unit)} × ${esc(inrMail(i.unitPriceIncl, 4))} = <strong>${esc(inrMail(i.totalIncl))}</strong>
+        <span style="color:#94a3b8;">(incl. GST)</span>
+      </div>
+      <a href="${esc(i.url)}" style="display:inline-block;margin-top:8px;font-size:12.5px;font-weight:700;color:${BRAND_TEAL};text-decoration:none;">View product</a>
+    </div>`).join("");
+
+  const html = shell(
+    `Quotation for ${esc(enquiryProduct)}`,
+    `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
+       Hi ${esc(customerName || "there")}, ${esc(sellerName)} has shared a quotation for your enquiry
+       (${esc(enquiryProduct)})${salespersonName ? `, prepared by ${esc(salespersonName)}` : ""}.
+     </p>
+     ${rows}
+     <table role="presentation" width="100%" style="margin-top:6px;font-size:13px;color:#334155;">
+       <tr><td style="padding:3px 0;">Total before GST</td><td align="right">${esc(inrMail(subtotal))}</td></tr>
+       <tr><td style="padding:3px 0;">GST</td><td align="right">${esc(inrMail(gstAmount))}</td></tr>
+       <tr><td style="padding:6px 0 0;font-size:15px;font-weight:800;color:#0f172a;">Total (incl. GST)</td>
+           <td align="right" style="padding:6px 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(inrMail(total))}</td></tr>
+     </table>
+     <p style="margin:14px 0 0;font-size:12.5px;color:#64748b;">This quotation is valid until <strong>${esc(validUntil)}</strong>.</p>
+     ${note ? `<p style="margin:10px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;">${esc(note)}</p>` : ""}
+     <p style="margin:12px 0 0;font-size:12.5px;color:#64748b;">Reply to this email if you have any questions.</p>`,
+    "You're receiving this because a supplier prepared a quotation for your enquiry on BBM. If this wasn't meant for you, you can ignore this email."
+  );
+  const clean = (v) => String(v || "").replace(/[\r\n]+/g, " ");
+  const result = await resend.emails.send({
+    from: FROM,
+    to,
+    ...(replyTo ? { replyTo } : {}),   // older resend SDKs call this field reply_to
+    subject: `Quotation for ${clean(enquiryProduct)} from ${clean(sellerName)}`,
+    html,
+  });
+  return throwIfResendError(result);
+}
+
