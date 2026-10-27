@@ -7,6 +7,10 @@
 //    version stamps, so cached data is never stale after a change.
 //  - getThread pages entries with a (created_at, id) cursor: newest page first, `before` for older pages,
 //    `after` for a tiny "what's new" refresh (used by the live poll / socket).
+//
+// Outcomes: an enquiry is "open" (db status approved) or closed with sales_outcome "won" | "lost".
+// Product: an enquiry may be created with a product tagged from the company catalog (product_submission_id);
+// it is set once at creation and never editable afterwards.
 import { randomUUID } from "node:crypto";
 import { supabase } from "../config/supabase.js";
 import { isUuid, RFQ_UNITS } from "../services/rfqValidation.js";
@@ -14,7 +18,9 @@ import { sameUnit } from "../services/rfqQuotes.service.js";
 import { sendSalesQuotationWhatsApp } from "../services/whatsapp.service.js";
 import { sendSalesQuotationEmail } from "../services/mail.service.js";
 import { logActivity } from "../services/team.service.js";
+import { pingCustomersChanged } from "../services/salesSync.service.js";
 import { cached, getVer, bumpVer, hashKey } from "../services/cache.service.js";
+import { resolveGstin, addOne } from "./sellerCustomers.controller.js";
 import {
     BUCKET, GSTIN_RE, getSalesActor, str, safeSearch, cleanGstin, cleanPhone, cleanEmail, round4,
     saleUnits, priceLine, listingProblem, listingDescription, productUrl, clipPreview, ping,
@@ -36,16 +42,73 @@ const validText = (iso) => (new Date(iso).getUTCFullYear() >= 9000 ? "further no
 const VALIDITY = [1, 3, 7, 15, 30];
 const CHANNELS = ["whatsapp", "email"];
 const TS_RE = /^\d{4}-\d{2}-\d{2}T[\d:.]+(Z|[+-]\d{2}(:?\d{2})?)$/;
+const STATUS_FILTERS = ["open", "won", "lost", "reminder"];
+const REMINDER_MAX_MS = 366 * 24 * 60 * 60 * 1000;
+const REMINDER_TZ = "Asia/Kolkata";   // only used for the wording of the log line; the stored value is a UTC instant
+const remText = (iso) => new Date(iso).toLocaleString("en-IN", {
+    timeZone: REMINDER_TZ, day: "numeric", month: "short", hour: "numeric", minute: "2-digit", hour12: true,
+});
+
+const dtoOf = (row, extra) => ({
+    ...threadDto(row, extra),
+    outcome: row.sales_outcome || null,
+    productSubmissionId: row.product_submission_id || null,
+    reminderAt: row.reminder_at || null,
+});
+const SUB_SELECT = "*, hs_generic_product_brands!inner(id, name, brand_name, image, deleted_at)";
 
 const fail = (res, status, message) => res.status(status).json({ success: false, message });
 const oops = (res, e) => { console.error("[sales threads]", e?.message || e); return fail(res, 500, "Something went wrong. Please try again."); };
 const errText = (e) => String(e?.error?.error?.message || e?.error?.message || e?.message || e || "Failed").slice(0, 200);
 const NO_SELLER = "Your company's seller account isn't approved yet, so products can't be quoted.";
 
+
+const flatSub = ({ hs_generic_product_brands, ...rest }) => ({ ...rest, brand: hs_generic_product_brands || null });
+
 // A change happened: invalidate cached reads (this salesperson's list + this thread) and tell live pages.
 async function notify(ownerId, actorId, enquiryId) {
     await bumpVer(`sa:${actorId}`, enquiryId ? `st:${enquiryId}` : null);
     ping([ownerId, actorId], { enquiryId });
+}
+
+// The company name as the GST records / our customer list know it (more reliable than what was typed).
+async function canonicalCustomerName({ sellerId, ownerId, gstin }) {
+    if (!gstin || !GSTIN_RE.test(gstin)) return "";
+    try {
+        if (sellerId) {
+            const { data } = await supabase.from("seller_customers").select("business_name")
+                .eq("seller_id", sellerId).eq("gstin", gstin).limit(1).maybeSingle();
+            if (data?.business_name) return String(data.business_name).slice(0, 160);
+        }
+        const r = await resolveGstin(gstin, ownerId);
+        if ((r?.state === "registered" || r?.state === "unregistered") && r.name) return String(r.name).slice(0, 160);
+    } catch (e) { console.error("[sales threads] gst name lookup failed:", e?.message || e); }
+    return "";
+}
+
+// Adds the quoted customer to the salesperson's customer list (once). Never fails the quotation.
+async function ensureCustomer({ sellerId, companyId, actorId, teamId, thread }) {
+    try {
+        const out = await addOne(sellerId, companyId, thread.customer_gstin, "gst", {
+            assigned_to: actorId, assigned_by: actorId, assigned_kind: "self", assigned_at: new Date().toISOString(),
+            contact_name: null, contact_phone: thread.customer_phone || null, contact_email: thread.customer_email || null,
+        });
+        if (out?.result === "added" || out?.result === "saved") {
+            Promise.resolve(pingCustomersChanged(companyId, [actorId])).catch(() => { /* best effort */ });
+            try {
+                await logActivity({
+                    teamId, actorId, actorRole: "member", category: "sales", action: "sales.customer_added",
+                    label: `Added customer ${out.name} (from a quotation)`, entityType: "customer", entityId: out.customer?.id,
+                    meta: { link: "/grow/customers", gstin: out.gstin },
+                });
+            } catch { /* best effort */ }
+            return { status: "added", name: out.name || "" };
+        }
+        return { status: out?.result === "exists" ? "exists" : "skipped", name: "" };
+    } catch (e) {
+        console.error("[sales threads] add customer failed:", e?.message || e);
+        return { status: "failed", name: "" };
+    }
 }
 
 // ---- loading -------------------------------------------------------------------------------------------
@@ -66,10 +129,11 @@ async function loadOwnThread(req, res) {
 
 async function touch(enquiryId, preview) {
     await supabase.from("rfq_enquiries")
-        .update({ last_activity_at: new Date().toISOString(), last_entry_preview: preview }).eq("id", enquiryId);
+        .update({ last_activity_at: new Date().toISOString(), last_entry_preview: preview, reminder_at: null })
+        .eq("id", enquiryId);
 }
 
-// ---- GET /sales/threads --------------------------------------------------------------------------------
+// ---- GET /sales/threads?q=&status=open|won|lost&limit=&offset= ------------------------------------------
 export async function listThreads(req, res) {
     try {
         res.set("Cache-Control", "no-store");
@@ -77,7 +141,7 @@ export async function listThreads(req, res) {
         const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 15, 1), 100);
         const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
         const q = safeSearch(req.query.q);
-        const status = ["open", "closed"].includes(req.query.status) ? req.query.status : "";
+        const status = STATUS_FILTERS.includes(req.query.status) ? req.query.status : "";
 
         const ver = await getVer(`sa:${actorId}`);
         const body = await cached(`stl:${actorId}:${ver}:${hashKey([q, status, limit, offset])}`, 45, async () => {
@@ -86,14 +150,27 @@ export async function listThreads(req, res) {
 
             let query = scoped(supabase.from("rfq_enquiries").select("*", { count: "exact" }));
             if (status === "open") query = query.neq("status", "closed");
-            if (status === "closed") query = query.eq("status", "closed");
+            if (status === "won") query = query.eq("status", "closed").eq("sales_outcome", "won");
+            if (status === "lost") query = query.eq("status", "closed").eq("sales_outcome", "lost");
             if (q) query = query.or(`product_name.ilike.%${q}%,customer_name.ilike.%${q}%,customer_gstin.ilike.%${q}%`);
             query = query.order("last_activity_at", { ascending: false }).order("id", { ascending: true }).range(offset, offset + limit - 1);
 
-            // Tab counts are only needed with the first page.
-            const [list, all, open, closed] = await Promise.all([
+            if (status === "reminder") query = query.not("reminder_at", "is", null).neq("status", "closed");
+            // (keep the open / won / lost lines as they are)
+            if (q) query = query.or(`product_name.ilike.%${q}%,customer_name.ilike.%${q}%,customer_gstin.ilike.%${q}%`);
+            query = (status === "reminder"
+                ? query.order("reminder_at", { ascending: true })        // soonest first
+                : query.order("last_activity_at", { ascending: false })
+            ).order("id", { ascending: true }).range(offset, offset + limit - 1);
+
+            const first = offset === 0;
+            const [list, all, open, won, lost, rem] = await Promise.all([
                 query,
-                offset === 0 ? count() : null, offset === 0 ? count().neq("status", "closed") : null, offset === 0 ? count().eq("status", "closed") : null,
+                first ? count() : null,
+                first ? count().neq("status", "closed") : null,
+                first ? count().eq("status", "closed").eq("sales_outcome", "won") : null,
+                first ? count().eq("status", "closed").eq("sales_outcome", "lost") : null,
+                first ? count().neq("status", "closed").not("reminder_at", "is", null) : null,
             ]);
             if (list.error) throw list.error;
 
@@ -104,26 +181,84 @@ export async function listThreads(req, res) {
                 if (qErr) throw qErr;
                 for (const x of qs || []) qCount.set(x.enquiry_id, (qCount.get(x.enquiry_id) || 0) + 1);
             }
-            const items = rows.map((r) => threadDto(r, { quotesCount: qCount.get(r.id) || 0 }));
+            const items = rows.map((r) => dtoOf(r, { quotesCount: qCount.get(r.id) || 0 }));
 
             const out = {
                 success: true, items, total: list.count ?? items.length,
                 hasMore: offset + items.length < (list.count ?? 0),
             };
-            if (offset === 0) out.counts = { all: all?.count || 0, open: open?.count || 0, closed: closed?.count || 0 };
+            if (first) out.counts = { all: all?.count || 0, open: open?.count || 0, won: won?.count || 0, lost: lost?.count || 0, reminder: rem?.count || 0 };
             return out;
         });
         res.json(body);
     } catch (e) { oops(res, e); }
 }
 
+// ---- products (shared shape for the quote picker and the new-enquiry picker) ----------------------------
+function productItem(s, { unit, last, overrides, taggedId } = {}) {
+    const pack = Number(s.pack_size) > 0 ? Number(s.pack_size) : 1;
+    const master = Number(s.units_per_master_pack) > 0 ? Number(s.units_per_master_pack) : 1;
+    const list = Number(s.price) > 0 ? round4(Number(s.price) / saleUnits(pack, master)) : null;
+    return {
+        submissionId: s.id,
+        productName: s.brand?.name || s.product_name,
+        brandName: s.brand?.brand_name || s.brand_name || "",
+        image: s.image || s.brand?.image || null,
+        description: listingDescription(s),
+        unit: s.unit, packSize: pack, masterPackSize: master,
+        gstPercent: Number(s.gst_percent) || 0,
+        moq: s.moq != null ? Number(s.moq) : null,
+        listUnitPriceIncl: list,
+        lastUnitPriceIncl: last?.get(s.id) ?? null,
+        customUnitPriceIncl: overrides ? customUnitPriceOf(s, overrides.get(s.id)) : null,
+        unitMatches: unit ? sameUnit(s.unit, unit) : true,
+        reason: listingProblem(s),   // "In review" / "Paused" / "Expired" ... or null when it can be used
+        url: productUrl(s.id),
+        tagged: !!taggedId && s.id === taggedId,
+    };
+}
+
+function productQuery(sellerId, q) {
+    let query = supabase.from("seller_product_submissions")
+        .select(SUB_SELECT, { count: "exact" })
+        .eq("seller_id", sellerId).neq("review_status", "rejected")
+        .is("hs_generic_product_brands.deleted_at", null);
+    if (q) query = query.or(`product_name.ilike.%${q}%,brand_name.ilike.%${q}%`);
+    return query;
+}
+
+// ---- GET /sales/threads/products?q=&limit=&offset=  (company catalog, no thread needed) -----------------
+export async function listCatalogProducts(req, res) {
+    try {
+        res.set("Cache-Control", "no-store");
+        const { sellerId } = getSalesActor(req);
+        if (!sellerId) return fail(res, 409, NO_SELLER);
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 8, 1), 50);
+        const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+        const q = safeSearch(req.query.q);
+
+        const body = await cached(`stc:${sellerId}:${hashKey([q, limit, offset])}`, 20, async () => {
+            const { data, count, error } = await productQuery(sellerId, q)
+                .order("created_at", { ascending: false }).range(offset, offset + limit - 1);
+            if (error) throw error;
+            const items = (data || []).map((r) => productItem(flatSub(r)));
+            return {
+                success: true, items, total: count ?? items.length,
+                hasMore: offset + items.length < (count ?? 0), nextOffset: offset + items.length,
+            };
+        });
+        res.json(body);
+    } catch (e) { oops(res, e); }
+}
+
 // ---- POST /sales/threads -------------------------------------------------------------------------------
+// { customerGstin?, customerName?, customerPhone?, customerEmail?, productSubmissionId? | productName, quantity, unit, specifications? }
 export async function createThread(req, res) {
     try {
-        const { actorId, actorName, ownerId } = getSalesActor(req);
+        const { actorId, actorName, ownerId, sellerId } = getSalesActor(req);
         const b = req.body || {};
 
-        const customerName = str(b.customerName, 160);
+        let customerName = str(b.customerName, 160);
         const gstin = cleanGstin(b.customerGstin);
         if (gstin && !GSTIN_RE.test(gstin)) return fail(res, 400, "Enter a valid 15-character GST number, or leave it empty.");
         if (!customerName && !gstin) return fail(res, 400, "Enter the customer's GST number or company name.");
@@ -134,18 +269,41 @@ export async function createThread(req, res) {
         if (phoneRaw && !phone) return fail(res, 400, "Enter a valid 10-digit mobile number.");
         if (emailRaw && !email) return fail(res, 400, "Enter a valid email address.");
 
-        const productName = str(b.productName, 200);
+        // Product: tagged from the company catalog, or typed by hand.
+        let product = null;
+        if (b.productSubmissionId) {
+            if (!isUuid(b.productSubmissionId)) return fail(res, 400, "The selected product is invalid.");
+            if (!sellerId) return fail(res, 409, NO_SELLER);
+            const { data: sub, error: sErr } = await supabase.from("seller_product_submissions").select(SUB_SELECT)
+                .eq("seller_id", sellerId).eq("id", b.productSubmissionId).neq("review_status", "rejected")
+                .is("hs_generic_product_brands.deleted_at", null).maybeSingle();
+            if (sErr) throw sErr;
+            if (!sub) return fail(res, 404, "This product isn't in your company's catalog.");
+            product = flatSub(sub);
+            const why = listingProblem(product);
+            if (why) return fail(res, 409, `"${product.brand?.name || product.product_name}" can't be used right now (${why.toLowerCase()}).`);
+        }
+        const productName = product ? (product.brand?.name || product.product_name) : str(b.productName, 200);
         if (productName.length < 2) return fail(res, 400, "Product name must be at least 2 characters.");
+
         const quantity = Number(b.quantity);
         if (!(quantity > 0) || quantity > 1e9) return fail(res, 400, "Enter a valid quantity.");
-        if (!RFQ_UNITS.includes(b.unit)) return fail(res, 400, "Select a valid unit.");
+        const unit = product && RFQ_UNITS.includes(product.unit) ? product.unit : b.unit;
+        if (!RFQ_UNITS.includes(unit)) return fail(res, 400, "Select a valid unit.");
+
+        // The company name always comes from the GST number when it can be found.
+        if (gstin) {
+            const official = await canonicalCustomerName({ sellerId, ownerId, gstin });
+            if (official) customerName = official;
+        }
 
         const now = new Date().toISOString();
         const { data, error } = await supabase.from("rfq_enquiries").insert({
             buyer_id: ownerId,                       // belongs to the company, so the team sees it on the Save page
             source: "sales", visibility: "private",  // never listed publicly
             status: "approved", published_at: now,   // no admin review: it is not shown to suppliers
-            product_name: productName, quantity, unit: b.unit, pack_size: 1,
+            product_name: productName, product_submission_id: product?.id || null,
+            quantity, unit, pack_size: 1,
             specifications: str(b.specifications, 2000) || null,
             accept_equivalent: false, images: [], supplier_locations: [],
             payment_terms: "flexible", consumption_type: "one_time",
@@ -158,11 +316,11 @@ export async function createThread(req, res) {
 
         await supabase.from("sales_thread_entries").insert({
             enquiry_id: data.id, author_id: actorId, author_name: actorName, kind: "system",
-            body: `Enquiry created: ${productName} · ${quantity} ${b.unit}`,
+            body: `Enquiry created: ${productName} · ${quantity} ${unit}`,
         });
 
         await notify(ownerId, actorId, data.id);
-        res.json({ success: true, thread: threadDto(data, { quotesCount: 0 }), message: "Enquiry created." });
+        res.json({ success: true, thread: dtoOf(data, { quotesCount: 0 }), message: "Enquiry created." });
     } catch (e) { oops(res, e); }
 }
 
@@ -193,7 +351,7 @@ export async function getThread(req, res) {
                     quotesQ,
                 ]);
                 if (list.error) throw list.error;
-                const thread = threadDto(row, { quotesCount: qc.count || 0 });
+                const thread = dtoOf(row, { quotesCount: qc.count || 0 });
                 const data = list.data || [];
                 if (data.length > AFTER_MAX) return { success: true, thread, entries: [], reset: true };
                 return { success: true, thread, entries: await hydrateEntries(data) };
@@ -212,7 +370,7 @@ export async function getThread(req, res) {
             const hasOlder = data.length > limit;
             const page = data.slice(0, limit).reverse();
             return {
-                success: true, thread: threadDto(row, { quotesCount: qc.count || 0 }),
+                success: true, thread: dtoOf(row, { quotesCount: qc.count || 0 }),
                 entries: await hydrateEntries(page), hasOlder,
             };
         });
@@ -220,10 +378,10 @@ export async function getThread(req, res) {
     } catch (e) { oops(res, e); }
 }
 
-// ---- PATCH /sales/threads/:id  (customer details) ------------------------------------------------------
+// ---- PATCH /sales/threads/:id  (customer details only; the product is locked after creation) ------------
 export async function updateThread(req, res) {
     try {
-        const { actorId, ownerId } = getSalesActor(req);
+        const { actorId, ownerId, sellerId } = getSalesActor(req);
         const row = await loadOwnThread(req, res); if (!row) return;
         const b = req.body || {};
         const patch = {};
@@ -246,6 +404,12 @@ export async function updateThread(req, res) {
         }
         if (!Object.keys(patch).length) return fail(res, 400, "Nothing to update.");
 
+        // A new GST number: take the company name from the GST records instead of what was typed.
+        if (patch.customer_gstin && patch.customer_gstin !== row.customer_gstin) {
+            const official = await canonicalCustomerName({ sellerId, ownerId, gstin: patch.customer_gstin });
+            if (official) patch.customer_name = official;
+        }
+
         const name = "customer_name" in patch ? patch.customer_name : row.customer_name;
         const gst = "customer_gstin" in patch ? patch.customer_gstin : row.customer_gstin;
         if (!name && !gst) return fail(res, 400, "Keep either the company name or the GST number.");
@@ -253,28 +417,73 @@ export async function updateThread(req, res) {
         const { data, error } = await supabase.from("rfq_enquiries").update(patch).eq("id", row.id).select("*").single();
         if (error) throw error;
         await notify(ownerId, actorId, row.id);
-        res.json({ success: true, thread: threadDto(data) });
+        res.json({ success: true, thread: dtoOf(data) });
     } catch (e) { oops(res, e); }
 }
 
-// ---- PATCH /sales/threads/:id/status  { status: "open" | "closed" } ------------------------------------
+// ---- PATCH /sales/threads/:id/status  { status: "open" | "won" | "lost" } ------------------------------
 export async function setThreadStatus(req, res) {
     try {
         const { actorId, actorName, ownerId } = getSalesActor(req);
         const row = await loadOwnThread(req, res); if (!row) return;
         const next = req.body?.status;
-        if (!["open", "closed"].includes(next)) return fail(res, 400, "Invalid status.");
-        const dbStatus = next === "closed" ? "closed" : "approved";
-        if (row.status === dbStatus) return res.json({ success: true, thread: threadDto(row) });
+        if (!["open", "won", "lost"].includes(next)) return fail(res, 400, "Invalid status.");
+        const dbStatus = next === "open" ? "approved" : "closed";
+        const outcome = next === "open" ? null : next;
+        if (row.status === dbStatus && (row.sales_outcome || null) === outcome) return res.json({ success: true, thread: dtoOf(row) });
 
-        const body = next === "closed" ? "Enquiry closed" : "Enquiry reopened";
+        const body = next === "won" ? "Enquiry marked as won" : next === "lost" ? "Enquiry marked as lost" : "Enquiry reopened";
         const { data, error } = await supabase.from("rfq_enquiries")
-            .update({ status: dbStatus, last_activity_at: new Date().toISOString(), last_entry_preview: body })
+            // .update({ status: dbStatus, sales_outcome: outcome, last_activity_at: new Date().toISOString(), last_entry_preview: body })
+            .update({ status: dbStatus, sales_outcome: outcome, reminder_at: null, last_activity_at: new Date().toISOString(), last_entry_preview: body })
             .eq("id", row.id).select("*").single();
         if (error) throw error;
         await supabase.from("sales_thread_entries").insert({ enquiry_id: row.id, author_id: actorId, author_name: actorName, kind: "system", body });
         await notify(ownerId, actorId, row.id);
-        res.json({ success: true, thread: threadDto(data) });
+        res.json({ success: true, thread: dtoOf(data) });
+    } catch (e) { oops(res, e); }
+}
+
+// ---- PATCH /sales/threads/:id/reminder  { reminderAt: ISO string | null } ------------------------------
+// The client works out "9:00 AM when no time is given" in the user's own timezone and sends the final instant.
+export async function setReminder(req, res) {
+    try {
+        const { actorId, actorName, ownerId } = getSalesActor(req);
+        const row = await loadOwnThread(req, res); if (!row) return;
+        if (row.status === "closed") return fail(res, 409, "Reopen this enquiry to set a reminder.");
+        const raw = req.body?.reminderAt;
+        const now = Date.now();
+
+        // cancel
+        if (raw === null) {
+            if (!row.reminder_at) return res.json({ success: true, thread: dtoOf(row) });
+            const { data, error } = await supabase.from("rfq_enquiries").update({ reminder_at: null }).eq("id", row.id).select("*").single();
+            if (error) throw error;
+            await supabase.from("sales_thread_entries").insert({
+                enquiry_id: row.id, author_id: actorId, author_name: actorName, kind: "system", body: "Reminder removed",
+            });
+            await notify(ownerId, actorId, row.id);
+            return res.json({ success: true, thread: dtoOf(data) });
+        }
+
+        // set / change
+        if (typeof raw !== "string" || !TS_RE.test(raw)) return fail(res, 400, "Choose a valid date and time.");
+        const at = new Date(raw).getTime();
+        if (Number.isNaN(at)) return fail(res, 400, "Choose a valid date and time.");
+        if (at <= now) return fail(res, 400, "The reminder must be set for a future date and time.");
+        if (at > now + REMINDER_MAX_MS) return fail(res, 400, "Reminders can be set up to a year ahead.");
+
+        const iso = new Date(at).toISOString();
+        const body = `Reminder set for ${remText(iso)}`;
+        const { data, error } = await supabase.from("rfq_enquiries")
+            .update({ reminder_at: iso, last_activity_at: new Date().toISOString(), last_entry_preview: body })
+            .eq("id", row.id).select("*").single();
+        if (error) throw error;
+        await supabase.from("sales_thread_entries").insert({
+            enquiry_id: row.id, author_id: actorId, author_name: actorName, kind: "system", body,
+        });
+        await notify(ownerId, actorId, row.id);
+        res.json({ success: true, thread: dtoOf(data) });
     } catch (e) { oops(res, e); }
 }
 
@@ -334,7 +543,8 @@ export async function addEntry(req, res) {
 // ---- GET /sales/threads/:id/products?q=&limit=&offset= -------------------------------------------------
 // The company's own products (unavailable ones carry a `reason`), with the price last quoted to THIS customer (by GST number)
 // and, when the customer is a BBM buyer, the custom price they currently have on each product.
-// Cached for a short time per thread version: sending a quote or editing the customer bumps the version.
+// The product tagged on the enquiry (if any) is put first on the first page and flagged `tagged`.
+// `nextOffset` is the offset of the next database page (the tagged product may be an extra row on top of the page).
 export async function listQuoteProducts(req, res) {
     try {
         res.set("Cache-Control", "no-store");
@@ -345,21 +555,29 @@ export async function listQuoteProducts(req, res) {
         const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
         const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
         const q = safeSearch(req.query.q);
+        const taggedId = row.product_submission_id || null;
 
         const ver = await getVer(`st:${row.id}`);
         const body = await cached(`stp:${sellerId}:${row.id}:${ver}:${hashKey([q, limit, offset])}`, 20, async () => {
-            let query = supabase.from("seller_product_submissions")
-                .select("*, hs_generic_product_brands!inner(id, name, brand_name, image, deleted_at)", { count: "exact" })
-                .eq("seller_id", sellerId).neq("review_status", "rejected")
-                .is("hs_generic_product_brands.deleted_at", null);
-            if (q) query = query.or(`product_name.ilike.%${q}%,brand_name.ilike.%${q}%`);
-
-            const { data, count, error } = await query.order("created_at", { ascending: false }).range(offset, offset + limit - 1);
+            const { data, count, error } = await productQuery(sellerId, q)
+                .order("created_at", { ascending: false }).range(offset, offset + limit - 1);
             if (error) throw error;
-            const subs = (data || []).map(({ hs_generic_product_brands, ...rest }) => ({ ...rest, brand: hs_generic_product_brands || null }));
+            const dbRows = (data || []).length;
+            const subs = (data || []).map(flatSub);
+
+            if (taggedId && offset === 0 && !q) {
+                const at = subs.findIndex((s) => s.id === taggedId);
+                if (at > 0) subs.unshift(...subs.splice(at, 1));
+                else if (at < 0) {
+                    const { data: t, error: tErr } = await supabase.from("seller_product_submissions").select(SUB_SELECT)
+                        .eq("seller_id", sellerId).eq("id", taggedId).neq("review_status", "rejected")
+                        .is("hs_generic_product_brands.deleted_at", null).maybeSingle();
+                    if (tErr) throw tErr;
+                    if (t) subs.unshift(flatSub(t));
+                }
+            }
             const subIds = subs.map((s) => s.id);
 
-            // Is the customer a BBM buyer? (null = unknown: no GST number on the enquiry yet)
             const lastP = (async () => {
                 const m = new Map();
                 if (!row.customer_gstin || !subIds.length) return m;
@@ -369,6 +587,7 @@ export async function listQuoteProducts(req, res) {
                 for (const c of cp || []) m.set(c.submission_id, Number(c.unit_price_incl));
                 return m;
             })();
+            // Is the customer a BBM buyer? (null = unknown: no GST number on the enquiry yet)
             const buyerP = (async () => {
                 if (!row.customer_gstin) return { buyer: null, overrides: new Map() };
                 try {
@@ -382,28 +601,11 @@ export async function listQuoteProducts(req, res) {
             })();
             const [last, { buyer, overrides }] = await Promise.all([lastP, buyerP]);
 
-            const items = subs.map((s) => {
-                const pack = Number(s.pack_size) > 0 ? Number(s.pack_size) : 1;
-                const master = Number(s.units_per_master_pack) > 0 ? Number(s.units_per_master_pack) : 1;
-                const list = Number(s.price) > 0 ? round4(Number(s.price) / saleUnits(pack, master)) : null;
-                return {
-                    submissionId: s.id,
-                    productName: s.brand?.name || s.product_name,
-                    brandName: s.brand?.brand_name || s.brand_name || "",
-                    image: s.image || s.brand?.image || null,
-                    description: listingDescription(s),
-                    unit: s.unit, packSize: pack, masterPackSize: master,
-                    gstPercent: Number(s.gst_percent) || 0,
-                    moq: s.moq != null ? Number(s.moq) : null,
-                    listUnitPriceIncl: list,
-                    lastUnitPriceIncl: last.get(s.id) ?? null,
-                    customUnitPriceIncl: customUnitPriceOf(s, overrides.get(s.id)),
-                    unitMatches: sameUnit(s.unit, row.unit),
-                    reason: listingProblem(s),   // "In review" / "Paused" / "Expired" ... or null when it can be quoted
-                    url: productUrl(s.id),
-                };
-            });
-            return { success: true, items, buyer, total: count ?? items.length, hasMore: offset + items.length < (count ?? 0) };
+            const items = subs.map((s) => productItem(s, { unit: row.unit, last, overrides, taggedId }));
+            return {
+                success: true, items, buyer, total: count ?? items.length,
+                hasMore: offset + dbRows < (count ?? 0), nextOffset: offset + dbRows,
+            };
         });
         res.json(body);
     } catch (e) { oops(res, e); }
@@ -461,17 +663,18 @@ const cleanChannels = (list) => [...new Set((Array.isArray(list) ? list : []).fi
 // ---- POST /sales/threads/:id/quotes --------------------------------------------------------------------
 // { items: [{ submissionId, quantity, price, gstInclusive, setCustomPrice }], channels, validityDays, note }
 // setCustomPrice === true also stores the quoted price as this buyer's custom price on BBM (when the customer is a BBM buyer).
+// The customer is added to the salesperson's customer list on the first quotation (if not already there).
 export async function sendQuote(req, res) {
     try {
         const { actorId, actorName, actorEmail, ownerId, sellerId } = getSalesActor(req);
-        const thread = await loadOwnThread(req, res); if (!thread) return;
-        if (thread.status === "closed") return fail(res, 409, "This enquiry is closed. Reopen it to send a quotation.");
+        const loaded = await loadOwnThread(req, res); if (!loaded) return;
+        if (loaded.status === "closed") return fail(res, 409, "This enquiry is closed. Reopen it to send a quotation.");
         if (!sellerId) return fail(res, 409, NO_SELLER);
 
         const b = req.body || {};
-        if (!thread.customer_gstin) return fail(res, 400, "Add the customer's GST number before sending a quotation.");
+        if (!loaded.customer_gstin) return fail(res, 400, "Add the customer's GST number before sending a quotation.");
         const channels = cleanChannels(b.channels);
-        const contactErr = contactCheck(thread, channels);
+        const contactErr = contactCheck(loaded, channels);
         if (contactErr) return fail(res, 400, contactErr);
 
         const validityDays = VALIDITY.includes(Number(b.validityDays)) ? Number(b.validityDays) : 7;
@@ -482,10 +685,10 @@ export async function sendQuote(req, res) {
 
         // Always read products fresh here (never from cache): this is the price/availability check that matters.
         const { data: subs, error: sErr } = await supabase.from("seller_product_submissions")
-            .select("*, hs_generic_product_brands!inner(id, name, brand_name, image, deleted_at)")
+            .select(SUB_SELECT)
             .eq("seller_id", sellerId).in("id", ids).is("hs_generic_product_brands.deleted_at", null);
         if (sErr) throw sErr;
-        const byId = new Map((subs || []).map(({ hs_generic_product_brands, ...r }) => [r.id, { ...r, brand: hs_generic_product_brands || null }]));
+        const byId = new Map((subs || []).map((r) => { const s = flatSub(r); return [s.id, s]; }));
 
         const items = [];
         for (const r of raw) {
@@ -506,6 +709,16 @@ export async function sendQuote(req, res) {
                 url: productUrl(s.id),
                 setCustomPrice: r.setCustomPrice === true,
             });
+        }
+
+        // Make sure the customer is in the customer list. addOne also resolves the official company name from the GST number,
+        // which then replaces whatever was typed (so the quotation and the thread carry the reliable name).
+        const companyId = req.sales?.companyId ?? ownerId;
+        const ensured = await ensureCustomer({ sellerId, companyId, actorId, teamId: req.sales?.teamId, thread: loaded });
+        let thread = loaded;   // a copy: the loaded row may come from the shared cache and must not be mutated
+        if (ensured.name && ensured.name !== loaded.customer_name) {
+            thread = { ...loaded, customer_name: ensured.name };
+            await supabase.from("rfq_enquiries").update({ customer_name: ensured.name }).eq("id", loaded.id);
         }
 
         const total = items.reduce((a, i) => a + i.totalIncl, 0);
@@ -559,6 +772,7 @@ export async function sendQuote(req, res) {
         const okCount = Object.values(delivery).filter((d) => d.status === "sent").length;
         res.json({
             success: true, delivery, customPricing,
+            customerAdded: ensured.status === "added" ? (ensured.name || thread.customer_name || "The customer") : null,
             quote: quoteDto(done || { ...quote, delivery }),
             entry: entryDto(entryRow, quoteDto(done || { ...quote, delivery })),
             message: okCount === channels.length ? "Quotation sent." : okCount ? "Quotation sent on some channels. Retry the others from the thread." : "Quotation saved, but it couldn't be delivered. Retry from the thread.",

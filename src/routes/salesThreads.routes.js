@@ -1,16 +1,10 @@
 // routes/salesThreads.routes.js
-// Mount this INSIDE your existing sales router so it inherits the auth + salesperson guards that router already applies:
-//
-//   // routes/sales.routes.js  (after the existing router.use(requireAuth, <your sales guard>) line)
-//   import salesThreadRoutes from "./salesThreads.routes.js";
-//   router.use("/threads", salesThreadRoutes);
-//
-// Every handler is scoped to the calling salesperson (see getSalesActor in services/salesThreads.service.js).
+// Mounted inside the sales router (inherits requireAuth + requireSalesperson).
 import { Router } from "express";
 import { authWriteLimiter } from "../middleware/rateLimiter.js";
 import {
-    listThreads, createThread, getThread, updateThread, setThreadStatus,
-    signAttachment, addEntry, listQuoteProducts, sendQuote, resendQuote,
+    listThreads, createThread, getThread, updateThread, setThreadStatus, setReminder,
+    signAttachment, addEntry, listQuoteProducts, listCatalogProducts, sendQuote, resendQuote,
 } from "../controllers/salesThreads.controller.js";
 
 const router = Router();
@@ -18,9 +12,13 @@ const router = Router();
 router.get("/", listThreads);
 router.post("/", authWriteLimiter, createThread);
 
+// Must stay above "/:id" so "products" is never read as a thread id.
+router.get("/products", listCatalogProducts);
+
 router.get("/:id", getThread);
 router.patch("/:id", authWriteLimiter, updateThread);
 router.patch("/:id/status", authWriteLimiter, setThreadStatus);
+router.patch("/:id/reminder", authWriteLimiter, setReminder);
 
 router.post("/:id/attachments/sign", authWriteLimiter, signAttachment);
 router.post("/:id/entries", authWriteLimiter, addEntry);
