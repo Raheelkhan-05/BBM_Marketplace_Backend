@@ -1,39 +1,67 @@
 // controllers/salesThreads.controller.js
 // A salesperson's private enquiry threads: create, log notes + files, send quotations (WhatsApp / email).
 // Every query is scoped to the CALLING salesperson, so other salespeople of the same team never see a thread.
+//
+// Speed notes:
+//  - Reads go through cache.service (Redis if REDIS_URL is set, else memory). Writers call notify(), which bumps
+//    version stamps, so cached data is never stale after a change.
+//  - getThread pages entries with a (created_at, id) cursor: newest page first, `before` for older pages,
+//    `after` for a tiny "what's new" refresh (used by the live poll / socket).
 import { randomUUID } from "node:crypto";
 import { supabase } from "../config/supabase.js";
 import { isUuid, RFQ_UNITS } from "../services/rfqValidation.js";
 import { sameUnit } from "../services/rfqQuotes.service.js";
 import { sendSalesQuotationWhatsApp } from "../services/whatsapp.service.js";
 import { sendSalesQuotationEmail } from "../services/mail.service.js";
+import { logActivity } from "../services/team.service.js";
+import { cached, getVer, bumpVer, hashKey } from "../services/cache.service.js";
 import {
     BUCKET, GSTIN_RE, getSalesActor, str, safeSearch, cleanGstin, cleanPhone, cleanEmail, round4,
     saleUnits, priceLine, listingProblem, listingDescription, productUrl, clipPreview, ping,
     threadDto, entryDto, quoteDto, hydrateEntries, inr, fmtDate, whatsappItemsLine,
 } from "../services/salesThreads.service.js";
+import {
+    findBuyerCompanyByGstin, fetchBuyerOverrides, customUnitPriceOf, syncQuoteCustomPrices,
+} from "../services/salesQuotePricing.service.js";
 
-const ENTRY_PAGE = 60;
+const ENTRY_PAGE = 20;          // default entries per page (newest first)
+const ENTRY_PAGE_MAX = 50;
+const AFTER_MAX = 100;          // more new entries than this -> tell the client to reload instead
 const MAX_FILES = 10;
 const MAX_BYTES = 15 * 1024 * 1024;
 const ALLOWED_EXT = new Set(["jpg", "jpeg", "png", "webp", "gif", "heic", "pdf", "doc", "docx", "xls", "xlsx", "csv", "txt", "ppt", "pptx"]);
+// Quotations never expire for now. Stored as a far-future date so the existing expiry checks keep working.
+const NO_EXPIRY = "9999-12-31T23:59:59.000Z";
+const validText = (iso) => (new Date(iso).getUTCFullYear() >= 9000 ? "further notice" : fmtDate(iso));
 const VALIDITY = [1, 3, 7, 15, 30];
 const CHANNELS = ["whatsapp", "email"];
+const TS_RE = /^\d{4}-\d{2}-\d{2}T[\d:.]+(Z|[+-]\d{2}(:?\d{2})?)$/;
 
 const fail = (res, status, message) => res.status(status).json({ success: false, message });
+const oops = (res, e) => { console.error("[sales threads]", e?.message || e); return fail(res, 500, "Something went wrong. Please try again."); };
 const errText = (e) => String(e?.error?.error?.message || e?.error?.message || e?.message || e || "Failed").slice(0, 200);
 const NO_SELLER = "Your company's seller account isn't approved yet, so products can't be quoted.";
+
+// A change happened: invalidate cached reads (this salesperson's list + this thread) and tell live pages.
+async function notify(ownerId, actorId, enquiryId) {
+    await bumpVer(`sa:${actorId}`, enquiryId ? `st:${enquiryId}` : null);
+    ping([ownerId, actorId], { enquiryId });
+}
 
 // ---- loading -------------------------------------------------------------------------------------------
 async function loadOwnThread(req, res) {
     const { actorId, ownerId } = getSalesActor(req);
     const { id } = req.params;
     if (!isUuid(id)) { fail(res, 404, "Enquiry not found."); return null; }
-    const { data, error } = await supabase.from("rfq_enquiries").select("*")
-        .eq("id", id).eq("source", "sales").eq("created_by_actor_id", actorId).eq("buyer_id", ownerId).maybeSingle();
-    if (error) throw error;
-    if (!data) { fail(res, 404, "Enquiry not found."); return null; }
-    return data;
+    const ver = await getVer(`st:${id}`);
+    const row = await cached(`sto:${id}:${actorId}:${ver}`, 60, async () => {
+        const { data, error } = await supabase.from("rfq_enquiries").select("*")
+            .eq("id", id).eq("source", "sales").eq("created_by_actor_id", actorId).eq("buyer_id", ownerId).maybeSingle();
+        if (error) throw error;
+        return data || null;
+    });
+    if (!row) { fail(res, 404, "Enquiry not found."); return null; }
+    return row;
 }
 
 async function touch(enquiryId, preview) {
@@ -51,35 +79,42 @@ export async function listThreads(req, res) {
         const q = safeSearch(req.query.q);
         const status = ["open", "closed"].includes(req.query.status) ? req.query.status : "";
 
-        const scoped = (qb) => qb.eq("source", "sales").eq("created_by_actor_id", actorId).eq("buyer_id", ownerId);
-        const count = () => scoped(supabase.from("rfq_enquiries").select("id", { count: "exact", head: true }));
+        const ver = await getVer(`sa:${actorId}`);
+        const body = await cached(`stl:${actorId}:${ver}:${hashKey([q, status, limit, offset])}`, 45, async () => {
+            const scoped = (qb) => qb.eq("source", "sales").eq("created_by_actor_id", actorId).eq("buyer_id", ownerId);
+            const count = () => scoped(supabase.from("rfq_enquiries").select("id", { count: "exact", head: true }));
 
-        let query = scoped(supabase.from("rfq_enquiries").select("*", { count: "exact" }));
-        if (status === "open") query = query.neq("status", "closed");
-        if (status === "closed") query = query.eq("status", "closed");
-        if (q) query = query.or(`product_name.ilike.%${q}%,customer_name.ilike.%${q}%,customer_gstin.ilike.%${q}%`);
+            let query = scoped(supabase.from("rfq_enquiries").select("*", { count: "exact" }));
+            if (status === "open") query = query.neq("status", "closed");
+            if (status === "closed") query = query.eq("status", "closed");
+            if (q) query = query.or(`product_name.ilike.%${q}%,customer_name.ilike.%${q}%,customer_gstin.ilike.%${q}%`);
+            query = query.order("last_activity_at", { ascending: false }).order("id", { ascending: true }).range(offset, offset + limit - 1);
 
-        const [list, all, open, closed] = await Promise.all([
-            query.order("last_activity_at", { ascending: false }).range(offset, offset + limit - 1),
-            count(), count().neq("status", "closed"), count().eq("status", "closed"),
-        ]);
-        if (list.error) throw list.error;
+            // Tab counts are only needed with the first page.
+            const [list, all, open, closed] = await Promise.all([
+                query,
+                offset === 0 ? count() : null, offset === 0 ? count().neq("status", "closed") : null, offset === 0 ? count().eq("status", "closed") : null,
+            ]);
+            if (list.error) throw list.error;
 
-        const rows = list.data || [];
-        const qCount = new Map();
-        if (rows.length) {
-            const { data: qs, error: qErr } = await supabase.from("sales_quotes").select("enquiry_id").in("enquiry_id", rows.map((r) => r.id));
-            if (qErr) throw qErr;
-            for (const x of qs || []) qCount.set(x.enquiry_id, (qCount.get(x.enquiry_id) || 0) + 1);
-        }
-        const items = rows.map((r) => threadDto(r, { quotesCount: qCount.get(r.id) || 0 }));
+            const rows = list.data || [];
+            const qCount = new Map();
+            if (rows.length) {
+                const { data: qs, error: qErr } = await supabase.from("sales_quotes").select("enquiry_id").in("enquiry_id", rows.map((r) => r.id));
+                if (qErr) throw qErr;
+                for (const x of qs || []) qCount.set(x.enquiry_id, (qCount.get(x.enquiry_id) || 0) + 1);
+            }
+            const items = rows.map((r) => threadDto(r, { quotesCount: qCount.get(r.id) || 0 }));
 
-        res.json({
-            success: true, items, total: list.count ?? items.length,
-            hasMore: offset + items.length < (list.count ?? 0),
-            counts: { all: all.count || 0, open: open.count || 0, closed: closed.count || 0 },
+            const out = {
+                success: true, items, total: list.count ?? items.length,
+                hasMore: offset + items.length < (list.count ?? 0),
+            };
+            if (offset === 0) out.counts = { all: all?.count || 0, open: open?.count || 0, closed: closed?.count || 0 };
+            return out;
         });
-    } catch (e) { fail(res, 500, e.message); }
+        res.json(body);
+    } catch (e) { oops(res, e); }
 }
 
 // ---- POST /sales/threads -------------------------------------------------------------------------------
@@ -126,26 +161,63 @@ export async function createThread(req, res) {
             body: `Enquiry created: ${productName} · ${quantity} ${b.unit}`,
         });
 
-        ping([ownerId, actorId], { enquiryId: data.id });
+        await notify(ownerId, actorId, data.id);
         res.json({ success: true, thread: threadDto(data, { quotesCount: 0 }), message: "Enquiry created." });
-    } catch (e) { fail(res, 500, e.message); }
+    } catch (e) { oops(res, e); }
 }
 
-// ---- GET /sales/threads/:id?before= --------------------------------------------------------------------
+// ---- GET /sales/threads/:id?limit=&before=&beforeId=&after= --------------------------------------------
+//   (no cursor)      -> newest `limit` entries, oldest-first, plus hasOlder
+//   before(+beforeId)-> the `limit` entries just older than that entry
+//   after            -> entries created at/after that time (cheap refresh). `reset: true` if there are too many.
 export async function getThread(req, res) {
     try {
         res.set("Cache-Control", "no-store");
         const row = await loadOwnThread(req, res); if (!row) return;
-        let q = supabase.from("sales_thread_entries").select("*").eq("enquiry_id", row.id)
-            .order("created_at", { ascending: false }).limit(ENTRY_PAGE + 1);
-        if (req.query.before) q = q.lt("created_at", String(req.query.before));
-        const { data, error } = await q;
-        if (error) throw error;
-        const hasOlder = (data || []).length > ENTRY_PAGE;
-        const page = (data || []).slice(0, ENTRY_PAGE).reverse();
-        const { count } = await supabase.from("sales_quotes").select("id", { count: "exact", head: true }).eq("enquiry_id", row.id);
-        res.json({ success: true, thread: threadDto(row, { quotesCount: count || 0 }), entries: await hydrateEntries(page), hasOlder });
-    } catch (e) { fail(res, 500, e.message); }
+
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || ENTRY_PAGE, 1), ENTRY_PAGE_MAX);
+        const before = req.query.before ? String(req.query.before) : "";
+        const after = req.query.after ? String(req.query.after) : "";
+        const beforeId = isUuid(req.query.beforeId) ? String(req.query.beforeId) : "";
+        if ((before && !TS_RE.test(before)) || (after && !TS_RE.test(after))) return fail(res, 400, "Invalid cursor.");
+
+        const ver = await getVer(`st:${row.id}`);
+        const body = await cached(`sth:${row.id}:${ver}:${hashKey([limit, before, beforeId, after])}`, 30, async () => {
+            const quotesQ = supabase.from("sales_quotes").select("id", { count: "exact", head: true }).eq("enquiry_id", row.id);
+
+            if (after) {
+                const [list, qc] = await Promise.all([
+                    supabase.from("sales_thread_entries").select("*").eq("enquiry_id", row.id)
+                        .gte("created_at", after)
+                        .order("created_at", { ascending: true }).order("id", { ascending: true }).limit(AFTER_MAX + 1),
+                    quotesQ,
+                ]);
+                if (list.error) throw list.error;
+                const thread = threadDto(row, { quotesCount: qc.count || 0 });
+                const data = list.data || [];
+                if (data.length > AFTER_MAX) return { success: true, thread, entries: [], reset: true };
+                return { success: true, thread, entries: await hydrateEntries(data) };
+            }
+
+            let q = supabase.from("sales_thread_entries").select("*").eq("enquiry_id", row.id)
+                .order("created_at", { ascending: false }).order("id", { ascending: false }).limit(limit + 1);
+            if (before) {
+                q = beforeId
+                    ? q.or(`created_at.lt.${before},and(created_at.eq.${before},id.lt.${beforeId})`)
+                    : q.lt("created_at", before);
+            }
+            const [list, qc] = await Promise.all([q, quotesQ]);
+            if (list.error) throw list.error;
+            const data = list.data || [];
+            const hasOlder = data.length > limit;
+            const page = data.slice(0, limit).reverse();
+            return {
+                success: true, thread: threadDto(row, { quotesCount: qc.count || 0 }),
+                entries: await hydrateEntries(page), hasOlder,
+            };
+        });
+        res.json(body);
+    } catch (e) { oops(res, e); }
 }
 
 // ---- PATCH /sales/threads/:id  (customer details) ------------------------------------------------------
@@ -180,9 +252,9 @@ export async function updateThread(req, res) {
 
         const { data, error } = await supabase.from("rfq_enquiries").update(patch).eq("id", row.id).select("*").single();
         if (error) throw error;
-        ping([ownerId, actorId], { enquiryId: row.id });
+        await notify(ownerId, actorId, row.id);
         res.json({ success: true, thread: threadDto(data) });
-    } catch (e) { fail(res, 500, e.message); }
+    } catch (e) { oops(res, e); }
 }
 
 // ---- PATCH /sales/threads/:id/status  { status: "open" | "closed" } ------------------------------------
@@ -201,9 +273,9 @@ export async function setThreadStatus(req, res) {
             .eq("id", row.id).select("*").single();
         if (error) throw error;
         await supabase.from("sales_thread_entries").insert({ enquiry_id: row.id, author_id: actorId, author_name: actorName, kind: "system", body });
-        ping([ownerId, actorId], { enquiryId: row.id });
+        await notify(ownerId, actorId, row.id);
         res.json({ success: true, thread: threadDto(data) });
-    } catch (e) { fail(res, 500, e.message); }
+    } catch (e) { oops(res, e); }
 }
 
 // ---- POST /sales/threads/:id/attachments/sign  { name, type, size } ------------------------------------
@@ -221,7 +293,7 @@ export async function signAttachment(req, res) {
         const { data, error } = await supabase.storage.from(BUCKET).createSignedUploadUrl(path);
         if (error) throw error;
         res.json({ success: true, uploadUrl: data.signedUrl, path });
-    } catch (e) { fail(res, 500, e.message); }
+    } catch (e) { oops(res, e); }
 }
 
 function cleanAttachments(list, enquiryId) {
@@ -253,72 +325,88 @@ export async function addEntry(req, res) {
             .select("*").single();
         if (error) throw error;
         await touch(row.id, clipPreview(body, attachments.length));
-        ping([ownerId, actorId], { enquiryId: row.id });
+        await notify(ownerId, actorId, row.id);
         const [entry] = await hydrateEntries([data]);
         res.json({ success: true, entry });
-    } catch (e) { fail(res, 500, e.message); }
+    } catch (e) { oops(res, e); }
 }
 
 // ---- GET /sales/threads/:id/products?q=&limit=&offset= -------------------------------------------------
-// The company's own products (unavailable ones carry a `reason`), with the price last quoted to THIS customer (by GST number).
+// The company's own products (unavailable ones carry a `reason`), with the price last quoted to THIS customer (by GST number)
+// and, when the customer is a BBM buyer, the custom price they currently have on each product.
+// Cached for a short time per thread version: sending a quote or editing the customer bumps the version.
 export async function listQuoteProducts(req, res) {
     try {
         res.set("Cache-Control", "no-store");
-        const { sellerId } = getSalesActor(req);
+        const { sellerId, ownerId } = getSalesActor(req);
         if (!sellerId) return fail(res, 409, NO_SELLER);
         const row = await loadOwnThread(req, res); if (!row) return;
-
-        // console.log("row : ", row);
 
         const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
         const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
         const q = safeSearch(req.query.q);
 
-        // console.log("listQuoteProducts", ownerId, row.id, "limit", limit, "offset", offset, "q", q);
+        const ver = await getVer(`st:${row.id}`);
+        const body = await cached(`stp:${sellerId}:${row.id}:${ver}:${hashKey([q, limit, offset])}`, 20, async () => {
+            let query = supabase.from("seller_product_submissions")
+                .select("*, hs_generic_product_brands!inner(id, name, brand_name, image, deleted_at)", { count: "exact" })
+                .eq("seller_id", sellerId).neq("review_status", "rejected")
+                .is("hs_generic_product_brands.deleted_at", null);
+            if (q) query = query.or(`product_name.ilike.%${q}%,brand_name.ilike.%${q}%`);
 
-        let query = supabase.from("seller_product_submissions")
-            .select("*, hs_generic_product_brands!inner(id, name, brand_name, image, deleted_at)", { count: "exact" })
-            .eq("seller_id", sellerId).neq("review_status", "rejected")
-            .is("hs_generic_product_brands.deleted_at", null);
-        if (q) query = query.or(`product_name.ilike.%${q}%,brand_name.ilike.%${q}%`);
+            const { data, count, error } = await query.order("created_at", { ascending: false }).range(offset, offset + limit - 1);
+            if (error) throw error;
+            const subs = (data || []).map(({ hs_generic_product_brands, ...rest }) => ({ ...rest, brand: hs_generic_product_brands || null }));
+            const subIds = subs.map((s) => s.id);
 
-        const { data, count, error } = await query.order("created_at", { ascending: false }).range(offset, offset + limit - 1);
-        // console.log("data", data);
-        // console.log("count", count);
-        // console.log("error", error);
-        if (error) throw error;
-        const subs = (data || []).map(({ hs_generic_product_brands, ...rest }) => ({ ...rest, brand: hs_generic_product_brands || null }));
+            // Is the customer a BBM buyer? (null = unknown: no GST number on the enquiry yet)
+            const lastP = (async () => {
+                const m = new Map();
+                if (!row.customer_gstin || !subIds.length) return m;
+                const { data: cp, error: cErr } = await supabase.from("sales_customer_prices").select("submission_id, unit_price_incl")
+                    .eq("seller_id", sellerId).eq("customer_gstin", row.customer_gstin).in("submission_id", subIds);
+                if (cErr) throw cErr;
+                for (const c of cp || []) m.set(c.submission_id, Number(c.unit_price_incl));
+                return m;
+            })();
+            const buyerP = (async () => {
+                if (!row.customer_gstin) return { buyer: null, overrides: new Map() };
+                try {
+                    const b = await findBuyerCompanyByGstin(row.customer_gstin, ownerId);
+                    if (b && !b.self) return { buyer: { onBbm: true, name: b.name }, overrides: await fetchBuyerOverrides(sellerId, b.companyId, subIds) };
+                    return { buyer: { onBbm: false, name: null, own: !!b?.self }, overrides: new Map() };
+                } catch (e) {
+                    console.error("[sales] buyer lookup failed:", e?.message || e);
+                    return { buyer: null, overrides: new Map() };
+                }
+            })();
+            const [last, { buyer, overrides }] = await Promise.all([lastP, buyerP]);
 
-        const last = new Map();
-        if (row.customer_gstin && subs.length) {
-            const { data: cp, error: cErr } = await supabase.from("sales_customer_prices").select("submission_id, unit_price_incl")
-                .eq("seller_id", sellerId).eq("customer_gstin", row.customer_gstin).in("submission_id", subs.map((s) => s.id));
-            if (cErr) throw cErr;
-            for (const c of cp || []) last.set(c.submission_id, Number(c.unit_price_incl));
-        }
-
-        const items = subs.map((s) => {
-            const pack = Number(s.pack_size) > 0 ? Number(s.pack_size) : 1;
-            const master = Number(s.units_per_master_pack) > 0 ? Number(s.units_per_master_pack) : 1;
-            const list = Number(s.price) > 0 ? round4(Number(s.price) / saleUnits(pack, master)) : null;
-            return {
-                submissionId: s.id,
-                productName: s.brand?.name || s.product_name,
-                brandName: s.brand?.brand_name || s.brand_name || "",
-                image: s.image || s.brand?.image || null,
-                description: listingDescription(s),
-                unit: s.unit, packSize: pack, masterPackSize: master,
-                gstPercent: Number(s.gst_percent) || 0,
-                moq: s.moq != null ? Number(s.moq) : null,
-                listUnitPriceIncl: list,
-                lastUnitPriceIncl: last.get(s.id) ?? null,
-                unitMatches: sameUnit(s.unit, row.unit),
-                reason: listingProblem(s),   // "In review" / "Paused" / "Expired" ... or null when it can be quoted
-                url: productUrl(s.id),
-            };
+            const items = subs.map((s) => {
+                const pack = Number(s.pack_size) > 0 ? Number(s.pack_size) : 1;
+                const master = Number(s.units_per_master_pack) > 0 ? Number(s.units_per_master_pack) : 1;
+                const list = Number(s.price) > 0 ? round4(Number(s.price) / saleUnits(pack, master)) : null;
+                return {
+                    submissionId: s.id,
+                    productName: s.brand?.name || s.product_name,
+                    brandName: s.brand?.brand_name || s.brand_name || "",
+                    image: s.image || s.brand?.image || null,
+                    description: listingDescription(s),
+                    unit: s.unit, packSize: pack, masterPackSize: master,
+                    gstPercent: Number(s.gst_percent) || 0,
+                    moq: s.moq != null ? Number(s.moq) : null,
+                    listUnitPriceIncl: list,
+                    lastUnitPriceIncl: last.get(s.id) ?? null,
+                    customUnitPriceIncl: customUnitPriceOf(s, overrides.get(s.id)),
+                    unitMatches: sameUnit(s.unit, row.unit),
+                    reason: listingProblem(s),   // "In review" / "Paused" / "Expired" ... or null when it can be quoted
+                    url: productUrl(s.id),
+                };
+            });
+            return { success: true, items, buyer, total: count ?? items.length, hasMore: offset + items.length < (count ?? 0) };
         });
-        res.json({ success: true, items, total: count ?? items.length, hasMore: offset + items.length < (count ?? 0) });
-    } catch (e) { fail(res, 500, e.message); }
+        res.json(body);
+    } catch (e) { oops(res, e); }
 }
 
 // ---- delivery ------------------------------------------------------------------------------------------
@@ -336,7 +424,7 @@ async function deliver({ quote, thread, sellerName, actorName, actorEmail, chann
             customerName: thread.customer_name || "there",
             sellerName, enquiryProduct: thread.product_name,
             itemsLine: whatsappItemsLine(items),
-            total: inr(quote.total), validUntil: fmtDate(quote.valid_until),
+            total: inr(quote.total), validUntil: validText(quote.valid_until),
             closing: quote.note || "Please get in touch with us to confirm your order.",
         });
         return r.success
@@ -348,7 +436,7 @@ async function deliver({ quote, thread, sellerName, actorName, actorEmail, chann
             to: thread.customer_email, customerName: thread.customer_name || "there",
             sellerName, salespersonName: actorName, enquiryProduct: thread.product_name,
             items, subtotal: quote.subtotal, gstAmount: quote.gst_amount, total: quote.total,
-            validUntil: fmtDate(quote.valid_until), note: quote.note || "", replyTo: actorEmail || undefined,
+            validUntil: validText(quote.valid_until), note: quote.note || "", replyTo: actorEmail || undefined,
         });
         return { status: "sent", at: new Date().toISOString() };
     }));
@@ -356,10 +444,10 @@ async function deliver({ quote, thread, sellerName, actorName, actorEmail, chann
     return out;
 }
 
-async function sellerNameOf(sellerId) {
+const sellerNameOf = (sellerId) => cached(`sn:${sellerId}`, 600, async () => {
     const { data } = await supabase.from("seller_profiles").select("display_name").eq("id", sellerId).maybeSingle();
     return data?.display_name || "Our team";
-}
+});
 
 function contactCheck(thread, channels) {
     if (!channels.length) return "Choose WhatsApp, email or both.";
@@ -371,7 +459,8 @@ function contactCheck(thread, channels) {
 const cleanChannels = (list) => [...new Set((Array.isArray(list) ? list : []).filter((c) => CHANNELS.includes(c)))];
 
 // ---- POST /sales/threads/:id/quotes --------------------------------------------------------------------
-// { items: [{ submissionId, quantity, price, gstInclusive }], channels, validityDays, note }
+// { items: [{ submissionId, quantity, price, gstInclusive, setCustomPrice }], channels, validityDays, note }
+// setCustomPrice === true also stores the quoted price as this buyer's custom price on BBM (when the customer is a BBM buyer).
 export async function sendQuote(req, res) {
     try {
         const { actorId, actorName, actorEmail, ownerId, sellerId } = getSalesActor(req);
@@ -391,6 +480,7 @@ export async function sendQuote(req, res) {
         const ids = raw.map((i) => i?.submissionId);
         if (ids.some((id) => !isUuid(id)) || new Set(ids).size !== ids.length) return fail(res, 400, "The product list is invalid.");
 
+        // Always read products fresh here (never from cache): this is the price/availability check that matters.
         const { data: subs, error: sErr } = await supabase.from("seller_product_submissions")
             .select("*, hs_generic_product_brands!inner(id, name, brand_name, image, deleted_at)")
             .eq("seller_id", sellerId).in("id", ids).is("hs_generic_product_brands.deleted_at", null);
@@ -414,12 +504,13 @@ export async function sendQuote(req, res) {
                 quantity, gstPercent, gstInclusive, enteredPrice: price,
                 ...priceLine({ price, gstInclusive, gstPercent, quantity }),
                 url: productUrl(s.id),
+                setCustomPrice: r.setCustomPrice === true,
             });
         }
 
         const total = items.reduce((a, i) => a + i.totalIncl, 0);
         const subtotal = items.reduce((a, i) => a + i.taxable, 0);
-        const validUntil = new Date(Date.now() + validityDays * 86400000).toISOString();
+        const validUntil = NO_EXPIRY;
 
         const { data: quote, error: qErr } = await supabase.from("sales_quotes").insert({
             enquiry_id: thread.id, seller_id: sellerId, actor_id: actorId, actor_name: actorName,
@@ -439,6 +530,21 @@ export async function sendQuote(req, res) {
             })), { onConflict: "seller_id,customer_gstin,submission_id" });
         if (pErr) console.error("[sales] customer price save failed:", pErr.message);
 
+        // Make it the buyer's real price on BBM too (only for BBM buyers and only for lines the salesperson ticked).
+        // Done BEFORE delivery, so the product link in the message already shows this price. Never fails the quotation.
+        const customPricing = await syncQuoteCustomPrices({
+            sellerId, ownerId, gstin: thread.customer_gstin, items, subsById: byId,
+        });
+        if (customPricing.status === "done" && (customPricing.applied.length || customPricing.removed.length)) {
+            try {
+                await logActivity({
+                    teamId: req.sales?.teamId, actorId, actorRole: "member", category: "sales", action: "sales.quote_custom_price",
+                    label: `Set quoted prices for ${customPricing.buyerName || thread.customer_name || "a buyer"} (${customPricing.applied.length} product${customPricing.applied.length === 1 ? "" : "s"})`,
+                    entityType: "rfq", entityId: thread.id, meta: { link: "/grow/customers", quoteId: quote.id },
+                });
+            } catch { /* best effort */ }
+        }
+
         const { data: entryRow, error: eErr } = await supabase.from("sales_thread_entries").insert({
             enquiry_id: thread.id, author_id: actorId, author_name: actorName, kind: "quote", quote_id: quote.id,
             body: `Quotation sent · ${inr(quote.total)}`,
@@ -448,16 +554,16 @@ export async function sendQuote(req, res) {
         const delivery = await deliver({ quote, thread, sellerName: await sellerNameOf(sellerId), actorName, actorEmail, channels });
         const { data: done } = await supabase.from("sales_quotes").update({ delivery }).eq("id", quote.id).select("*").single();
         await touch(thread.id, `Quotation sent · ${inr(quote.total)}`);
-        ping([ownerId, actorId], { enquiryId: thread.id });
+        await notify(ownerId, actorId, thread.id);
 
         const okCount = Object.values(delivery).filter((d) => d.status === "sent").length;
         res.json({
-            success: true, delivery,
+            success: true, delivery, customPricing,
             quote: quoteDto(done || { ...quote, delivery }),
             entry: entryDto(entryRow, quoteDto(done || { ...quote, delivery })),
             message: okCount === channels.length ? "Quotation sent." : okCount ? "Quotation sent on some channels. Retry the others from the thread." : "Quotation saved, but it couldn't be delivered. Retry from the thread.",
         });
-    } catch (e) { fail(res, 500, e.message); }
+    } catch (e) { oops(res, e); }
 }
 
 // ---- POST /sales/threads/:id/quotes/:quoteId/resend  { channels } --------------------------------------
@@ -482,8 +588,8 @@ export async function resendQuote(req, res) {
         const { data: upd, error: uErr } = await supabase.from("sales_quotes").update({ delivery, channels: merged }).eq("id", quote.id).select("*").single();
         if (uErr) throw uErr;
         await touch(thread.id, "Quotation resent");
-        ping([ownerId, actorId], { enquiryId: thread.id });
+        await notify(ownerId, actorId, thread.id);
         const failed = Object.values(sent).some((d) => d.status !== "sent");
         res.json({ success: true, quote: quoteDto(upd), message: failed ? "Couldn't deliver on every channel." : "Quotation sent again." });
-    } catch (e) { fail(res, 500, e.message); }
+    } catch (e) { oops(res, e); }
 }
