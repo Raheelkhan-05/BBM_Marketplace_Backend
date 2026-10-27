@@ -1,4 +1,4 @@
-// controllers/adminSellerSubmissions.controller.js — REALIGNED
+// controllers/adminSellerSubmissions.controller.js — REALIGNED + PAGINATED
 //
 // This previously targeted an older commercial-spec shape (manufacturer,
 // rate_per_pack, seller_location, dispatch_time_days, gst_registration_status,
@@ -16,54 +16,50 @@
 //      description, manufacturing_details) — on the linked brand item
 //      (hs_generic_product_brands), shared across every seller listing it.
 //
-// PRODUCT-LEVEL AUTO-APPROVAL (previous pass): approveSellerSubmission used
-// to only ever touch the ONE submission row it was called for. That's fine
-// the very first time a brand-new product gets approved — but if a second
-// seller had already submitted the same (still-unmapped) brand item before
-// admin got to it, their row sat pending forever, needing a second manual
-// approval for a product that's now already live. approveSellerSubmission
-// also auto-approves any other still-pending submissions for the same
-// brand item in the same request, and notifies each of those sellers the
-// same way. Going forward, sellerCatalogListings.controller.js's
-// createSubmission / createListingForExistingBrand already skip the queue
-// entirely for an already-approved brand item, so this bulk step only ever
-// has anything to do at the moment a product is first approved.
+// PRODUCT-LEVEL AUTO-APPROVAL: approveSellerSubmission also auto-approves
+// any other still-pending submissions for the same brand item in the same
+// request, and notifies each of those sellers.
 //
-// "NEEDS MAPPING" TAB (this pass): sellerCatalogListings.controller.js now
-// fast-approves a genuinely brand-new brand item the moment a seller
-// submits it — it's visible to buyers right away, but generic_product_id
-// is left null until admin maps it into the category hierarchy. Those
-// items no longer show up under "Pending" (they're already approved), so
-// they'd otherwise be invisible to admin entirely. listSellerSubmissions
-// now accepts status=unmapped: approved rows whose brand item has no
-// generic_product. This is filtered in JS after the fetch (same as the
-// existing free-text `q` filter below) because the relevant condition —
-// "the embedded generic_product relation is null" — isn't something
-// PostgREST can express as a top-level .eq()/.is() on this query shape.
-// getSellerSubmission / updateSellerSubmission / approveSellerSubmission
-// are UNCHANGED: the manual approve flow still requires mapping via the
-// NOT_MAPPED code below for anything that reaches it still pending or
-// resubmitted — this tab is purely a way for admin to find already-live,
-// still-unmapped items on their own schedule, not a new approval path.
+// "NEEDS MAPPING" TAB: status=unmapped lists approved rows whose brand item
+// has no generic_product yet.
+//
+// PAGINATION (this pass): listSellerSubmissions used to fetch a hard
+// .limit(200) and then filter (unmapped / search) in JS, so the page could
+// neither show the real total nor reach anything past row 200. It now:
+//   - returns the TRUE total for the current status + search ({ count: "exact" }),
+//   - pages with limit/offset (default 100, max 300),
+//   - filters "unmapped" IN THE DATABASE (inner join on the brand item, so
+//     the count and the pages are both correct),
+//   - searches product / brand / seller / generic product / subcategory /
+//     category IN THE DATABASE, so search covers every record, not just the
+//     ones already loaded in the browser.
+// Order is created_at DESC, id DESC (id as tie-breaker so pages never
+// overlap or skip rows that share a timestamp).
 
 import { supabase } from "../config/supabase.js";
 import { notifyUser, notifySellerSubmissionsChanged, notifyAdminSubmissionsChanged } from "../services/notifications.service.js";
 import { computeFinalPrice, computeMarketplaceFigures } from "../services/pricing.service.js";
 
-const BRAND_EMBED = `
+const PAGE_DEFAULT = 100;
+const PAGE_MAX = 300;
+
+// `inner` = true makes the brand join an INNER join, which is what lets us
+// filter on brand columns (unmapped) and still get a correct count/pages.
+const buildEmbed = (inner = false) => `
     id, price, base_price, gst_percent, moq, unit, lead_time, image, stock_quantity,
     stock_type, hsn_code, price_basis, gst_inclusive_input, freight_included,
     dispatch_pincode, note_to_admin,
     review_status, rejection_reason, created_at, updated_at, is_active,
     seller:seller_profiles(id, display_name, user_id),
-    brand:hs_generic_product_brands(
-        id, name, brand_name, image, images,
+    brand:hs_generic_product_brands${inner ? "!inner" : ""}(
+        id, name, brand_name, image, images, generic_product_id,
         generic_product:hs_generic_products(id, name,
             subcategory:hs_subcategories(id, name, category:hs_categories(id, name))
         )
     )
 `;
 
+const BRAND_EMBED = buildEmbed(false);
 const FULL_DETAIL_EMBED = `*, ${BRAND_EMBED}`;
 
 const STOCK_TYPES = ["ready_stock", "made_to_order"];
@@ -97,62 +93,196 @@ async function resolvePolicyText(kind, key) {
     return data?.full_text || null;
 }
 
-// GET /api/admin/seller-submissions?status=pending_review&q=
-//
-// status accepts one more value than before: "unmapped" — approved
-// submissions whose brand item hasn't been mapped to a
-// category/subcategory/generic product yet (generic_product_id is null).
-// These are already live for buyers (see sellerCatalogListings.controller.js
-// fast-approval), so they're excluded from "Pending" but still need admin
-// attention on their own timeline.
-export async function listSellerSubmissions(req, res) {
-    const { status = "pending_review", q = "" } = req.query;
-    let query = supabase
-        .from("seller_product_submissions")
-        .select(BRAND_EMBED)
-        .order("created_at", { ascending: false })
-        .limit(200);
+const clampInt = (v, min, max, fallback) => {
+    const n = parseInt(v, 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+};
 
+// Strips characters that would break a PostgREST .or() expression or act as wildcards.
+const cleanTerm = (q) => String(q || "").replace(/[%,()*\\"']/g, " ").replace(/\s+/g, " ").trim().slice(0, 80);
+
+// Resolves a search term to the seller keys + brand-item ids it matches, using a
+// handful of small, capped lookups (only runs when the admin actually types a
+// search). Matching is by product / brand name, seller display name, generic
+// product, subcategory and category name. Lookups that fail simply contribute nothing.
+async function resolveSearchTargets(term) {
+    const pat = `%${term}%`;
+    const rows = async (q) => { const { data } = await q; return data || []; };
+
+    const [sellers, brandsByName, gpsByName, subsByName, catsByName] = await Promise.all([
+        rows(supabase.from("seller_profiles").select("id, user_id").ilike("display_name", pat).limit(50)),
+        rows(supabase.from("hs_generic_product_brands").select("id").or(`name.ilike.${pat},brand_name.ilike.${pat}`).limit(120)),
+        rows(supabase.from("hs_generic_products").select("id").ilike("name", pat).limit(60)),
+        rows(supabase.from("hs_subcategories").select("id").ilike("name", pat).limit(40)),
+        rows(supabase.from("hs_categories").select("id").ilike("name", pat).limit(20)),
+    ]);
+
+    // category -> subcategories
+    let subIds = subsByName.map((r) => r.id);
+    if (catsByName.length) {
+        const more = await rows(supabase.from("hs_subcategories").select("id").in("category_id", catsByName.map((r) => r.id)).limit(60));
+        subIds = [...new Set([...subIds, ...more.map((r) => r.id)])];
+    }
+    // subcategory -> generic products
+    let gpIds = gpsByName.map((r) => r.id);
+    if (subIds.length) {
+        const more = await rows(supabase.from("hs_generic_products").select("id").in("subcategory_id", subIds.slice(0, 60)).limit(100));
+        gpIds = [...new Set([...gpIds, ...more.map((r) => r.id)])];
+    }
+    // generic products -> brand items
+    let brandIds = brandsByName.map((r) => r.id);
+    if (gpIds.length) {
+        const more = await rows(supabase.from("hs_generic_product_brands").select("id").in("generic_product_id", gpIds.slice(0, 100)).limit(120));
+        brandIds = [...new Set([...brandIds, ...more.map((r) => r.id)])];
+    }
+
+    // seller_id may point at seller_profiles.id or at the user id depending on the
+    // schema; including both is harmless (UUIDs never collide across the two).
+    const sellerKeys = [...new Set(sellers.flatMap((s) => [s.id, s.user_id]).filter(Boolean))];
+    return { sellerKeys, brandIds: brandIds.slice(0, 120) };
+}
+
+// GET /api/admin/seller-submissions?status=pending_review&q=&limit=100&offset=0
+//
+// Response: { success, items, total, offset, limit, hasMore }
+//   total   = the real number of rows matching status + q (not just this page)
+//   hasMore = whether more rows exist after this page
+//
+// status "unmapped" = approved submissions whose brand item hasn't been
+// mapped to a category/subcategory/generic product yet. Already live for
+// buyers, so excluded from "Pending" but still needing admin attention.
+export async function listSellerSubmissions(req, res) {
+    const status = String(req.query.status || "pending_review");
+    const term = cleanTerm(req.query.q);
+    const limit = clampInt(req.query.limit, 1, PAGE_MAX, PAGE_DEFAULT);
+    const offset = clampInt(req.query.offset, 0, 1_000_000, 0);
+
+    try {
+        let query = supabase
+            .from("seller_product_submissions")
+            .select(buildEmbed(status === "unmapped"), { count: "exact" });
+
+        query = applyFilters(query, status, term ? await buildOrClause(term) : null);
+
+        const { data, error, count } = await query
+            .order("created_at", { ascending: false })
+            .order("id", { ascending: false })
+            .range(offset, offset + limit - 1);
+
+        if (error) {
+            // Asking for a page past the end (rows were removed meanwhile) isn't a failure.
+            if (error.code === "PGRST103") {
+                return res.json({ success: true, items: [], total: count ?? offset, offset, limit, hasMore: false });
+            }
+            return res.status(500).json({ success: false, message: error.message });
+        }
+
+        let items = (data || []).map(normalizeSubmission);
+        const total = count ?? (offset + items.length);
+
+        // Attach a suggested manufacturer to every item missing one, resolved
+        // in a single extra query rather than one per row.
+        const missingManufacturerBrands = items.filter((it) => !it.manufacturer?.trim()).map((it) => it.brand_name);
+        if (missingManufacturerBrands.length) {
+            const suggestions = await resolveManufacturersForBrands(missingManufacturerBrands);
+            items = items.map((it) => {
+                if (it.manufacturer?.trim()) return it;
+                const suggestion = it.brand_name ? suggestions.get(it.brand_name.trim().toLowerCase()) : null;
+                return suggestion ? { ...it, suggested_manufacturer: suggestion } : it;
+            });
+        }
+
+        res.json({
+            success: true,
+            items,
+            total,
+            offset,
+            limit,
+            hasMore: offset + (data?.length || 0) < total,
+        });
+    } catch (e) {
+        console.error("[adminSellerSubmissions] list:", e?.message || e);
+        res.status(500).json({ success: false, message: "Couldn't load listings. Please try again." });
+    }
+}
+
+// Shared by the paged list and by "select all matching" so both always agree.
+// status filter (unmapped needs the inner-joined brand embed, see buildEmbed(true)).
+function applyFilters(query, status, orClause) {
     if (status === "unmapped") {
-        // Unmapped items are always approved (fast-approval never leaves
-        // them pending) — narrow the query itself before filtering the
-        // "no generic_product" condition in JS below.
-        query = query.eq("review_status", "approved");
+        // Approved + the brand item has no generic product, done in SQL.
+        query = query.eq("review_status", "approved").is("brand.generic_product_id", null);
     } else if (status !== "all") {
         query = query.eq("review_status", status);
     }
+    if (orClause) query = query.or(orClause);
+    return query;
+}
 
-    const { data, error } = await query;
-    if (error) return res.status(500).json({ success: false, message: error.message });
+// Search term -> one PostgREST .or() expression (resolved once per request).
+async function buildOrClause(term) {
+    const pat = `%${term}%`;
+    const { sellerKeys, brandIds } = await resolveSearchTargets(term);
+    const parts = [`product_name.ilike.${pat}`];
+    if (sellerKeys.length) parts.push(`seller_id.in.(${sellerKeys.join(",")})`);
+    if (brandIds.length) parts.push(`generic_product_brand_id.in.(${brandIds.join(",")})`);
+    return parts.join(",");
+}
 
-    let items = (data || []).map(normalizeSubmission);
+const SELECT_ALL_MAX = 5000;    // safety cap for one "select all matching"
+const SELECT_ALL_BATCH = 1000;
 
-    if (status === "unmapped") {
-        items = items.filter((it) => !it.generic_product);
+// GET /api/admin/seller-submissions/matching?status=&q=
+//
+// Powers "Select all N listings": returns EVERY listing that matches the
+// current tab + search (not just the page the admin has scrolled to), in a
+// lightweight shape (enough for bulk category mapping). Capped at
+// SELECT_ALL_MAX; `truncated` tells the UI if the cap was hit.
+// Response: { success, items, total, truncated }
+export async function listMatchingSubmissions(req, res) {
+    const status = String(req.query.status || "pending_review");
+    const term = cleanTerm(req.query.q);
+    try {
+        const orClause = term ? await buildOrClause(term) : null;
+        const cols = `id, product_name, seller_id, generic_product_brand_id, review_status,
+            brand:hs_generic_product_brands${status === "unmapped" ? "!inner" : ""}(id, name, brand_name, generic_product_id)`;
+
+        const items = [];
+        let total = 0;
+        for (let from = 0; from < SELECT_ALL_MAX; from += SELECT_ALL_BATCH) {
+            const q = applyFilters(
+                supabase.from("seller_product_submissions").select(cols, { count: "exact" }),
+                status, orClause,
+            )
+                .order("created_at", { ascending: false })
+                .order("id", { ascending: false })
+                .range(from, from + SELECT_ALL_BATCH - 1);
+            const { data, error, count } = await q;
+            if (error) {
+                if (error.code === "PGRST103") break; // past the end
+                return res.status(500).json({ success: false, message: error.message });
+            }
+            if (count != null) total = count;
+            for (const r of data || []) {
+                const b = firstOrSelf(r.brand) || {};
+                items.push({
+                    id: r.id,
+                    product_name: r.product_name || b.name || null,
+                    brand_name: b.brand_name || null,
+                    review_status: r.review_status,
+                    generic_product_brand_id: r.generic_product_brand_id,
+                    brand: b.id ? { id: b.id, name: b.name, brand_name: b.brand_name } : null,
+                    generic_product: b.generic_product_id ? { id: b.generic_product_id } : null,
+                });
+            }
+            if (!data || data.length < SELECT_ALL_BATCH || items.length >= total) break;
+        }
+        res.json({ success: true, items, total: total || items.length, truncated: total > items.length });
+    } catch (e) {
+        console.error("[adminSellerSubmissions] matching:", e?.message || e);
+        res.status(500).json({ success: false, message: "Couldn't select all listings. Please try again." });
     }
-
-    if (q.trim()) {
-        const term = q.trim().toLowerCase();
-        items = items.filter(
-            (it) =>
-                it.product_name?.toLowerCase().includes(term) ||
-                it.brand_name?.toLowerCase().includes(term)
-        );
-    }
-
-    // Attach a suggested manufacturer to every item missing one, resolved
-    // in a single extra query rather than one per row.
-    const missingManufacturerBrands = items.filter((it) => !it.manufacturer?.trim()).map((it) => it.brand_name);
-    if (missingManufacturerBrands.length) {
-        const suggestions = await resolveManufacturersForBrands(missingManufacturerBrands);
-        items = items.map((it) => {
-            if (it.manufacturer?.trim()) return it;
-            const suggestion = it.brand_name ? suggestions.get(it.brand_name.trim().toLowerCase()) : null;
-            return suggestion ? { ...it, suggested_manufacturer: suggestion } : it;
-        });
-    }
-
-    res.json({ success: true, items });
 }
 
 // "Mostly one manufacturer per brand" — resolves a suggested manufacturer
@@ -416,13 +546,9 @@ async function autoApproveSiblingSubmissions({ brandItemId, excludeSubmissionId,
 
 // POST /api/admin/seller-submissions/:id/approve
 //
-// UNCHANGED by this pass. Still requires the brand item to be mapped to a
-// generic_product before it will approve — this remains the path for
-// items still sitting in "pending_review" (or resubmitted after
-// rejection). Brand-new fast-approved items never reach this endpoint on
-// their way to being live; they're found and mapped later via
-// status=unmapped + FixMappingPicker's PATCH .../catalog/brand_item/:id,
-// which doesn't go through here at all.
+// Mapping is not a precondition for approval — admin can one-click approve
+// and map the category/subcategory/generic product hierarchy later (via the
+// "Needs mapping" tab / FixMappingPicker).
 export async function approveSellerSubmission(req, res) {
     const { id } = req.params;
     const { data: existing, error: fetchErr } = await supabase
@@ -446,11 +572,6 @@ export async function approveSellerSubmission(req, res) {
     if (fetchErr) return res.status(500).json({ success: false, message: fetchErr.message });
     if (!existing) return res.status(404).json({ success: false, message: "Not found." });
 
-    // Mapping is no longer a precondition for approval — admin can
-    // one-click approve immediately and map the category/subcategory/
-    // generic product hierarchy whenever they get to it (via the
-    // "Needs mapping" tab / FixMappingPicker). The cascade below only
-    // runs for whichever of cat/sub/gp actually exist right now.
     const { data, error } = await supabase
         .from("seller_product_submissions")
         .update({ review_status: "approved", reviewed_at: new Date().toISOString(), reviewed_by: req.user.id, rejection_reason: null })
