@@ -153,6 +153,9 @@ async function resolveSearchTargets(term) {
 // mapped to a category/subcategory/generic product yet. Already live for
 // buyers, so excluded from "Pending" but still needing admin attention.
 export async function listSellerSubmissions(req, res) {
+    // "Select all matching" rides on this same route (?matching=1) so no extra
+    // route has to be registered ahead of "/:id".
+    if (req.query.matching === "1") return listMatchingSubmissions(req, res);
     const status = String(req.query.status || "pending_review");
     const term = cleanTerm(req.query.q);
     const limit = clampInt(req.query.limit, 1, PAGE_MAX, PAGE_DEFAULT);
@@ -233,7 +236,7 @@ async function buildOrClause(term) {
 const SELECT_ALL_MAX = 5000;    // safety cap for one "select all matching"
 const SELECT_ALL_BATCH = 1000;
 
-// GET /api/admin/seller-submissions/matching?status=&q=
+// GET /api/admin/seller-submissions?matching=1&status=&q=   (served by listSellerSubmissions)
 //
 // Powers "Select all N listings": returns EVERY listing that matches the
 // current tab + search (not just the page the admin has scrolled to), in a
