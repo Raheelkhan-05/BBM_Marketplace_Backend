@@ -1,5 +1,5 @@
 // routes/salesThreads.routes.js
-// Mounted inside the sales router (inherits requireAuth + requireSalesperson).
+// Mounted inside the sales router (inherits requireAuth + requireSalesperson) with '/sales' prefix.
 import { Router } from "express";
 import { authWriteLimiter } from "../middleware/rateLimiter.js";
 import {

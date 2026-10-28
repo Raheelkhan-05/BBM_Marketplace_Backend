@@ -42,6 +42,7 @@ import teamRoutes from "./routes/team.routes.js";
 import adminSellerListingsRoutes from "./routes/adminSellerListings.routes.js";
 import salesRoutes from "./routes/sales.routes.js";
 import { impersonationGuard } from "./middleware/impersonationGuard.middleware.js";
+import orderBookTeamRoutes from "./routes/orderBookTeam.routes.js";
 
 export function createApp() {
   const app = express();
@@ -115,6 +116,7 @@ export function createApp() {
   app.use("/api/seller/catalog", sellerCatalogListingsRouter);
   app.use("/api/seller/bulk", bulkListingsRoutes);
   app.use("/api/seller/orders", sellerOrdersRoutes);
+  app.use("/api/seller/order-book", orderBookTeamRoutes);
   app.use("/api/seller/wallet", sellerWalletRoutes);
   app.use("/api/seller/custom-pricing", customPricingRoutes);
   app.use("/api/admin/seller-listings", adminSellerListingsRoutes);
