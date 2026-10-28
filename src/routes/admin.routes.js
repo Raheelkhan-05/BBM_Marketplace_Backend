@@ -29,7 +29,10 @@ import {
   adminListDisputes, adminGetDispute, adminStartReview, adminPostMessage,
   adminResolveDispute, adminListLedger, adminRunSettlementSweep,
 } from "../controllers/adminDisputes.controller.js";
-
+import { shapeUploader } from "../services/bannerImages.service.js";
+import {
+  adminListEntityBanners, adminUpsertEntityBanner, adminPatchEntityBanner, adminDeleteEntityBanner,
+} from "../controllers/entityBanners.controller.js";
 // NEW — RFQ review queue + settings.
 import {
   getRfqSettings, updateRfqSettings, adminListEnquiries, adminGetEnquiry,
@@ -134,5 +137,12 @@ router.post("/group-banners/scan", requireAuth, requireAdmin, authWriteLimiter, 
 router.put("/group-banners/:groupId", requireAuth, requireAdmin, authWriteLimiter, bannerImageUpload, adminUpsertGroupBanner);
 router.patch("/group-banners/:groupId", requireAuth, requireAdmin, authWriteLimiter, adminPatchGroupBanner);
 router.delete("/group-banners/:groupId", requireAuth, requireAdmin, authWriteLimiter, adminDeleteGroupBanner);
+
+// NEW — category / subcategory banners (multi-shape storage).
+router.get("/entity-banners/:type", requireAuth, requireAdmin, adminListEntityBanners);
+router.put("/entity-banners/:type/:id", requireAuth, requireAdmin, authWriteLimiter, shapeUploader(), adminUpsertEntityBanner);
+router.patch("/entity-banners/:type/:id", requireAuth, requireAdmin, authWriteLimiter, adminPatchEntityBanner);
+router.delete("/entity-banners/:type/:id", requireAuth, requireAdmin, authWriteLimiter, adminDeleteEntityBanner);
+router.delete("/entity-banners/:type/:id/:shape", requireAuth, requireAdmin, authWriteLimiter, adminDeleteEntityBanner);
 
 export default router;

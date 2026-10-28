@@ -1,24 +1,24 @@
 // controllers/groupBanners.controller.js
-import multer from "multer";
 import { supabaseAdmin } from "../config/supabase.js";
 import {
-    BANNER_BUCKET, getActiveBanners, broadcastBannersChanged,
-    scanCatalogGroups, getLastScan,
+    broadcastBannersChanged, getHomeBanners, scanCatalogGroups, getLastScan, PRIORITY_COUNT,
 } from "../services/groupBanners.service.js";
+import {
+    shapeUploader, collectFiles, parseShapeList, validateAndUpload, removeObjects,
+} from "../services/bannerImages.service.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_ALT = 140;
-const MAX_BYTES = 2 * 1024 * 1024;
 
 /* ───────────────────────── public ───────────────────────── */
 
-// GET /api/catalog/group-banners
+// GET /api/catalog/group-banners  ->  { banners, plan }
 export async function getGroupBanners(req, res) {
     try {
-        const banners = await getActiveBanners();
+        const { banners, plan } = await getHomeBanners();
         // Always revalidate (ETag -> cheap 304) so admin changes show immediately.
         res.set("Cache-Control", "public, max-age=0, must-revalidate");
-        return res.json({ success: true, banners });
+        return res.json({ success: true, banners, plan });
     } catch {
         return res.status(500).json({ success: false, message: "Couldn't load banners." });
     }
@@ -26,88 +26,76 @@ export async function getGroupBanners(req, res) {
 
 /* ───────────────────────── admin ───────────────────────── */
 
-const uploader = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_BYTES, files: 1 } });
-export function bannerImageUpload(req, res, next) {
-    uploader.single("image")(req, res, (err) => {
-        if (!err) return next();
-        const msg = err.code === "LIMIT_FILE_SIZE" ? "Image is too large (max 2 MB)." : "Couldn't read the upload.";
-        return res.status(400).json({ success: false, message: msg });
-    });
-}
-
-function detectImage(buf) {
-    if (!buf || buf.length < 12) return null;
-    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return { mime: "image/jpeg", ext: "jpg" };
-    if (buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return { mime: "image/png", ext: "png" };
-    if (buf.subarray(0, 4).toString("ascii") === "RIFF" && buf.subarray(8, 12).toString("ascii") === "WEBP") return { mime: "image/webp", ext: "webp" };
-    return null;
-}
+export const bannerImageUpload = shapeUploader();
 
 const parseBool = (v, d) => (v === undefined ? d : v === true || v === "true" || v === "1");
 const cleanAlt = (v) => {
     const s = String(v ?? "").replace(/\s+/g, " ").trim().slice(0, MAX_ALT);
     return s || null;
 };
-const removeObject = async (path) => {
-    if (!path) return;
-    const { error } = await supabaseAdmin.storage.from(BANNER_BUCKET).remove([path]);
-    if (error) console.error("[group-banners] storage cleanup failed:", error.message);
-};
 
 // GET /api/admin/group-banners
 export async function adminListGroupBanners(req, res) {
-    const [g, b] = await Promise.all([
+    const [g, b, i] = await Promise.all([
         supabaseAdmin.from("catalog_group_registry")
             .select("group_id, name, category_name, variant_count, is_active, first_seen_at, last_seen_at")
             .order("name", { ascending: true }).range(0, 4999),
         supabaseAdmin.from("group_banners")
             .select("group_id, image_url, alt_text, is_active, sort_order, updated_at")
             .order("sort_order", { ascending: true }).order("created_at", { ascending: true }).range(0, 4999),
+        supabaseAdmin.from("group_banner_images")
+            .select("group_id, shape, image_url").range(0, 19999),
     ]);
-    if (g.error || b.error) {
-        console.error("[group-banners] adminList failed:", (g.error || b.error).message);
+    if (g.error || b.error || i.error) {
+        console.error("[group-banners] adminList failed:", (g.error || b.error || i.error).message);
         return res.status(500).json({ success: false, message: "Couldn't load groups." });
     }
-    const byGroup = new Map((b.data || []).map((x) => [x.group_id, x]));
+
+    const extras = new Map();
+    for (const r of i.data || []) {
+        if (!extras.has(r.group_id)) extras.set(r.group_id, {});
+        extras.get(r.group_id)[r.shape] = r.image_url;
+    }
+    const byGroup = new Map((b.data || []).map((x) => [x.group_id, { ...x, images: { wide: x.image_url, ...(extras.get(x.group_id) || {}) } }]));
     const groups = (g.data || []).map((r) => ({ ...r, banner: byGroup.get(r.group_id) || null }));
+
+    // Exactly what buyers get today (live banners + today's layout), for the admin preview.
+    let home = null;
+    try { home = { ...(await getHomeBanners()), priorityCount: PRIORITY_COUNT }; } catch { /* preview is optional */ }
+
     return res.json({
         success: true,
         groups,
         order: (b.data || []).map((x) => x.group_id),
+        home,
         lastScan: getLastScan().summary,
         lastScanAt: getLastScan().at || null,
     });
 }
 
-// PUT /api/admin/group-banners/:groupId   (multipart: image?, altText?, isActive?)
+// PUT /api/admin/group-banners/:groupId
+// multipart: wide? landscape? square? portrait? (image files), removeShapes? ("square,portrait"), altText?, isActive?
+// The 16:9 ("wide") image is required the first time; the other shapes are optional.
 export async function adminUpsertGroupBanner(req, res) {
     const { groupId } = req.params;
     if (!UUID_RE.test(groupId)) return res.status(400).json({ success: false, message: "Invalid group." });
 
-    const file = req.file || null;
+    const files = collectFiles(req);
+    const remove = parseShapeList(req.body.removeShapes).filter((s) => s !== "wide" && !files[s]);
+
     const { data: existing, error: exErr } = await supabaseAdmin
         .from("group_banners").select("*").eq("group_id", groupId).maybeSingle();
     if (exErr) return res.status(500).json({ success: false, message: "Couldn't save the banner." });
-    if (!file && !existing) return res.status(400).json({ success: false, message: "Choose an image first." });
-
-    let imageUrl = existing?.image_url;
-    let imagePath = existing?.image_path;
-    let uploadedPath = null;
-
-    if (file) {
-        const type = detectImage(file.buffer);
-        if (!type) return res.status(400).json({ success: false, message: "Only JPEG, PNG or WebP images are allowed." });
-
-        uploadedPath = `${groupId}/${Date.now()}.${type.ext}`;
-        const { error: upErr } = await supabaseAdmin.storage.from(BANNER_BUCKET)
-            .upload(uploadedPath, file.buffer, { contentType: type.mime, cacheControl: "31536000", upsert: false });
-        if (upErr) {
-            console.error("[group-banners] upload failed:", upErr.message);
-            return res.status(500).json({ success: false, message: "Couldn't upload the image." });
-        }
-        imageUrl = supabaseAdmin.storage.from(BANNER_BUCKET).getPublicUrl(uploadedPath).data.publicUrl;
-        imagePath = uploadedPath;
+    if (!existing && !files.wide) {
+        return res.status(400).json({ success: false, message: "Add the 16:9 image first. It's the base image for this group." });
     }
+
+    const up = await validateAndUpload(files, groupId);
+    if (!up.ok) return res.status(up.status).json({ success: false, message: up.message });
+    const uploaded = up.uploaded;
+    const wideUp = uploaded.find((u) => u.shape === "wide");
+    const others = uploaded.filter((u) => u.shape !== "wide");
+    const rollback = () => removeObjects(uploaded.map((u) => u.path));
 
     let sortOrder = existing?.sort_order;
     if (sortOrder == null) {
@@ -118,8 +106,8 @@ export async function adminUpsertGroupBanner(req, res) {
 
     const row = {
         group_id: groupId,
-        image_url: imageUrl,
-        image_path: imagePath,
+        image_url: wideUp ? wideUp.url : existing.image_url,
+        image_path: wideUp ? wideUp.path : existing.image_path,
         alt_text: req.body.altText !== undefined ? cleanAlt(req.body.altText) : (existing?.alt_text ?? null),
         is_active: parseBool(req.body.isActive, existing?.is_active ?? true),
         sort_order: sortOrder,
@@ -129,9 +117,8 @@ export async function adminUpsertGroupBanner(req, res) {
 
     const { data, error } = await supabaseAdmin.from("group_banners")
         .upsert(row, { onConflict: "group_id" }).select().single();
-
     if (error) {
-        if (uploadedPath) await removeObject(uploadedPath);
+        await rollback();
         if (error.code === "23503") {
             return res.status(404).json({ success: false, message: "That group isn't in the registry yet. Run “Scan for new groups” and try again." });
         }
@@ -139,7 +126,39 @@ export async function adminUpsertGroupBanner(req, res) {
         return res.status(500).json({ success: false, message: "Couldn't save the banner." });
     }
 
-    if (uploadedPath && existing?.image_path && existing.image_path !== uploadedPath) await removeObject(existing.image_path);
+    // Optional shapes
+    const touched = [...others.map((o) => o.shape), ...remove];
+    let oldImgs = [];
+    if (touched.length) {
+        const { data: old } = await supabaseAdmin.from("group_banner_images")
+            .select("shape, image_path").eq("group_id", groupId).in("shape", touched);
+        oldImgs = old || [];
+    }
+    if (others.length) {
+        const nowIso = new Date().toISOString();
+        const { error: imgErr } = await supabaseAdmin.from("group_banner_images").upsert(
+            others.map((o) => ({
+                group_id: groupId, shape: o.shape, image_url: o.url, image_path: o.path,
+                width: o.width, height: o.height, updated_at: nowIso, updated_by: row.updated_by,
+            })),
+            { onConflict: "group_id,shape" }
+        );
+        if (imgErr) {
+            await removeObjects(others.map((o) => o.path));
+            console.error("[group-banners] extra images failed:", imgErr.message);
+            return res.status(500).json({ success: false, message: "Couldn't save the extra banner sizes." });
+        }
+    }
+    if (remove.length) {
+        const { error: delErr } = await supabaseAdmin.from("group_banner_images")
+            .delete().eq("group_id", groupId).in("shape", remove);
+        if (delErr) console.error("[group-banners] remove shapes failed:", delErr.message);
+    }
+
+    const stale = oldImgs.map((o) => o.image_path);
+    if (wideUp && existing?.image_path && existing.image_path !== wideUp.path) stale.push(existing.image_path);
+    await removeObjects(stale);
+
     broadcastBannersChanged(req);
     return res.json({ success: true, banner: data });
 }
@@ -165,25 +184,28 @@ export async function adminPatchGroupBanner(req, res) {
     return res.json({ success: true, banner: data });
 }
 
-// DELETE /api/admin/group-banners/:groupId
+// DELETE /api/admin/group-banners/:groupId  (also removes every extra shape)
 export async function adminDeleteGroupBanner(req, res) {
     const { groupId } = req.params;
     if (!UUID_RE.test(groupId)) return res.status(400).json({ success: false, message: "Invalid group." });
 
+    const { data: extras } = await supabaseAdmin.from("group_banner_images")
+        .select("image_path").eq("group_id", groupId);
+
     const { data, error } = await supabaseAdmin.from("group_banners")
-        .delete().eq("group_id", groupId).select("image_path").maybeSingle();
+        .delete().eq("group_id", groupId).select("image_path").maybeSingle(); // child rows cascade
     if (error) {
         console.error("[group-banners] delete failed:", error.message);
         return res.status(500).json({ success: false, message: "Couldn't delete the banner." });
     }
     if (!data) return res.status(404).json({ success: false, message: "Banner not found." });
 
-    await removeObject(data.image_path);
+    await removeObjects([data.image_path, ...(extras || []).map((x) => x.image_path)]);
     broadcastBannersChanged(req);
     return res.json({ success: true });
 }
 
-// PUT /api/admin/group-banners/order   body: { groupIds: [uuid, ...] }  (full order, first = leftmost)
+// PUT /api/admin/group-banners/order   body: { groupIds: [uuid, ...] }  (full order, first = highest priority)
 export async function adminReorderGroupBanners(req, res) {
     const ids = Array.isArray(req.body?.groupIds) ? req.body.groupIds.map(String) : null;
     if (!ids || !ids.length || ids.length > 2000 || !ids.every((x) => UUID_RE.test(x)) || new Set(ids).size !== ids.length) {

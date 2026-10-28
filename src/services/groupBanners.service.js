@@ -1,6 +1,7 @@
 // services/groupBanners.service.js
 //
-// - getActiveBanners(): the public carousel list (30s in-memory cache, invalidated on every admin write)
+// - getActiveBanners(): live banners + all their image shapes (30s cache, invalidated on every admin write)
+// - getHomeBanners(): the above + TODAY'S placement plan (same for every user; day = IST date)
 // - scanCatalogGroups(): finds groups via catalog_browse_feed, records them, notifies admins about NEW ones
 // - startGroupBannerWatcher(): runs the scan in the background
 // - broadcastBannersChanged(): tells connected clients to refetch
@@ -8,12 +9,15 @@
 import { supabaseAdmin } from "../config/supabase.js";
 import { notifyUser } from "./notifications.service.js";
 import { getIO } from "../socket/io.js";
+import { BANNER_BUCKET, SHAPES, isShape } from "./bannerImages.service.js";
 
-export const BANNER_BUCKET = "group-banners";
+export { BANNER_BUCKET };
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CACHE_TTL_MS = 30_000;
-const CAROUSEL_MAX = Math.max(1, parseInt(process.env.GROUP_BANNER_CAROUSEL_MAX || "40", 10) || 40);
+const HOME_BANNER_MAX = Math.max(1, parseInt(process.env.HOME_BANNER_MAX || process.env.GROUP_BANNER_CAROUSEL_MAX || "200", 10) || 200);
+export const PRIORITY_COUNT = Math.max(0, parseInt(process.env.HOME_BANNER_PRIORITY_COUNT || "3", 10) || 0);
+const LOOKAHEAD = 4;
 const SCAN_PAGE = 200;
 const SCAN_MAX_PAGES = 60;
 const SCAN_MIN_GAP_MS = 30_000;
@@ -30,7 +34,7 @@ const chunk = (arr, n) => {
     return out;
 };
 
-/* ───────────────────────── public carousel list ───────────────────────── */
+/* ───────────────────────── live banners (+ every shape) ───────────────────────── */
 
 let cache = { t: 0, rows: null };
 let generation = 0;
@@ -49,11 +53,11 @@ export async function getActiveBanners() {
     inflight = (async () => {
         const { data, error } = await supabaseAdmin
             .from("group_banners")
-            .select("group_id, image_url, alt_text, sort_order, created_at, group:catalog_group_registry(name, variant_count, is_active)")
+            .select("group_id, image_url, alt_text, sort_order, created_at, group:catalog_group_registry(name, variant_count, is_active), extra:group_banner_images(shape, image_url)")
             .eq("is_active", true)
             .order("sort_order", { ascending: true })
             .order("created_at", { ascending: true })
-            .limit(300);
+            .limit(500);
 
         if (error) {
             console.error("[group-banners] getActiveBanners failed:", error.message);
@@ -63,20 +67,113 @@ export async function getActiveBanners() {
 
         const rows = (data || [])
             .filter((r) => r.group && r.group.is_active)
-            .slice(0, CAROUSEL_MAX)
-            .map((r) => ({
-                group_id: r.group_id,
-                name: r.group.name,
-                variant_count: r.group.variant_count,
-                image_url: r.image_url,
-                alt_text: r.alt_text || null,
-            }));
+            .slice(0, HOME_BANNER_MAX)
+            .map((r) => {
+                const images = { wide: r.image_url };
+                for (const x of r.extra || []) if (isShape(x.shape) && x.image_url) images[x.shape] = x.image_url;
+                return {
+                    group_id: r.group_id,
+                    name: r.group.name,
+                    variant_count: r.group.variant_count,
+                    image_url: r.image_url, // 16:9, kept for older clients / GroupBannerCard
+                    alt_text: r.alt_text || null,
+                    images,
+                };
+            });
 
         if (gen === generation) cache = { t: Date.now(), rows };
         return rows;
     })().finally(() => { inflight = null; });
 
     return inflight;
+}
+
+/* ───────────────────────── daily placement plan ─────────────────────────
+   Deterministic: the same banners on the same IST day always give the same plan, for everyone.
+   - first PRIORITY_COUNT banners (admin order) lead; the rest are ordered by hash(day + group_id),
+     so adding/removing one banner doesn't reshuffle the others
+   - block templates are picked by a day-seeded RNG; each slot takes the best shape fit among the next few banners
+   Template counts/ratios MUST match TEMPLATES in components/home/GroupBannerBlock.jsx. */
+
+const TEMPLATES = {
+    hero: { weight: 3, ratios: [16 / 9] },
+    duo: { weight: 3, ratios: [4 / 3, 4 / 3] },
+    trio: { weight: 3, ratios: [3 / 4, 3 / 4, 3 / 4] },
+    mosaic: { weight: 2, ratios: [3 / 4, 4 / 3, 4 / 3] },
+    quad: { weight: 2, ratios: [1, 1, 1, 1] },
+};
+
+export const dayKey = (d = new Date()) =>
+    new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(d); // YYYY-MM-DD
+
+function fnv1a(str) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+    return h >>> 0;
+}
+function mulberry32(a) {
+    return () => {
+        a |= 0; a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+// 0 = the group has an image of exactly this ratio; higher = more cropping needed.
+function fitCost(banner, ratio) {
+    let best = Infinity;
+    for (const shape of Object.keys(banner.images || {})) {
+        const r = SHAPES[shape]?.ratio;
+        if (r) best = Math.min(best, Math.abs(Math.log(ratio / r)));
+    }
+    return best;
+}
+
+export function buildPlan(banners, day) {
+    const rng = mulberry32(fnv1a(`bbm-home-banners:${day}`));
+    const priority = banners.slice(0, PRIORITY_COUNT);
+    const rest = banners.slice(PRIORITY_COUNT)
+        .map((b) => ({ b, k: fnv1a(`${day}:${b.group_id}`) }))
+        .sort((x, y) => x.k - y.k || String(x.b.group_id).localeCompare(String(y.b.group_id)))
+        .map((x) => x.b);
+    const queue = [...priority, ...rest];
+
+    const blocks = [];
+    let prev = null;
+    while (queue.length) {
+        let names = Object.keys(TEMPLATES).filter((n) => TEMPLATES[n].ratios.length <= queue.length && n !== prev);
+        if (blocks.length === 0 || !names.length) names = ["hero"]; // first block is always a hero
+        const total = names.reduce((s, n) => s + TEMPLATES[n].weight, 0);
+        let r = rng() * total;
+        let name = names[names.length - 1];
+        for (const n of names) { r -= TEMPLATES[n].weight; if (r <= 0) { name = n; break; } }
+
+        const groups = [];
+        for (const ratio of TEMPLATES[name].ratios) {
+            const look = blocks.length === 0 ? 1 : Math.min(queue.length, LOOKAHEAD);
+            let bestIdx = 0, bestCost = Infinity;
+            for (let i = 0; i < look; i++) {
+                const c = fitCost(queue[i], ratio);
+                if (c < bestCost - 1e-9) { bestIdx = i; bestCost = c; }
+            }
+            groups.push(queue.splice(bestIdx, 1)[0].group_id);
+        }
+        blocks.push({ key: `${day}:${blocks.length}`, template: name, groups });
+        prev = name;
+    }
+    return blocks;
+}
+
+let planCache = { day: null, rows: null, plan: null };
+
+export async function getHomeBanners() {
+    const rows = await getActiveBanners();
+    const day = dayKey();
+    if (planCache.rows === rows && planCache.day === day) return { banners: rows, plan: planCache.plan };
+    const plan = { day, blocks: buildPlan(rows, day) };
+    planCache = { day, rows, plan };
+    return { banners: rows, plan };
 }
 
 // `_req` is kept so the controller calls don't change.

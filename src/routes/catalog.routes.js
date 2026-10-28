@@ -25,6 +25,7 @@ import {
     getSellersPage,
 } from "../controllers/catalog.controller.js";
 import { getGroupBanners } from "../controllers/groupBanners.controller.js";
+import { getEntityBanners } from "../controllers/entityBanners.controller.js";
 
 const router = Router();
 
@@ -43,6 +44,8 @@ router.get("/sellers", optionalAuth, optionalSellerProfile, getSellersPage);
 
 // Admin-curated banners for product groups (public, tiny, ETag-revalidated).
 router.get("/group-banners", getGroupBanners);
+
+router.get("/entity-banners/:type", getEntityBanners);
 
 router.get("/brand-items-feed", optionalAuth, optionalSellerProfile, getBrandItemsFeed);
 router.get("/brand-items/:brandItemId/sellers", optionalAuth, optionalSellerProfile, getBrandItemSellers);
