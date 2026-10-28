@@ -2,23 +2,29 @@
 // ORDER BOOK: a standalone CRM log. A salesperson punches an order taken for a customer; the company's team
 // (admin / members) then moves it  placed -> processed -> shipped (LR + bill) -> completed.
 // It never touches the marketplace orders, wallet, stock or pricing. Prices here are for the log only.
+// Catalog products are ordered in whole packs or master packs (never single units).
+// The customer must have a mobile number or an email, and the buyer address is filled from the GST number (editable).
 // When an order is marked processed, the customer is thanked by email / WhatsApp on behalf of the company.
 import multer from "multer";
-import { supabase } from "../config/supabase.js";
+import { supabase, supabaseAdmin } from "../config/supabase.js";
 import { isUuid, RFQ_UNITS } from "../services/rfqValidation.js";
 import { resolveGstin, addOne } from "./sellerCustomers.controller.js";
+import { validateGSTIN, fetchGstinDetails } from "../services/gst.service.js";
 import { logActivity, getTeamContext } from "../services/team.service.js";
 import { pingCustomersChanged } from "../services/salesSync.service.js";
 import { notifyUser } from "../services/realtimeBroadcast.js";
 import { getSalesActor, str, safeSearch, cleanGstin, cleanPhone, cleanEmail, round2, GSTIN_RE } from "../services/salesThreads.service.js";
 import { BUCKET, STATUSES, LIST_COLS, orderDto, eventDto, signDocs, broadcast } from "../services/orderBook.service.js";
 import { notifyOrderProcessed } from "../services/orderBookNotify.service.js";
+import { productDetails } from "../services/orderBookProduct.service.js";
 
 const MAX_LINES = 20;
 const NO_SELLER = "Your company's seller account isn't approved yet, so products can't be added.";
 const NO_CONTACT = "Add the customer's mobile number or email (at least one) so they can receive their order updates.";
-const SUB_SELECT = "*, hs_generic_product_brands!inner(id, name, brand_name, image, deleted_at)";
+const SUB_SELECT = "*, hs_generic_product_brands!inner(id, name, brand_name, image, images, description, manufacturer, model_no, specifications, deleted_at)";
 const ALLOWED_EXT = new Set(["jpg", "jpeg", "png", "webp", "gif", "heic", "pdf", "doc", "docx", "xls", "xlsx", "csv", "txt"]);
+const PINCODE_RE = /^\d{6}$/;
+const round4 = (x) => Math.round(x * 1e4) / 1e4;
 
 const fail = (res, status, message) => res.status(status).json({ success: false, message });
 const oops = (res, e) => { console.error("[order book]", e?.message || e); return fail(res, 500, "Something went wrong. Please try again."); };
@@ -77,7 +83,52 @@ async function ensureCustomer({ s, gstin, phone, email }) {
     } catch (e) { console.error("[order book] add customer failed:", e?.message || e); }
 }
 
+// POST /api/sales/gst-address { gstin } -> { name, address, city, state, pincode }
+// Registered BBM buyers: their saved business profile first. Otherwise (or if it has no address) the GST provider
+// (fetchGstinDetails has a short cache, so repeat lookups don't cost another credit).
+export async function gstAddress(req, res) {
+    try {
+        const v = validateGSTIN(req.body?.gstin);
+        if (!v.valid) return fail(res, 400, v.reason || "Enter a valid GST number.");
+        const gstin = v.gstin;
+        let name = "", address = "", city = "", state = "", pincode = "";
+
+        try {
+            const { data, error } = await supabaseAdmin.from("business_profiles")
+                .select("legal_name, trade_name, display_name, registered_address, district, state, pincode")
+                .eq("gstin", gstin).limit(1);
+            if (error) throw error;
+            const bp = data?.[0];
+            if (bp) {
+                name = (bp.display_name || bp.trade_name || bp.legal_name || "").trim();
+                address = (bp.registered_address || "").trim();
+                city = (bp.district || "").trim();
+                state = (bp.state || "").trim();
+                pincode = (bp.pincode || "").trim();
+            }
+        } catch (e) { console.error("[order book] profile address lookup failed:", e?.message || e); }
+
+        if (!address) {
+            const g = await fetchGstinDetails(gstin);
+            const m = g?.mapped;
+            if (m) {
+                name = name || (m.trade_name || m.legal_name || "").trim();
+                address = (m.registered_address || "").trim();
+                city = city || (m.district || "").trim();
+                state = state || (m.state || "").trim();
+                pincode = pincode || (m.pincode || "").trim();
+            }
+        }
+        res.json({ success: true, found: !!(name || address), gstin, name, address, city, state, pincode });
+    } catch (e) { oops(res, e); }
+}
+
 /* ------------------------------ lines ------------------------------ */
+// Catalog product: sold in whole packs or master packs. The pack sizes come from the listing in the database, never from
+// the browser. Typed-name product (no pack data): quantity + unit, as before.
+//   unit      "Pack" | "Master Pack" (catalog)  or the typed unit (manual)
+//   quantity  number of packs / master packs     unitPrice  per pack / master pack (GST included)
+//   baseUnit, unitsPerSaleUnit, totalUnits, perUnitPrice  (catalog only) the same line in the listing's own unit
 async function buildItems(raw, sellerId) {
     if (!Array.isArray(raw) || !raw.length || raw.length > MAX_LINES) return { status: 400, error: `Add between 1 and ${MAX_LINES} products.` };
     const ids = raw.map((i) => i?.productSubmissionId).filter(Boolean);
@@ -104,14 +155,35 @@ async function buildItems(raw, sellerId) {
         const quantity = Number(r.quantity), unitPrice = Number(r.unitPrice);
         if (!(quantity > 0) || quantity > 1e9) return { status: 400, error: `Enter a valid quantity for ${name}.` };
         if (!(unitPrice > 0) || unitPrice > 1e8) return { status: 400, error: `Enter a valid price for ${name}.` };
-        const unit = sub && RFQ_UNITS.includes(sub.unit) ? sub.unit : r.unit;
-        if (!RFQ_UNITS.includes(unit)) return { status: 400, error: `Select a unit for ${name}.` };
-        const q = Math.round(quantity * 1e4) / 1e4;
+
+        if (!sub) {
+            const unit = r.unit;
+            if (!RFQ_UNITS.includes(unit)) return { status: 400, error: `Select a unit for ${name}.` };
+            const q = Math.round(quantity * 1e4) / 1e4;
+            items.push({
+                submissionId: null, productName: name, brandName: "", image: null,
+                unit, quantity: q, unitPrice: round4(unitPrice), lineTotal: round2(q * unitPrice), details: null,
+            });
+            continue;
+        }
+
+        const pack = Number(sub.pack_size) > 0 ? Number(sub.pack_size) : 1;
+        const per = Number(sub.units_per_master_pack) > 1 ? Number(sub.units_per_master_pack) : 0;
+        const basis = r.basis === "per_pack" || r.basis === "per_master_pack" ? r.basis : (per ? "per_master_pack" : "per_pack");
+        if (basis === "per_master_pack" && !per) return { status: 400, error: `${name} isn't sold in master packs. Choose packs.` };
+        const word = basis === "per_master_pack" ? "master packs" : "packs";
+        if (!Number.isInteger(quantity)) return { status: 400, error: `Enter a whole number of ${word} for ${name}.` };
+
+        const unitsPerSaleUnit = basis === "per_master_pack" ? pack * per : pack;
         items.push({
-            submissionId: sub?.id || null, productName: name,
-            brandName: sub ? (sub.brand?.brand_name || sub.brand_name || "") : "",
-            image: sub ? (sub.image || sub.brand?.image || null) : null,
-            unit, quantity: q, unitPrice: Math.round(unitPrice * 1e4) / 1e4, lineTotal: round2(q * unitPrice),
+            submissionId: sub.id, productName: name,
+            brandName: sub.brand?.brand_name || sub.brand_name || "",
+            image: sub.image || sub.brand?.image || null,
+            basis, unit: basis === "per_master_pack" ? "Master Pack" : "Pack",
+            quantity, unitPrice: round4(unitPrice), lineTotal: round2(quantity * unitPrice),
+            baseUnit: sub.unit || "", unitsPerSaleUnit: round4(unitsPerSaleUnit),
+            totalUnits: round4(quantity * unitsPerSaleUnit), perUnitPrice: round4(unitPrice / unitsPerSaleUnit),
+            details: productDetails(sub),   // snapshot: pack sizes, HSN, specs, documents
         });
     }
     return { items };
@@ -177,7 +249,8 @@ export const listMine = (req, res) => listFor(req, res, salesScope(req));
 export const getMine = (req, res) => detailFor(req, res, salesScope(req));
 
 // POST /api/sales/order-book
-// { customerGstin?, customerName?, customerPhone?, customerEmail?, items:[{productSubmissionId?|productName, quantity, unit, unitPrice}], notes? }
+// { customerGstin?, customerName?, customerPhone?, customerEmail?, customerAddress?, customerCity?, customerState?, customerPincode?,
+//   items:[{productSubmissionId, basis:"per_pack"|"per_master_pack", quantity, unitPrice} | {productName, unit, quantity, unitPrice}], notes? }
 // The customer needs at least a mobile number or an email, so they can be told when the order is processed.
 export async function createOrder(req, res) {
     try {
@@ -195,6 +268,10 @@ export async function createOrder(req, res) {
         if (emailRaw && !email) return fail(res, 400, "Enter a valid email address.");
         if (!phone && !email) return fail(res, 400, NO_CONTACT);
 
+        const address = str(b.customerAddress, 400), city = str(b.customerCity, 80), stateName = str(b.customerState, 60);
+        const pincode = str(b.customerPincode, 10).replace(/\s/g, "");
+        if (pincode && !PINCODE_RE.test(pincode)) return fail(res, 400, "Enter a valid 6-digit pincode, or leave it empty.");
+
         const built = await buildItems(b.items, s.sellerId);
         if (built.error) return fail(res, built.status, built.error);
         const items = built.items;
@@ -210,6 +287,7 @@ export async function createOrder(req, res) {
         const { data: row, error } = await supabase.from("order_book_orders").insert({
             company_id: s.companyId, seller_id: s.sellerId, salesperson_id: s.actorId, salesperson_name: s.actorName,
             customer_name: customerName, customer_gstin: gstin || null, customer_phone: phone || null, customer_email: email || null,
+            customer_address: address || null, customer_city: city || null, customer_state: stateName || null, customer_pincode: pincode || null,
             items, total_amount: total, notes: str(b.notes, 1000) || null,
             status: "placed", last_activity_at: now, updated_at: now,
         }).select("*").single();

@@ -14,6 +14,8 @@ export function orderDto(r, docs = null) {
         id: r.id, orderNo: r.order_no, status: r.status,
         customerName: r.customer_name || "", customerGstin: r.customer_gstin || "",
         customerPhone: r.customer_phone || "", customerEmail: r.customer_email || "",
+        customerAddress: r.customer_address || "", customerCity: r.customer_city || "",
+        customerState: r.customer_state || "", customerPincode: r.customer_pincode || "",
         items, itemsCount: items.length, total: Number(r.total_amount) || 0, notes: r.notes || "",
         salespersonId: r.salesperson_id, salespersonName: r.salesperson_name || "",
         lrNumber: r.lr_number || "", lrNotes: r.lr_notes || "", cancelReason: r.cancel_reason || "",
