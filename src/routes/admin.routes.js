@@ -55,6 +55,8 @@ import {
   adminDeleteGroupBanner, adminReorderGroupBanners, adminScanGroups,
 } from "../controllers/groupBanners.controller.js";
 
+import { aiOverview, aiEnqueue, aiCancel } from "../controllers/aiBanners.controller.js";
+
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
 
 
@@ -144,5 +146,9 @@ router.put("/entity-banners/:type/:id", requireAuth, requireAdmin, authWriteLimi
 router.patch("/entity-banners/:type/:id", requireAuth, requireAdmin, authWriteLimiter, adminPatchEntityBanner);
 router.delete("/entity-banners/:type/:id", requireAuth, requireAdmin, authWriteLimiter, adminDeleteEntityBanner);
 router.delete("/entity-banners/:type/:id/:shape", requireAuth, requireAdmin, authWriteLimiter, adminDeleteEntityBanner);
+
+router.get("/ai-banners", requireAuth, requireAdmin, aiOverview);
+router.post("/ai-banners/jobs", requireAuth, requireAdmin, authWriteLimiter, aiEnqueue);
+router.post("/ai-banners/cancel", requireAuth, requireAdmin, authWriteLimiter, aiCancel);
 
 export default router;

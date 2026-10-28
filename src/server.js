@@ -11,6 +11,7 @@ import { startListingExpiryScheduler } from "./services/listingExpiry.service.js
 import { startSettlementScheduler } from "./services/settlement.service.js";
 import { startPaymentScheduler } from "./services/paymentScheduler.service.js";
 import { startGroupBannerWatcher } from "./services/groupBanners.service.js";
+import { startAiBannerWorker } from "./services/aiBanners.service.js";
 
 const PORT = process.env.PORT || 4000;
 const app = createApp();
@@ -73,4 +74,6 @@ startPaymentScheduler();
 // Home page group banners: finds new product groups every 30 min and notifies admins.
 // Safe on several processes: new groups are claimed atomically before anyone is notified.
 startGroupBannerWatcher();
+
+startAiBannerWorker();
 start();
