@@ -2,6 +2,7 @@
 // ORDER BOOK: a standalone CRM log. A salesperson punches an order taken for a customer; the company's team
 // (admin / members) then moves it  placed -> processed -> shipped (LR + bill) -> completed.
 // It never touches the marketplace orders, wallet, stock or pricing. Prices here are for the log only.
+// When an order is marked processed, the customer is thanked by email / WhatsApp on behalf of the company.
 import multer from "multer";
 import { supabase } from "../config/supabase.js";
 import { isUuid, RFQ_UNITS } from "../services/rfqValidation.js";
@@ -11,9 +12,11 @@ import { pingCustomersChanged } from "../services/salesSync.service.js";
 import { notifyUser } from "../services/realtimeBroadcast.js";
 import { getSalesActor, str, safeSearch, cleanGstin, cleanPhone, cleanEmail, round2, GSTIN_RE } from "../services/salesThreads.service.js";
 import { BUCKET, STATUSES, LIST_COLS, orderDto, eventDto, signDocs, broadcast } from "../services/orderBook.service.js";
+import { notifyOrderProcessed } from "../services/orderBookNotify.service.js";
 
 const MAX_LINES = 20;
 const NO_SELLER = "Your company's seller account isn't approved yet, so products can't be added.";
+const NO_CONTACT = "Add the customer's mobile number or email (at least one) so they can receive their order updates.";
 const SUB_SELECT = "*, hs_generic_product_brands!inner(id, name, brand_name, image, deleted_at)";
 const ALLOWED_EXT = new Set(["jpg", "jpeg", "png", "webp", "gif", "heic", "pdf", "doc", "docx", "xls", "xlsx", "csv", "txt"]);
 
@@ -175,6 +178,7 @@ export const getMine = (req, res) => detailFor(req, res, salesScope(req));
 
 // POST /api/sales/order-book
 // { customerGstin?, customerName?, customerPhone?, customerEmail?, items:[{productSubmissionId?|productName, quantity, unit, unitPrice}], notes? }
+// The customer needs at least a mobile number or an email, so they can be told when the order is processed.
 export async function createOrder(req, res) {
     try {
         const s = salesScope(req);
@@ -189,6 +193,7 @@ export async function createOrder(req, res) {
         const phone = phoneRaw ? cleanPhone(phoneRaw) : "", email = emailRaw ? cleanEmail(emailRaw) : "";
         if (phoneRaw && !phone) return fail(res, 400, "Enter a valid 10-digit mobile number.");
         if (emailRaw && !email) return fail(res, 400, "Enter a valid email address.");
+        if (!phone && !email) return fail(res, 400, NO_CONTACT);
 
         const built = await buildItems(b.items, s.sellerId);
         if (built.error) return fail(res, built.status, built.error);
@@ -292,7 +297,10 @@ export async function processOrder(req, res) {
     try {
         const row = await loadTeamRow(req, res); if (!row) return;
         if (row.status !== "placed") return fail(res, 409, "Only a placed order can be marked as processed.");
-        await move(req, res, row, "processed", { eventBody: "Order marked as processed" });
+        const ok = await move(req, res, row, "processed", { eventBody: "Order marked as processed" });
+        // Thank the customer by email / WhatsApp. Runs after the response, so it never slows or breaks the step.
+        // The guarded UPDATE in move() means this fires once per order.
+        if (ok) notifyOrderProcessed(row).catch((e) => console.error("[order book] customer notify failed:", e?.message || e));
     } catch (e) { oops(res, e); }
 }
 

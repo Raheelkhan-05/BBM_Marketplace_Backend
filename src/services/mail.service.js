@@ -222,7 +222,7 @@ export async function sendSalesQuotationEmail({
      <p style="margin:14px 0 0;font-size:12.5px;color:#64748b;">This quotation is valid until <strong>${esc(validUntil)}</strong>.</p>
      ${note ? `<p style="margin:10px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;">${esc(note)}</p>` : ""}
      <p style="margin:12px 0 0;font-size:12.5px;color:#64748b;">Reply to this email if you have any questions.</p>`,
-    "You're receiving this because a supplier prepared a quotation for your enquiry on BBM. If this wasn't meant for you, you can ignore this email."
+    "You're receiving this because a supplier prepared a quotation for your enquiry on BBM Marketplace. If this wasn't meant for you, you can ignore this email."
   );
   const clean = (v) => String(v || "").replace(/[\r\n]+/g, " ");
   const result = await resend.emails.send({
@@ -235,3 +235,53 @@ export async function sendSalesQuotationEmail({
   return throwIfResendError(result);
 }
 
+// Order Book: sent to the customer when the selling company's team marks their order as processed.
+// Written on behalf of the company (thank you, full order details, prices incl. GST, link to the company's shop).
+export async function sendOrderProcessedEmail({ to, customerName, companyName, orderNo, placedOn, items, total, notes, shopUrl }) {
+  if (!to) return;
+  const company = esc(companyName || "our team");
+  const rows = (items || []).map((i) => `
+    <div style="margin:0 0 10px;padding:12px 14px;border:1px solid #e5eaee;border-radius:12px;">
+      <div style="font-size:14px;font-weight:700;color:#0f172a;">${esc(i.productName)}${i.brandName ? ` <span style="font-weight:400;color:#64748b;">· ${esc(i.brandName)}</span>` : ""}</div>
+      <div style="margin-top:6px;font-size:13px;color:#334155;">
+        ${esc(qtyMail(i.quantity))} ${esc(i.unit)} × ${esc(inrMail(i.unitPrice, 4))} = <strong>${esc(inrMail(i.lineTotal))}</strong>
+      </div>
+    </div>`).join("");
+
+  const html = shell(
+    `Thank you for your purchase from ${company}`,
+    `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
+       Hi ${esc(customerName || "there")}, thank you for your purchase from <strong>${company}</strong>.
+       We're happy to let you know that your order is confirmed and is now being processed.
+     </p>
+     <table role="presentation" width="100%" style="margin:0 0 14px;font-size:13px;color:#334155;">
+       <tr><td style="padding:3px 0;color:#64748b;">Order number</td><td align="right"><strong>${esc(orderNo)}</strong></td></tr>
+       ${placedOn ? `<tr><td style="padding:3px 0;color:#64748b;">Order date</td><td align="right">${esc(placedOn)}</td></tr>` : ""}
+       <tr><td style="padding:3px 0;color:#64748b;">Status</td><td align="right"><strong>Processing</strong></td></tr>
+     </table>
+     <p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#0f172a;">Your order</p>
+     ${rows}
+     <table role="presentation" width="100%" style="margin-top:6px;border-top:1px solid #e5eaee;">
+       <tr><td style="padding:10px 0 0;font-size:15px;font-weight:800;color:#0f172a;">Order total (incl. GST)</td>
+           <td align="right" style="padding:10px 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(inrMail(total))}</td></tr>
+     </table>
+     ${notes ? `<p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;"><strong>Your notes:</strong> ${esc(notes)}</p>` : ""}
+     <p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#475569;">
+       We will update you again once your order is shipped. If you have any questions about this order, simply reply to this email or contact ${company} and mention order <strong>${esc(orderNo)}</strong>.
+     </p>
+     ${shopUrl ? `<a href="${esc(shopUrl)}" style="display:inline-block;margin-top:14px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
+       Visit ${company}'s shop
+     </a>
+     <p style="margin:10px 0 0;font-size:11.5px;line-height:1.5;color:#94a3b8;word-break:break-all;">${esc(shopUrl)}</p>` : ""}
+     <p style="margin:16px 0 0;font-size:13px;line-height:1.6;color:#475569;">Thank you once again for choosing ${company}.</p>`,
+    `You're receiving this because ${company} placed an order for you through BBM Marketplace. If this wasn't meant for you, you can ignore this email.`
+  );
+  const clean = (v, d) => String(v || d).replace(/[\r\n]+/g, " ");
+  const result = await resend.emails.send({
+    from: FROM,
+    to,
+    subject: `Thank you for your purchase from ${clean(companyName, "our team")} (Order ${clean(orderNo, "")})`.replace(/\s+\(Order \)$/, ""),
+    html,
+  });
+  return throwIfResendError(result);
+}

@@ -123,3 +123,35 @@ export async function sendSalesQuotationWhatsApp({ to, customerName, sellerName,
     });
 }
 
+
+//
+// ORDER BOOK: sent to the customer when the company's team marks their order as processed.
+// You must create this UTILITY template in Meta WhatsApp Manager, name: order_processed, language: English (en).
+// Body (6 variables, in this exact order):
+//
+//   Hello {{1}},
+//
+//   Thank you for your purchase from {{2}}. Your order {{3}} is confirmed and is now being processed.
+//
+//   Order details: {{4}}
+//
+//   Order total (incl. GST): {{5}}
+//
+//   You can view our shop here: {{6}}
+//
+//   We will update you again once your order is shipped. If you have any questions about this order, please contact {{2}}.
+//
+// (Meta counts a repeated {{2}} as the same variable; if the form rejects that, reword the last line to
+//  "please reply to this message" and the code needs no change.)
+// Sample values for approval: Acme Traders / BBM Supplies / ORD-1042 / 1) Hinge 4 inch - 500 Kg x ₹2.47 = ₹1,235.00 / ₹1,235.00 / https://bbm.business/sellers/bbm-supplies
+// =====================================================================================================
+const ORDER_PROCESSED_TEMPLATE_NAME = "order_processed";
+
+export async function sendOrderProcessedWhatsApp({ to, customerName, companyName, orderNo, itemsLine, total, shopUrl }) {
+    const v = (x, fallback = "-") => String(x ?? "").replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").trim() || fallback;
+    return sendWhatsAppTemplate({
+        to,
+        templateName: ORDER_PROCESSED_TEMPLATE_NAME,
+        bodyParams: [v(customerName, "there"), v(companyName, "our team"), v(orderNo), v(itemsLine), v(total), v(shopUrl)],
+    });
+}
