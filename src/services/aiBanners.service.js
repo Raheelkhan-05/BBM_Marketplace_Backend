@@ -901,17 +901,17 @@ function layoutCopy(concept, ctx, shape, W, H, k, nBenefits, showKicker) {
         blocks.push(block);
     }
 
-    if (ctx.kind === "group") {
-        const btn = ctaButton(concept.cta_style, concept.cta_label, Math.round(base.cta * k), textW, pal);
+    // if (ctx.kind === "group") {
+    //     const btn = ctaButton(concept.cta_style, concept.cta_label, Math.round(base.cta * k), textW, pal);
 
-        const cta = {
-            h: btn.h,
-            draw: (top) => [btn.draw(centered ? Math.round(cx - btn.w / 2) : x0, top)],
-        };
+    //     const cta = {
+    //         h: btn.h,
+    //         draw: (top) => [btn.draw(centered ? Math.round(cx - btn.w / 2) : x0, top)],
+    //     };
 
-        if (concept.cta_position === "above_benefits") blocks.unshift(cta);
-        else blocks.push(cta);
-    }
+    //     if (concept.cta_position === "above_benefits") blocks.unshift(cta);
+    //     else blocks.push(cta);
+    // }
 
     for (const b of blocks) {
         y += sec;
@@ -1056,16 +1056,12 @@ Design ONE specific, original banner concept for the supplied catalog entity. Ev
  "copy_valign": "top"|"center"|"bottom",
  "kicker_style": "rule"|"tag"|"plain",
  "benefit_style": "dots"|"ticks"|"chips"|"bars",
- "cta_style": "pill"|"block"|"outline"|"link",
- "cta_position": "above_benefits"|"below_benefits",
  "headline_case": "title"|"upper",
- "cta_label": string
 }
 CONTENT RULES
 - label: 1-3 short buyer-friendly words in Title Case (4 words maximum). Use the generic product/category name, never a brand, model, price, size, unit, or claim. Shorter is better because it is typeset large.
 - hero_items: 3-4 generic, unbranded, recognizable product forms. Keep the selection coherent: variants for a product range; representative products for a subcategory; representative subcategories for a broad category. The first item is the dominant hero.
 - benefits: exactly 2 benefit OR application labels when the catalog context supports them. Each must be 2-3 words and at most 18 characters, because they are typeset large for phone screens. Use grounded, ordinary use-cases; never invent certifications, guarantees, prices, delivery promises, performance figures, or technical claims. Use [] rather than guess if unsupported.
-- cta_label: 2-3 words, at most 16 characters, an invitation to browse (for example "Shop the range", "Browse variants", "See the range"). Vary the wording. No prices, discounts, or promises.
 CREATIVE RULES
 - idea: one sentence naming the visual story, drawn from how these specific products are used, made, or built. It must not be a generic "products on a pedestal".
 - visual_direction: 1-2 sentences describing the set, composition, backdrop surface and light. Build a scene specific to these products: architectural framing, a staged vignette made from the products' own materials, a macro hero with receding variants, a diagonal cascade, a modular wall, an overhead flat-lay, colour-blocked geometric panels, layered cut-paper depth, a raw-material slab stage, a curved wall with a pool of light, and so on. Never default to a centered pile or a plain row of items.
@@ -1075,7 +1071,7 @@ CREATIVE RULES
 LAYOUT RULES (the copy is typeset separately over the image, so layout must vary)
 - side_h: which side the copy sits on in wide/landscape banners. side_v: top or bottom of square/portrait banners. align_v: left or center alignment for square/portrait copy. copy_valign: where the copy block sits vertically in wide/landscape banners.
 - Choose layout values that differ from the recently used banners supplied to you, and that suit this composition.
-- kicker_style, benefit_style, cta_style, cta_position, headline_case: pick a combination that is different from the recent banners. Use upper headline_case sparingly, mainly for bold technical or industrial products.
+- kicker_style, benefit_style, headline_case: pick a combination that is different from the recent banners. Use upper headline_case sparingly, mainly for bold technical or industrial products.
 You receive "creative_lens" as a starting point of inspiration; adapt it to the products, or ignore it if it clearly does not suit them. You also receive "recently_used_banners": do not repeat their layout combination or visual approach.`;
 
 const LENSES = [
@@ -1115,18 +1111,18 @@ async function recentConcepts(limit = 12) {
 
 const summariseConcept = (c) => ({
     palette: paletteOfConcept(c),
-    layout: [c.side_h, c.side_v, c.benefit_style, c.cta_style].filter(Boolean).join("/") || null,
+    layout: [c.side_h, c.side_v, c.benefit_style].filter(Boolean).join("/") || null,
     direction: String(c.visual_direction || "").slice(0, 110),
 });
 
 // If the new concept repeats the look of a very recent one, shuffle the layout choices.
 function diversify(concept, recent) {
-    const sig = (c) => [paletteOfConcept(c), c.side_h, c.benefit_style, c.cta_style].join("|");
+    // const sig = (c) => [paletteOfConcept(c), c.side_h, c.benefit_style, c.cta_style].join("|");
+    const sig = (c) => [paletteOfConcept(c), c.side_h, c.benefit_style].join("|");
     const seen = new Set(recent.slice(0, 5).map(sig));
 
     for (let i = 0; i < 8 && seen.has(sig(concept)); i++) {
         concept.benefit_style = randOf(BENEFIT_STYLES);
-        concept.cta_style = randOf(CTA_STYLES);
         concept.side_h = randOf(SIDE_H);
     }
 
