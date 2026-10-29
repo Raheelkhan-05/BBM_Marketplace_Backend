@@ -15,7 +15,7 @@ import { pingCustomersChanged } from "../services/salesSync.service.js";
 import { notifyUser } from "../services/realtimeBroadcast.js";
 import { getSalesActor, str, safeSearch, cleanGstin, cleanPhone, cleanEmail, round2, GSTIN_RE } from "../services/salesThreads.service.js";
 import { BUCKET, STATUSES, LIST_COLS, orderDto, eventDto, signDocs, broadcast } from "../services/orderBook.service.js";
-import { notifyOrderProcessed } from "../services/orderBookNotify.service.js";
+import { notifyOrderProcessed, notifyOrderPlaced } from "../services/orderBookNotify.service.js";
 import { productDetails } from "../services/orderBookProduct.service.js";
 
 const MAX_LINES = 20;
@@ -312,6 +312,9 @@ export async function createOrder(req, res) {
             type: "order_book_new", title: `New order ${row.order_no}`,
             body: `${s.actorName} punched an order for ${customerName}.`, link: `/grow/order-book/${row.id}`,
         }).catch(() => { /* best effort */ });
+
+        // Greet the customer: order received + order and billing details (email / WhatsApp). After the response path, never blocks it.
+        notifyOrderPlaced(row).catch((e) => console.error("[order book] order-placed notify failed:", e?.message || e));
 
         res.json({ success: true, order: orderDto(row), message: "Order punched." });
     } catch (e) { oops(res, e); }

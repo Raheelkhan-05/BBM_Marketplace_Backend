@@ -155,3 +155,34 @@ export async function sendOrderProcessedWhatsApp({ to, customerName, companyName
         bodyParams: [v(customerName, "there"), v(companyName, "our team"), v(orderNo), v(itemsLine), v(total), v(shopUrl)],
     });
 }
+
+
+//
+// ORDER BOOK: sent to the customer the moment the salesperson punches their order.
+// Create this UTILITY template in Meta WhatsApp Manager, name: order_received, language: English (en).
+// Body (6 variables, in this exact order):
+//
+//   Hello {{1}},
+//
+//   Thank you for placing your order with {{2}}. We have received your details and your order {{3}} has been recorded.
+//
+//   Order details: {{4}}
+//
+//   Billing details: {{5}}
+//
+//   Order total (incl. GST): {{6}}
+//
+//   Our team will confirm and process your order shortly and keep you updated at every step. If anything looks incorrect, please reply to this message.
+//
+// Sample values for approval: Acme Traders / BBM Supplies / ORD-1042 / 1) Hinge 4 inch - 5 master packs x ₹1,200 per master pack (5,000 Kg in total) = ₹6,000.00 / Billed to Acme Traders, GSTIN 24ABCDE1234F1Z5, Ahmedabad, Gujarat 380001. Taxable value ₹5,084.75, GST ₹915.25. / ₹6,000.00
+// =====================================================================================================
+const ORDER_PLACED_TEMPLATE_NAME = "order_received";
+
+export async function sendOrderPlacedWhatsApp({ to, customerName, companyName, orderNo, itemsLine, billingLine, total }) {
+    const v = (x, fallback = "-") => String(x ?? "").replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").trim() || fallback;
+    return sendWhatsAppTemplate({
+        to,
+        templateName: ORDER_PLACED_TEMPLATE_NAME,
+        bodyParams: [v(customerName, "there"), v(companyName, "our team"), v(orderNo), v(itemsLine), v(billingLine), v(total)],
+    });
+}

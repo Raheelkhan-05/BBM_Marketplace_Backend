@@ -235,6 +235,68 @@ export async function sendSalesQuotationEmail({
   return throwIfResendError(result);
 }
 
+// Order Book: sent to the customer the moment the salesperson punches their order.
+// Greeting, "we have your details", order confirmation (with pack breakdown) and billing details.
+export async function sendOrderPlacedEmail({ to, customerName, companyName, orderNo, placedOn, items, billing, totals, notes, shopUrl }) {
+  if (!to) return;
+  const company = esc(companyName || "our team");
+  const rows = (items || []).map((i) => `
+    <div style="margin:0 0 10px;padding:12px 14px;border:1px solid #e5eaee;border-radius:12px;">
+      <div style="font-size:14px;font-weight:700;color:#0f172a;">${esc(i.productName)}${i.brandName ? ` <span style="font-weight:400;color:#64748b;">· ${esc(i.brandName)}</span>` : ""}</div>
+      <div style="margin-top:6px;font-size:13px;color:#334155;">${esc(i.qtyText)}</div>
+      ${i.packText ? `<div style="margin-top:2px;font-size:12.5px;color:#64748b;">${esc(i.packText)}</div>` : ""}
+      <div style="margin-top:6px;font-size:13px;color:#334155;">Amount: <strong>${esc(inrMail(i.lineTotal))}</strong> <span style="color:#94a3b8;">(incl. GST)</span></div>
+    </div>`).join("");
+
+  const b = billing || {};
+  const detail = (label, value) => (value ? `<tr><td style="padding:3px 0;color:#64748b;vertical-align:top;width:34%;">${label}</td><td style="padding:3px 0;color:#0f172a;">${esc(value)}</td></tr>` : "");
+
+  const html = shell(
+    `We've received your order, ${esc(customerName || "there")}`,
+    `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
+       Hello ${esc(customerName || "there")}, thank you for choosing <strong>${company}</strong>.
+       We have received your details and recorded your order. Here is a summary for your reference.
+     </p>
+     <table role="presentation" width="100%" style="margin:0 0 16px;font-size:13px;color:#334155;">
+       <tr><td style="padding:3px 0;color:#64748b;">Order number</td><td align="right"><strong>${esc(orderNo)}</strong></td></tr>
+       ${placedOn ? `<tr><td style="padding:3px 0;color:#64748b;">Order date</td><td align="right">${esc(placedOn)}</td></tr>` : ""}
+       <tr><td style="padding:3px 0;color:#64748b;">Status</td><td align="right"><strong>Order received</strong></td></tr>
+     </table>
+ 
+     <p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#0f172a;">Your order</p>
+     ${rows}
+ 
+     <p style="margin:16px 0 8px;font-size:13px;font-weight:700;color:#0f172a;">Billing details</p>
+     <table role="presentation" width="100%" style="font-size:13px;">
+       ${detail("Billed to", b.name)}${detail("GSTIN", b.gstin)}${detail("Address", b.address)}${detail("Mobile", b.phone)}${detail("Email", b.email)}
+     </table>
+     <table role="presentation" width="100%" style="margin-top:10px;border-top:1px solid #e5eaee;font-size:13px;color:#334155;">
+       ${totals?.split ? `<tr><td style="padding:8px 0 3px;">Taxable value</td><td align="right" style="padding:8px 0 3px;">${esc(inrMail(totals.taxable))}</td></tr>
+       <tr><td style="padding:3px 0;">GST</td><td align="right">${esc(inrMail(totals.gst))}</td></tr>` : ""}
+       <tr><td style="padding:${totals?.split ? "6px" : "10px"} 0 0;font-size:15px;font-weight:800;color:#0f172a;">Order total (incl. GST)</td>
+           <td align="right" style="padding:${totals?.split ? "6px" : "10px"} 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(inrMail(totals?.total))}</td></tr>
+     </table>
+     ${notes ? `<p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;"><strong>Your notes:</strong> ${esc(notes)}</p>` : ""}
+ 
+     <p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#475569;">
+       Our team will confirm and process your order shortly, and we will keep you updated at every step.
+       If anything above looks incorrect, please reply to this email and mention order <strong>${esc(orderNo)}</strong>.
+     </p>
+     ${shopUrl ? `<a href="${esc(shopUrl)}" style="display:inline-block;margin-top:14px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">Visit ${company}'s shop</a>` : ""}
+     <p style="margin:16px 0 0;font-size:13px;line-height:1.6;color:#475569;">Thank you once again for choosing ${company}.</p>`,
+    `You're receiving this because ${company} placed an order for you through BBM Marketplace. If this wasn't meant for you, you can ignore this email.`
+  );
+  const clean = (v, d) => String(v || d).replace(/[\r\n]+/g, " ");
+  const result = await resend.emails.send({
+    from: FROM,
+    to,
+    subject: `We've received your order ${clean(orderNo, "")} - ${clean(companyName, "our team")}`.replace(/\s+-\s+$/, ""),
+    html,
+  });
+  return throwIfResendError(result);
+}
+
+
 // Order Book: sent to the customer when the selling company's team marks their order as processed.
 // Written on behalf of the company (thank you, full order details, prices incl. GST, link to the company's shop).
 export async function sendOrderProcessedEmail({ to, customerName, companyName, orderNo, placedOn, items, total, notes, shopUrl }) {
