@@ -453,11 +453,6 @@ function normalizeConcept(raw, ctx, dflt = {}) {
         .filter(Boolean)
         .slice(0, 4);
 
-    const benefits = (Array.isArray(r.benefits) ? r.benefits : [])
-        .map((v) => cleanLine(v, 28).replace(/[.!]+$/g, "").trim())
-        .filter(Boolean)
-        .slice(0, 2);
-
     let cta = cleanLine(r.cta_label, 24).replace(/[^\p{L}\p{N}\s&'-]/gu, "").trim();
 
     if (!cta || cta.split(" ").length > 3 || cta.length > 18) cta = DEFAULT_CTA;
@@ -471,7 +466,6 @@ function normalizeConcept(raw, ctx, dflt = {}) {
     return {
         label,
         hero_items: hero.length >= 2 ? hero : fallbackHero(ctx),
-        benefits,
         palette,
         idea: cleanLine(r.idea, 240),
         visual_direction: cleanLine(r.visual_direction, 340) || DEFAULT_DIRECTION,
@@ -481,7 +475,6 @@ function normalizeConcept(raw, ctx, dflt = {}) {
         align_v: pickEnum("align_v", ALIGN_V),
         copy_valign: pickEnum("copy_valign", VALIGN),
         kicker_style: pickEnum("kicker_style", KICKER_STYLES),
-        benefit_style: pickEnum("benefit_style", BENEFIT_STYLES),
         cta_style: pickEnum("cta_style", CTA_STYLES),
         cta_position: pickEnum("cta_position", CTA_POS),
         headline_case: pickEnum("headline_case", CASES),
@@ -823,83 +816,83 @@ function layoutCopy(concept, ctx, shape, W, H, k, nBenefits, showKicker) {
 
     y += (title.lines.length - 1) * lh + Math.round(title.fontSize * 1.08);
 
-    const blocks = [];
-    const benefits = concept.benefits.slice(0, nBenefits);
-    const style = concept.benefit_style;
+    // const blocks = [];
+    // const benefits = concept.benefits.slice(0, nBenefits);
+    // const style = concept.benefit_style;
 
-    if (benefits.length) {
-        const startFs = Math.round(base.benefit * k);
-        let block = null;
+    // if (benefits.length) {
+    //     const startFs = Math.round(base.benefit * k);
+    //     let block = null;
 
-        // Square banners: both benefits share one line, which saves height for the products.
-        if (shape === "square" && benefits.length > 1) {
-            const measure = (f) => {
-                const items = benefits.map((t) => benefitItem(style, t, f, pal));
-                const gap = Math.round(f * 0.6);
-                const total = items.reduce((s, b) => s + b.w, 0) + gap * (items.length - 1);
+    //     // Square banners: both benefits share one line, which saves height for the products.
+    //     if (shape === "square" && benefits.length > 1) {
+    //         const measure = (f) => {
+    //             const items = benefits.map((t) => benefitItem(style, t, f, pal));
+    //             const gap = Math.round(f * 0.6);
+    //             const total = items.reduce((s, b) => s + b.w, 0) + gap * (items.length - 1);
 
-                return { items, gap, total };
-            };
+    //             return { items, gap, total };
+    //         };
 
-            const minFs = Math.round(startFs * 0.78);
-            let f = startFs;
-            let m = measure(f);
+    //         const minFs = Math.round(startFs * 0.78);
+    //         let f = startFs;
+    //         let m = measure(f);
 
-            while (f > minFs && m.total > textW) {
-                f -= 1;
-                m = measure(f);
-            }
+    //         while (f > minFs && m.total > textW) {
+    //             f -= 1;
+    //             m = measure(f);
+    //         }
 
-            if (m.total <= textW) {
-                block = {
-                    h: Math.max(...m.items.map((b) => b.h)),
-                    draw: (top) => {
-                        let xx = centered ? Math.round(cx - m.total / 2) : x0;
-                        const out = [];
+    //         if (m.total <= textW) {
+    //             block = {
+    //                 h: Math.max(...m.items.map((b) => b.h)),
+    //                 draw: (top) => {
+    //                     let xx = centered ? Math.round(cx - m.total / 2) : x0;
+    //                     const out = [];
 
-                        for (const b of m.items) {
-                            out.push(b.draw(xx, top));
-                            xx += b.w + m.gap;
-                        }
+    //                     for (const b of m.items) {
+    //                         out.push(b.draw(xx, top));
+    //                         xx += b.w + m.gap;
+    //                     }
 
-                        return out;
-                    },
-                };
-            }
-        }
+    //                     return out;
+    //                 },
+    //             };
+    //         }
+    //     }
 
-        if (!block) {
-            const list = shape === "square" ? benefits.slice(0, 1) : benefits;
-            let fs = startFs;
-            const build = () => list.map((t) => benefitItem(style, t, fs, pal));
-            let built = build();
+    //     if (!block) {
+    //         const list = shape === "square" ? benefits.slice(0, 1) : benefits;
+    //         let fs = startFs;
+    //         const build = () => list.map((t) => benefitItem(style, t, fs, pal));
+    //         let built = build();
 
-            while (fs > 20 && built.some((b) => b.w > textW)) {
-                fs -= 1;
-                built = build();
-            }
+    //         while (fs > 20 && built.some((b) => b.w > textW)) {
+    //             fs -= 1;
+    //             built = build();
+    //         }
 
-            const rowGap = Math.round(fs * 0.3);
-            const h = built.reduce((s, b) => s + b.h, 0) + rowGap * (built.length - 1);
+    //         const rowGap = Math.round(fs * 0.3);
+    //         const h = built.reduce((s, b) => s + b.h, 0) + rowGap * (built.length - 1);
 
-            block = {
-                h,
-                draw: (top) => {
-                    let yy = top;
-                    const out = [];
+    //         block = {
+    //             h,
+    //             draw: (top) => {
+    //                 let yy = top;
+    //                 const out = [];
 
-                    for (const b of built) {
-                        out.push(b.draw(centered ? Math.round(cx - b.w / 2) : x0, yy));
-                        yy += b.h + rowGap;
-                    }
+    //                 for (const b of built) {
+    //                     out.push(b.draw(centered ? Math.round(cx - b.w / 2) : x0, yy));
+    //                     yy += b.h + rowGap;
+    //                 }
 
-                    return out;
-                },
-            };
-        }
+    //                 return out;
+    //             },
+    //         };
+    //     }
 
-        blocks.push(block);
-    }
+    //     blocks.push(block);
+    // }
 
     // if (ctx.kind === "group") {
     //     const btn = ctaButton(concept.cta_style, concept.cta_label, Math.round(base.cta * k), textW, pal);
@@ -913,11 +906,11 @@ function layoutCopy(concept, ctx, shape, W, H, k, nBenefits, showKicker) {
     //     else blocks.push(cta);
     // }
 
-    for (const b of blocks) {
-        y += sec;
-        els.push(...b.draw(y));
-        y += b.h;
-    }
+    // for (const b of blocks) {
+    //     y += sec;
+    //     els.push(...b.draw(y));
+    //     y += b.h;
+    // }
 
     return { els, h: Math.round(y) };
 }
@@ -946,26 +939,15 @@ function copyWash(shape, concept, pal) {
 // Each entry: [scale, benefits shown, kicker shown]. The first one that fits wins:
 // drop extras before shrinking text.
 const LADDER_DEFAULT = [
-    [1, 2, true],
-    [1, 2, false],
-    [0.92, 2, false],
-    [1, 1, true],
-    [0.92, 1, false],
-    [0.84, 1, false],
-    [0.76, 1, false],
-    [0.66, 1, false],
+    [1, 0, true],
+    [1, 0, false],
+    [0.92, 0, false],
+    [0.84, 0, false],
+    [0.76, 0, false],
+    [0.66, 0, false],
 ];
 
-// Square banners keep the copy compact (title + button, benefits only if they fit) so the products stay big.
-const LADDER_SQUARE = [
-    [1, 2, false],
-    [0.92, 2, false],
-    [1, 0, false],
-    [0.88, 0, false],
-    [0.8, 0, false],
-    [0.7, 0, false],
-    [0.62, 0, false],
-];
+const LADDER_SQUARE = LADDER_DEFAULT;
 
 function buildOverlaySvg(concept, ctx, shape, width, height) {
     const pal = PALETTES[concept.palette] || PALETTES.mist;
@@ -1045,7 +1027,6 @@ Design ONE specific, original banner concept for the supplied catalog entity. Ev
 {
  "label": string,
  "hero_items": string[],
- "benefits": string[],
  "palette": string,
  "idea": string,
  "visual_direction": string,
@@ -1055,13 +1036,11 @@ Design ONE specific, original banner concept for the supplied catalog entity. Ev
  "align_v": "left"|"center",
  "copy_valign": "top"|"center"|"bottom",
  "kicker_style": "rule"|"tag"|"plain",
- "benefit_style": "dots"|"ticks"|"chips"|"bars",
  "headline_case": "title"|"upper",
 }
 CONTENT RULES
 - label: 1-3 short buyer-friendly words in Title Case (4 words maximum). Use the generic product/category name, never a brand, model, price, size, unit, or claim. Shorter is better because it is typeset large.
 - hero_items: 3-4 generic, unbranded, recognizable product forms. Keep the selection coherent: variants for a product range; representative products for a subcategory; representative subcategories for a broad category. The first item is the dominant hero.
-- benefits: exactly 2 benefit OR application labels when the catalog context supports them. Each must be 2-3 words and at most 18 characters, because they are typeset large for phone screens. Use grounded, ordinary use-cases; never invent certifications, guarantees, prices, delivery promises, performance figures, or technical claims. Use [] rather than guess if unsupported.
 CREATIVE RULES
 - idea: one sentence naming the visual story, drawn from how these specific products are used, made, or built. It must not be a generic "products on a pedestal".
 - visual_direction: 1-2 sentences describing the set, composition, backdrop surface and light. Build a scene specific to these products: architectural framing, a staged vignette made from the products' own materials, a macro hero with receding variants, a diagonal cascade, a modular wall, an overhead flat-lay, colour-blocked geometric panels, layered cut-paper depth, a raw-material slab stage, a curved wall with a pool of light, and so on. Never default to a centered pile or a plain row of items.
@@ -1071,7 +1050,7 @@ CREATIVE RULES
 LAYOUT RULES (the copy is typeset separately over the image, so layout must vary)
 - side_h: which side the copy sits on in wide/landscape banners. side_v: top or bottom of square/portrait banners. align_v: left or center alignment for square/portrait copy. copy_valign: where the copy block sits vertically in wide/landscape banners.
 - Choose layout values that differ from the recently used banners supplied to you, and that suit this composition.
-- kicker_style, benefit_style, headline_case: pick a combination that is different from the recent banners. Use upper headline_case sparingly, mainly for bold technical or industrial products.
+- kicker_style, headline_case: pick a combination that is different from the recent banners. Use upper headline_case sparingly, mainly for bold technical or industrial products.
 You receive "creative_lens" as a starting point of inspiration; adapt it to the products, or ignore it if it clearly does not suit them. You also receive "recently_used_banners": do not repeat their layout combination or visual approach.`;
 
 const LENSES = [
@@ -1111,18 +1090,17 @@ async function recentConcepts(limit = 12) {
 
 const summariseConcept = (c) => ({
     palette: paletteOfConcept(c),
-    layout: [c.side_h, c.side_v, c.benefit_style].filter(Boolean).join("/") || null,
+    layout: [c.side_h, c.side_v].filter(Boolean).join("/") || null,
     direction: String(c.visual_direction || "").slice(0, 110),
 });
 
 // If the new concept repeats the look of a very recent one, shuffle the layout choices.
 function diversify(concept, recent) {
     // const sig = (c) => [paletteOfConcept(c), c.side_h, c.benefit_style, c.cta_style].join("|");
-    const sig = (c) => [paletteOfConcept(c), c.side_h, c.benefit_style].join("|");
+    const sig = (c) => [paletteOfConcept(c), c.side_h].join("|");
     const seen = new Set(recent.slice(0, 5).map(sig));
 
     for (let i = 0; i < 8 && seen.has(sig(concept)); i++) {
-        concept.benefit_style = randOf(BENEFIT_STYLES);
         concept.side_h = randOf(SIDE_H);
     }
 
