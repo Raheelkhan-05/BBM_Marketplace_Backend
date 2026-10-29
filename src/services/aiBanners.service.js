@@ -341,19 +341,43 @@ async function openai(path, body, { timeoutMs = 150_000, tries = 4 } = {}) {
 const randOf = (list) => list[Math.floor(Math.random() * list.length)];
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-// Every palette is contrast-checked: ink on wash, and onAccent on accent, are both >= 4.5:1.
+// Palettes span the colour wheel while staying light, sober and premium (plus a few dark studio looks).
+// Every palette is contrast-checked: ink and support text on wash, and onAccent on accent, all >= 4.5:1.
+const lightPal = (wash, ink, support, accent, bg) => ({
+    dark: false, wash, ink, support, accent, onAccent: "#FFFFFF",
+    cardFill: "#FFFFFF", cardOp: 0.85, cardStroke: ink, bg,
+});
+
+const darkPal = (wash, ink, support, accent, onAccent, bg) => ({
+    dark: true, wash, ink, support, accent, onAccent,
+    cardFill: "#FFFFFF", cardOp: 0.09, cardStroke: "#FFFFFF", bg,
+});
+
 const PALETTES = {
-    ivory: { dark: false, wash: "#FBF7F0", ink: "#1B2A2F", support: "#44535A", accent: "#C2410C", onAccent: "#FFFFFF", cardFill: "#FFFFFF", cardOp: 0.82, cardStroke: "#1B2A2F", bg: "warm ivory / pale cream seamless backdrop, bright soft studio light" },
-    mist: { dark: false, wash: "#EEF4FA", ink: "#0F2A44", support: "#3B536B", accent: "#1D4ED8", onAccent: "#FFFFFF", cardFill: "#FFFFFF", cardOp: 0.85, cardStroke: "#0F2A44", bg: "pale cool mist blue-grey backdrop, clean bright daylight studio light" },
-    sage: { dark: false, wash: "#EEF5EF", ink: "#12301F", support: "#3F5A49", accent: "#15803D", onAccent: "#FFFFFF", cardFill: "#FFFFFF", cardOp: 0.85, cardStroke: "#12301F", bg: "soft sage-white backdrop with gentle green-grey tonal depth, bright natural light" },
-    blush: { dark: false, wash: "#FBEFEF", ink: "#3A1620", support: "#6A4450", accent: "#BE185D", onAccent: "#FFFFFF", cardFill: "#FFFFFF", cardOp: 0.85, cardStroke: "#3A1620", bg: "pale blush / rose-white backdrop, soft diffused light" },
-    sand: { dark: false, wash: "#F6EEDF", ink: "#2E2414", support: "#5E5037", accent: "#B45309", onAccent: "#FFFFFF", cardFill: "#FFFFFF", cardOp: 0.8, cardStroke: "#2E2414", bg: "warm sand / oat backdrop with subtle mineral texture, golden soft light" },
-    slate: { dark: true, wash: "#111C27", ink: "#FFFFFF", support: "#CBD5E1", accent: "#FBBF24", onAccent: "#111C27", cardFill: "#FFFFFF", cardOp: 0.09, cardStroke: "#FFFFFF", bg: "deep slate-navy backdrop, low-key moody studio lighting with crisp rim light" },
-    teal: { dark: true, wash: "#0B2B2E", ink: "#F4FBFA", support: "#B7D9D5", accent: "#2DD4BF", onAccent: "#06292B", cardFill: "#FFFFFF", cardOp: 0.09, cardStroke: "#FFFFFF", bg: "deep teal-green backdrop, low-key studio lighting with controlled specular highlights" },
-    plum: { dark: true, wash: "#1F1630", ink: "#FFFFFF", support: "#D9CDEB", accent: "#F472B6", onAccent: "#2A0F20", cardFill: "#FFFFFF", cardOp: 0.09, cardStroke: "#FFFFFF", bg: "deep aubergine-plum backdrop, low-key dramatic studio lighting with soft rim light" },
+    ivory: lightPal("#FBF7F0", "#1B2A2F", "#44535A", "#C2410C", "warm ivory / pale cream seamless backdrop, bright soft studio light"),
+    mist: lightPal("#EEF4FA", "#0F2A44", "#3B536B", "#1D4ED8", "pale cool mist blue-grey backdrop, clean bright daylight studio light"),
+    sage: lightPal("#EEF5EF", "#12301F", "#3F5A49", "#15803D", "soft sage-white backdrop with gentle green-grey tonal depth, bright natural light"),
+    blush: lightPal("#FBEFEF", "#3A1620", "#6A4450", "#BE185D", "pale blush / rose-white backdrop, soft diffused light"),
+    sand: lightPal("#F6EEDF", "#2E2414", "#5E5037", "#B45309", "warm sand / oat backdrop with subtle mineral texture, golden soft light"),
+    lilac: lightPal("#F3EFFA", "#24193F", "#52466B", "#6D28D9", "pale lilac-lavender backdrop, soft cool diffused light"),
+    aqua: lightPal("#E8F6F7", "#0B3038", "#3D6068", "#0E7490", "pale aqua / seafoam backdrop, fresh bright studio light"),
+    citrus: lightPal("#F6F8E4", "#25300E", "#556033", "#4D7C0F", "pale lime-cream backdrop with a fresh yellow-green tint, bright airy light"),
+    coral: lightPal("#FDEEEA", "#3C1512", "#6E4540", "#B91C1C", "soft coral-peach backdrop, warm gentle light"),
+    jade: lightPal("#E9F5F1", "#0A3027", "#3C6256", "#0F766E", "pale jade / mint-green backdrop, clean bright light"),
+    butter: lightPal("#FBF5DC", "#33290A", "#665A28", "#A16207", "soft butter-yellow backdrop, warm sunny soft light"),
+    stone: lightPal("#F1F0EC", "#22211F", "#55524C", "#1E3A8A", "neutral warm stone-grey backdrop with fine mineral texture, even soft light"),
+    slate: darkPal("#111C27", "#FFFFFF", "#CBD5E1", "#FBBF24", "#111C27", "deep slate-navy backdrop, low-key moody studio lighting with crisp rim light"),
+    teal: darkPal("#0B2B2E", "#F4FBFA", "#B7D9D5", "#2DD4BF", "#06292B", "deep teal-green backdrop, low-key studio lighting with controlled specular highlights"),
+    plum: darkPal("#1F1630", "#FFFFFF", "#D9CDEB", "#F472B6", "#2A0F20", "deep aubergine-plum backdrop, low-key dramatic studio lighting with soft rim light"),
+    forest: darkPal("#0F2417", "#F1FAF3", "#BBD8C3", "#86EFAC", "#0B2414", "deep forest-green backdrop, low-key studio lighting with soft rim light"),
+    burgundy: darkPal("#2A1015", "#FFF5F5", "#E3C4C8", "#FCA5A5", "#2A1015", "deep burgundy-wine backdrop, low-key dramatic lighting with warm rim light"),
 };
 
-const LIGHT_PALETTES = ["ivory", "mist", "sage", "blush", "sand"];
+const PALETTE_GUIDE = Object.entries(PALETTES)
+    .map(([k, p]) => `${k} (${p.bg.split(",")[0]})`)
+    .join("; ");
+
+const LIGHT_PALETTES = Object.keys(PALETTES).filter((k) => !PALETTES[k].dark);
 const LEGACY_ACCENT = { orange: "ivory", blue: "mist", green: "sage" };
 
 const SIDE_H = ["left", "right"];
@@ -427,7 +451,7 @@ function normalizeConcept(raw, ctx, dflt = {}) {
     const hero = (Array.isArray(r.hero_items) ? r.hero_items : [])
         .map((v) => cleanLine(v, 60))
         .filter(Boolean)
-        .slice(0, 5);
+        .slice(0, 4);
 
     const benefits = (Array.isArray(r.benefits) ? r.benefits : [])
         .map((v) => cleanLine(v, 28).replace(/[.!]+$/g, "").trim())
@@ -538,15 +562,16 @@ const txt = (x, y, s, size, fill, { weight = 700, ls = 0, anchor = "start" } = {
 const isHorizontal = (shape) => shape === "wide" || shape === "landscape";
 
 // Fraction of the canvas reserved for copy on stacked (square / portrait) layouts.
-const ZONE = { square: 0.55, portrait: 0.49 };
+// Kept small on purpose so the products get the larger share of the banner.
+const ZONE = { square: 0.44, portrait: 0.44 };
 
-// Base sizes in px at the final output width. Roughly 3-5% of the banner width for supporting copy
-// so it stays readable when a banner is shown at half a phone screen.
+// Base sizes in px at the final output width. Supporting copy stays around 3-5% of the banner width
+// so it remains readable on a phone.
 const BASE = {
     wide: { kicker: 30, title: 108, benefit: 46, cta: 40 },
     landscape: { kicker: 28, title: 98, benefit: 44, cta: 38 },
-    square: { kicker: 32, title: 104, benefit: 48, cta: 44 },
-    portrait: { kicker: 32, title: 108, benefit: 50, cta: 46 },
+    square: { kicker: 30, title: 96, benefit: 44, cta: 42 },
+    portrait: { kicker: 32, title: 104, benefit: 48, cta: 44 },
 };
 
 const KICKER = {
@@ -738,14 +763,14 @@ function ctaButton(style, label, fs0, maxW, pal) {
    Built in local coordinates (y = 0 is the top of the block), measured, then placed by the caller. */
 
 function layoutCopy(concept, ctx, shape, W, H, k, nBenefits, showKicker) {
-    const pal = PALETTES[concept.palette];
+    const pal = PALETTES[concept.palette] || PALETTES.mist;
     const accent = pal.accent;
     const horizontal = isHorizontal(shape);
     const centered = !horizontal && concept.align_v === "center";
     const base = BASE[shape];
 
     const marginX = Math.round(W * (horizontal ? 0.06 : 0.065));
-    const textW = horizontal ? Math.round(W * 0.42) : W - marginX * 2;
+    const textW = horizontal ? Math.round(W * 0.40) : W - marginX * 2;
     const x0 = horizontal && concept.side_h === "right" ? W - marginX - textW : marginX;
     const cx = Math.round(x0 + textW / 2);
     const anchor = centered ? "middle" : "start";
@@ -788,7 +813,7 @@ function layoutCopy(concept, ctx, shape, W, H, k, nBenefits, showKicker) {
 
     const upper = concept.headline_case === "upper";
     const head = upper ? concept.label.toUpperCase() : concept.label;
-    const title = fitHeadline(head, textW, Math.round(base.title * k), 3);
+    const title = fitHeadline(head, textW, Math.round(base.title * k), shape === "square" ? 2 : 3);
     const lh = Math.round(title.fontSize * 1.06);
     const tls = upper ? 0 : -Math.round(title.fontSize * 0.012);
 
@@ -800,34 +825,80 @@ function layoutCopy(concept, ctx, shape, W, H, k, nBenefits, showKicker) {
 
     const blocks = [];
     const benefits = concept.benefits.slice(0, nBenefits);
+    const style = concept.benefit_style;
 
     if (benefits.length) {
-        let fs = Math.round(base.benefit * k);
-        const build = () => benefits.map((t) => benefitItem(concept.benefit_style, t, fs, pal));
-        let built = build();
+        const startFs = Math.round(base.benefit * k);
+        let block = null;
 
-        while (fs > 20 && built.some((b) => b.w > textW)) {
-            fs -= 1;
-            built = build();
+        // Square banners: both benefits share one line, which saves height for the products.
+        if (shape === "square" && benefits.length > 1) {
+            const measure = (f) => {
+                const items = benefits.map((t) => benefitItem(style, t, f, pal));
+                const gap = Math.round(f * 0.6);
+                const total = items.reduce((s, b) => s + b.w, 0) + gap * (items.length - 1);
+
+                return { items, gap, total };
+            };
+
+            const minFs = Math.round(startFs * 0.78);
+            let f = startFs;
+            let m = measure(f);
+
+            while (f > minFs && m.total > textW) {
+                f -= 1;
+                m = measure(f);
+            }
+
+            if (m.total <= textW) {
+                block = {
+                    h: Math.max(...m.items.map((b) => b.h)),
+                    draw: (top) => {
+                        let xx = centered ? Math.round(cx - m.total / 2) : x0;
+                        const out = [];
+
+                        for (const b of m.items) {
+                            out.push(b.draw(xx, top));
+                            xx += b.w + m.gap;
+                        }
+
+                        return out;
+                    },
+                };
+            }
         }
 
-        const rowGap = Math.round(fs * 0.3);
-        const h = built.reduce((s, b) => s + b.h, 0) + rowGap * (built.length - 1);
+        if (!block) {
+            const list = shape === "square" ? benefits.slice(0, 1) : benefits;
+            let fs = startFs;
+            const build = () => list.map((t) => benefitItem(style, t, fs, pal));
+            let built = build();
 
-        blocks.push({
-            h,
-            draw: (top) => {
-                let yy = top;
-                const out = [];
+            while (fs > 20 && built.some((b) => b.w > textW)) {
+                fs -= 1;
+                built = build();
+            }
 
-                for (const b of built) {
-                    out.push(b.draw(centered ? Math.round(cx - b.w / 2) : x0, yy));
-                    yy += b.h + rowGap;
-                }
+            const rowGap = Math.round(fs * 0.3);
+            const h = built.reduce((s, b) => s + b.h, 0) + rowGap * (built.length - 1);
 
-                return out;
-            },
-        });
+            block = {
+                h,
+                draw: (top) => {
+                    let yy = top;
+                    const out = [];
+
+                    for (const b of built) {
+                        out.push(b.draw(centered ? Math.round(cx - b.w / 2) : x0, yy));
+                        yy += b.h + rowGap;
+                    }
+
+                    return out;
+                },
+            };
+        }
+
+        blocks.push(block);
     }
 
     if (ctx.kind === "group") {
@@ -851,10 +922,11 @@ function layoutCopy(concept, ctx, shape, W, H, k, nBenefits, showKicker) {
     return { els, h: Math.round(y) };
 }
 
+// The wash fades out just before the products start, so it never hazes them.
 function copyWash(shape, concept, pal) {
-    const z = isHorizontal(shape) ? 0.48 : ZONE[shape];
+    const z = isHorizontal(shape) ? 0.46 : ZONE[shape] - 0.03;
 
-    const stops = [[0, 0.99], [0.7 * z, 0.98], [0.88 * z, 0.94], [z, 0.72], [1.15 * z, 0.18], [1.3 * z, 0]];
+    const stops = [[0, 0.99], [0.72 * z, 0.98], [0.92 * z, 0.92], [z, 0.7], [1.12 * z, 0.2], [1.24 * z, 0]];
 
     let axis;
 
@@ -871,8 +943,9 @@ function copyWash(shape, concept, pal) {
     return `<linearGradient id="copyWash" ${axis}>${body}</linearGradient>`;
 }
 
-// Biggest-and-clearest wins: drop the kicker or a benefit before shrinking text.
-const LADDER = [
+// Each entry: [scale, benefits shown, kicker shown]. The first one that fits wins:
+// drop extras before shrinking text.
+const LADDER_DEFAULT = [
     [1, 2, true],
     [1, 2, false],
     [0.92, 2, false],
@@ -883,9 +956,21 @@ const LADDER = [
     [0.66, 1, false],
 ];
 
+// Square banners keep the copy compact (title + button, benefits only if they fit) so the products stay big.
+const LADDER_SQUARE = [
+    [1, 2, false],
+    [0.92, 2, false],
+    [1, 0, false],
+    [0.88, 0, false],
+    [0.8, 0, false],
+    [0.7, 0, false],
+    [0.62, 0, false],
+];
+
 function buildOverlaySvg(concept, ctx, shape, width, height) {
     const pal = PALETTES[concept.palette] || PALETTES.mist;
     const horizontal = isHorizontal(shape);
+    const ladder = shape === "square" ? LADDER_SQUARE : LADDER_DEFAULT;
 
     const padY = horizontal ? Math.round(height * 0.07) : Math.round(width * 0.065);
 
@@ -895,7 +980,7 @@ function buildOverlaySvg(concept, ctx, shape, width, height) {
 
     let chosen = null;
 
-    for (const [k, n, kicker] of LADDER) {
+    for (const [k, n, kicker] of ladder) {
         chosen = layoutCopy(concept, ctx, shape, width, height, k, n, kicker);
         if (chosen.h <= maxH) break;
     }
@@ -917,17 +1002,51 @@ function buildOverlaySvg(concept, ctx, shape, width, height) {
     );
 }
 
+/* ---- colour rotation ----
+   The server decides which palettes the AI may use, so the home page never ends up one colour. */
+
+const PALETTE_MEMORY = 8;
+
+const paletteOfConcept = (c) =>
+    PALETTES[c?.palette] ? c.palette : LEGACY_ACCENT[c?.accent] || null;
+
+const shuffle = (arr) => {
+    const a = [...arr];
+
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+
+    return a;
+};
+
+// `recent` is newest-first. Returns the palettes used lately and 5 fresh ones the AI may choose from.
+function paletteOffers(recent) {
+    const all = Object.keys(PALETTES);
+    const used = recent.slice(0, PALETTE_MEMORY).map(paletteOfConcept).filter(Boolean);
+    const lastFew = used.slice(0, 3);
+    const darkRecent = lastFew.some((k) => PALETTES[k].dark);
+
+    let pool = all.filter((k) => !used.includes(k) && !(darkRecent && PALETTES[k].dark));
+
+    if (pool.length < 3) pool = all.filter((k) => !lastFew.includes(k));
+    if (!pool.length) pool = all;
+
+    return { used, offers: shuffle(pool).slice(0, 5) };
+}
+
 /* ===== DESIGN SYSTEM END ===== */
 
 /* ------------------------- creative concept (AI) ------------------------- */
 
 const CONCEPT_SYSTEM = `You are a senior creative director and art director for a premium B2B wholesale marketplace.
-Design ONE specific, original banner concept for the supplied catalog entity. Every banner in the catalogue must feel like it came from a different campaign: different idea, different set, different palette, different layout. Return valid JSON only:
+Design ONE specific, original banner concept for the supplied catalog entity. Every banner in the catalogue must feel like it came from a different campaign: different idea, different set, different colour, different layout. Return valid JSON only:
 {
  "label": string,
  "hero_items": string[],
  "benefits": string[],
- "palette": "ivory"|"mist"|"sage"|"blush"|"sand"|"slate"|"teal"|"plum",
+ "palette": string,
  "idea": string,
  "visual_direction": string,
  "camera": string,
@@ -944,19 +1063,20 @@ Design ONE specific, original banner concept for the supplied catalog entity. Ev
 }
 CONTENT RULES
 - label: 1-3 short buyer-friendly words in Title Case (4 words maximum). Use the generic product/category name, never a brand, model, price, size, unit, or claim. Shorter is better because it is typeset large.
-- hero_items: 3-5 generic, unbranded, recognizable product forms. Keep the selection coherent: variants for a product range; representative products for a subcategory; representative subcategories for a broad category.
+- hero_items: 3-4 generic, unbranded, recognizable product forms. Keep the selection coherent: variants for a product range; representative products for a subcategory; representative subcategories for a broad category. The first item is the dominant hero.
 - benefits: exactly 2 benefit OR application labels when the catalog context supports them. Each must be 2-3 words and at most 18 characters, because they are typeset large for phone screens. Use grounded, ordinary use-cases; never invent certifications, guarantees, prices, delivery promises, performance figures, or technical claims. Use [] rather than guess if unsupported.
 - cta_label: 2-3 words, at most 16 characters, an invitation to browse (for example "Shop the range", "Browse variants", "See the range"). Vary the wording. No prices, discounts, or promises.
 CREATIVE RULES
 - idea: one sentence naming the visual story, drawn from how these specific products are used, made, or built. It must not be a generic "products on a pedestal".
 - visual_direction: 1-2 sentences describing the set, composition, backdrop surface and light. Build a scene specific to these products: architectural framing, a staged vignette made from the products' own materials, a macro hero with receding variants, a diagonal cascade, a modular wall, an overhead flat-lay, colour-blocked geometric panels, layered cut-paper depth, a raw-material slab stage, a curved wall with a pool of light, and so on. Never default to a centered pile or a plain row of items.
-- camera: a short phrase (angle, lens feel, depth of field).
-- palette: choose from the materials, mood and category of the products. slate, teal and plum are dark studio backgrounds for premium, technical, electrical, lighting or tool products; the rest are light. Do NOT reuse the palette of the most recent banners.
+- PRODUCT SCALE IS CRITICAL: the products are the star and must be recognisable at a glance, even as a small thumbnail. Compose with FEW, LARGE products and one clearly dominant hero, tight framing, a close camera. Never plan many small items, wide empty floors, or tiny products lost in a big scene.
+- camera: a short phrase (angle, lens feel, depth of field). Prefer close, tight framing.
+- palette: pick EXACTLY ONE value from "allowed_palettes" (the server already removed colours used recently, so every banner on the home page has a different colour). Choose the one that best suits the products' materials and mood. Palette guide: ${PALETTE_GUIDE}. The look must stay light, sober, professional and premium; slate, teal, plum, forest and burgundy are dark studio looks, so pick one only when it clearly suits the products (premium, technical, electrical, lighting, tools).
 LAYOUT RULES (the copy is typeset separately over the image, so layout must vary)
 - side_h: which side the copy sits on in wide/landscape banners. side_v: top or bottom of square/portrait banners. align_v: left or center alignment for square/portrait copy. copy_valign: where the copy block sits vertically in wide/landscape banners.
 - Choose layout values that differ from the recently used banners supplied to you, and that suit this composition.
 - kicker_style, benefit_style, cta_style, cta_position, headline_case: pick a combination that is different from the recent banners. Use upper headline_case sparingly, mainly for bold technical or industrial products.
-You receive "creative_lens" as a starting point of inspiration; adapt it to the products, or ignore it if it clearly does not suit them. You also receive "recently_used_banners": do not repeat their palette, layout combination or visual approach.`;
+You receive "creative_lens" as a starting point of inspiration; adapt it to the products, or ignore it if it clearly does not suit them. You also receive "recently_used_banners": do not repeat their layout combination or visual approach.`;
 
 const LENSES = [
     "monumental architecture: arches, stepped plinths and deep shadows",
@@ -977,7 +1097,7 @@ const LENSES = [
     "a split-level set with two surfaces at different heights",
 ];
 
-async function recentConcepts(limit = 10) {
+async function recentConcepts(limit = 12) {
     try {
         const { data } = await supabaseAdmin
             .from("ai_banner_jobs")
@@ -994,14 +1114,14 @@ async function recentConcepts(limit = 10) {
 }
 
 const summariseConcept = (c) => ({
-    palette: c.palette || null,
+    palette: paletteOfConcept(c),
     layout: [c.side_h, c.side_v, c.benefit_style, c.cta_style].filter(Boolean).join("/") || null,
     direction: String(c.visual_direction || "").slice(0, 110),
 });
 
 // If the new concept repeats the look of a very recent one, shuffle the layout choices.
 function diversify(concept, recent) {
-    const sig = (c) => [c.palette, c.side_h, c.benefit_style, c.cta_style].join("|");
+    const sig = (c) => [paletteOfConcept(c), c.side_h, c.benefit_style, c.cta_style].join("|");
     const seen = new Set(recent.slice(0, 5).map(sig));
 
     for (let i = 0; i < 8 && seen.has(sig(concept)); i++) {
@@ -1015,6 +1135,7 @@ function diversify(concept, recent) {
 
 async function buildConcept(ctx) {
     const recent = await recentConcepts();
+    const { used, offers } = paletteOffers(recent);
     let concept;
 
     try {
@@ -1028,6 +1149,8 @@ async function buildConcept(ctx) {
                     role: "user",
                     content: JSON.stringify({
                         catalog_entity: ctx.brief,
+                        allowed_palettes: offers,
+                        recently_used_palettes: used,
                         creative_lens: randOf(LENSES),
                         recently_used_banners: recent.map(summariseConcept),
                         variation_seed: Math.random().toString(36).slice(2, 8),
@@ -1041,6 +1164,9 @@ async function buildConcept(ctx) {
         console.error("[ai-banners] concept failed, using fallback:", e?.message);
         concept = normalizeConcept({}, ctx);
     }
+
+    // The colour is enforced here, whatever the AI answered.
+    if (!offers.includes(concept.palette)) concept.palette = randOf(offers);
 
     return diversify(concept, recent);
 }
@@ -1081,22 +1207,22 @@ async function priorConcept(job, ctx) {
 
 function compositionFor(orientation, concept) {
     if (orientation === "landscape") {
-        const edge = "Keep every product at least 10% away from the top and bottom edges and at least 7% away from the left and right edges so nothing is cropped.";
+        const edge = "Keep every product at least 8% away from the top and bottom edges and at least 5% away from the left and right edges so nothing is cropped.";
 
         return concept.side_h === "right"
-            ? `Landscape product photograph. Place the coherent hero arrangement in the LEFT 54-58% of the canvas, with the visual center around 27% of the width. Keep the entire RIGHT 44% visually quiet, smooth and free of objects for a separately typeset headline and copy. The products must remain fully visible and must not intrude into the right copy area. ${edge}`
-            : `Landscape product photograph. Place the coherent hero arrangement in the RIGHT 54-58% of the canvas, with the visual center around 73% of the width. Keep the entire LEFT 44% visually quiet, smooth and free of objects for a separately typeset headline and copy. The products must remain fully visible and must not intrude into the left copy area. ${edge}`;
+            ? `Landscape product photograph. Place the hero arrangement in the LEFT 54-57% of the canvas (visual center around 28% of the width) and make it LARGE: it should fill roughly 85% of the canvas height and most of that zone's width. Keep the entire RIGHT 43% visually quiet, smooth and free of objects for a separately typeset headline and copy. The products must stay fully visible and must not intrude into the right copy area. ${edge}`
+            : `Landscape product photograph. Place the hero arrangement in the RIGHT 54-57% of the canvas (visual center around 72% of the width) and make it LARGE: it should fill roughly 85% of the canvas height and most of that zone's width. Keep the entire LEFT 43% visually quiet, smooth and free of objects for a separately typeset headline and copy. The products must stay fully visible and must not intrude into the left copy area. ${edge}`;
     }
 
     if (orientation === "square") {
         return concept.side_v === "bottom"
-            ? "Square product photograph. Build an intentional, dimensional arrangement only in the UPPER 42-44% of the frame. Keep the lower 55% clean, smooth, low-detail, and completely free of objects for a separately typeset headline, supporting copy and button. Use a confident silhouette and deliberate negative space; keep products away from the left, right and top edges."
-            : "Square product photograph. Build an intentional, dimensional arrangement only in the LOWER 42-44% of the frame. Keep the upper 55% clean, smooth, low-detail, and completely free of objects for a separately typeset headline, supporting copy and button. Use a confident silhouette and deliberate negative space; keep products away from the left, right and bottom edges.";
+            ? "Square product photograph. Build the hero arrangement in the UPPER 56% of the frame and make it LARGE and dominant: it should span roughly 85-90% of the canvas width and fill most of that zone's height, so the products read instantly. Keep the lower 44% clean, smooth, low-detail, and completely free of objects for a separately typeset headline and button. Keep products fully visible, away from the left, right and top edges."
+            : "Square product photograph. Build the hero arrangement in the LOWER 56% of the frame and make it LARGE and dominant: it should span roughly 85-90% of the canvas width and fill most of that zone's height, so the products read instantly. Keep the upper 44% clean, smooth, low-detail, and completely free of objects for a separately typeset headline and button. Keep products fully visible, away from the left, right and bottom edges.";
     }
 
     return concept.side_v === "bottom"
-        ? "Portrait product photograph. Place the product arrangement in the UPPER 49-51% of the frame, with clear separation between silhouettes. Keep the lower 49% smooth, low-detail, and free of objects for a separately typeset headline, supporting copy and button. Do not crop the hero products at the edges."
-        : "Portrait product photograph. Place the product arrangement in the LOWER 49-51% of the frame, with clear separation between silhouettes. Keep the upper 49% smooth, low-detail, and free of objects for a separately typeset headline, supporting copy and button. Do not crop the hero products at the edges.";
+        ? "Portrait product photograph. Place the hero arrangement in the UPPER 56% of the frame and make it LARGE and dominant, spanning roughly 85-90% of the canvas width, with clear separation between silhouettes. Keep the lower 44% smooth, low-detail, and free of objects for a separately typeset headline, supporting copy and button. Do not crop the hero products at the edges."
+        : "Portrait product photograph. Place the hero arrangement in the LOWER 56% of the frame and make it LARGE and dominant, spanning roughly 85-90% of the canvas width, with clear separation between silhouettes. Keep the upper 44% smooth, low-detail, and free of objects for a separately typeset headline, supporting copy and button. Do not crop the hero products at the edges.";
 }
 
 const KIND_PHRASE = {
@@ -1112,7 +1238,9 @@ function buildImagePrompt(concept, ctx, orientation) {
 
 CREATIVE CONCEPT: ${concept.idea || "A product-specific visual story built around how these products are used and made."}
 
-PRODUCT SUBJECTS: ${concept.hero_items.join("; ")}. Show 3-5 recognizable, generic, unbranded product forms appropriate to this catalog entity. Keep them physically plausible, correctly proportioned, beautifully lit, and distinct from one another. Do not introduce unrelated product categories. No visible people, logos, brand marks, packaging copy, labels, letters, numbers, watermarks, typography, interface elements, buttons, badges, icons, or pseudo-text. Absolutely no text anywhere in the generated image: all copy will be typeset separately afterward.
+PRODUCT SUBJECTS: ${concept.hero_items.join("; ")}. Show 3-4 recognizable, generic, unbranded product forms appropriate to this catalog entity, with ONE dominant hero product at least 1.5 times larger than the others. Keep them physically plausible, correctly proportioned, beautifully lit, and distinct from one another. Do not introduce unrelated product categories. No visible people, logos, brand marks, packaging copy, labels, letters, numbers, watermarks, typography, interface elements, buttons, badges, icons, or pseudo-text. Absolutely no text anywhere in the generated image: all copy will be typeset separately afterward.
+
+PRODUCT SCALE (very important): the products must be BIG and instantly recognisable, even when this image is viewed as a small thumbnail on a phone. Use tight, close framing; fewer, larger products beat many small ones. The products should fill their allotted zone almost edge to edge, with no wide empty floor, no distant camera, and no tiny products lost in a large scene.
 
 ART DIRECTION: ${concept.visual_direction}. CAMERA: ${concept.camera}. Make this a product-specific campaign, not a stock-photo template. The set may use abstract geometric pieces (plinths, arches, slabs, panels, steps) in materials related to the products. Use believable contact shadows, varied product heights, and a deliberate asymmetrical silhouette. Avoid an identical centered pile, generic floating products, repeated tiles, and an empty generic gradient as the only design idea.
 
