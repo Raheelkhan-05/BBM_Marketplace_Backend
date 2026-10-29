@@ -21,6 +21,7 @@ import { logActivity } from "../services/team.service.js";
 import { pingCustomersChanged } from "../services/salesSync.service.js";
 import { cached, getVer, bumpVer, hashKey } from "../services/cache.service.js";
 import { resolveGstin, addOne } from "./sellerCustomers.controller.js";
+import { fillCustomerContact } from "../services/sellerCustomerContact.service.js";
 import {
     BUCKET, GSTIN_RE, getSalesActor, str, safeSearch, cleanGstin, cleanPhone, cleanEmail, round4,
     saleUnits, priceLine, listingProblem, listingDescription, productUrl, clipPreview, ping,
@@ -86,7 +87,9 @@ async function canonicalCustomerName({ sellerId, ownerId, gstin }) {
     return "";
 }
 
-// Adds the quoted customer to the salesperson's customer list (once). Never fails the quotation.
+// Adds the quoted customer to the salesperson's customer list (once), with the contact used on the quotation.
+// A customer who is already in the list but has no phone / email saved gets the contact filled in (never overwritten),
+// so it is pre-filled next time. Never fails the quotation.
 async function ensureCustomer({ sellerId, companyId, actorId, teamId, thread }) {
     try {
         const out = await addOne(sellerId, companyId, thread.customer_gstin, "gst", {
@@ -104,6 +107,11 @@ async function ensureCustomer({ sellerId, companyId, actorId, teamId, thread }) 
             } catch { /* best effort */ }
             return { status: "added", name: out.name || "" };
         }
+        // Already in the list: save any contact that was missing.
+        await fillCustomerContact({
+            sellerId, companyId, actorId, gstin: thread.customer_gstin,
+            phone: thread.customer_phone || "", email: thread.customer_email || "",
+        });
         return { status: out?.result === "exists" ? "exists" : "skipped", name: "" };
     } catch (e) {
         console.error("[sales threads] add customer failed:", e?.message || e);
@@ -663,7 +671,8 @@ const cleanChannels = (list) => [...new Set((Array.isArray(list) ? list : []).fi
 // ---- POST /sales/threads/:id/quotes --------------------------------------------------------------------
 // { items: [{ submissionId, quantity, price, gstInclusive, setCustomPrice }], channels, validityDays, note }
 // setCustomPrice === true also stores the quoted price as this buyer's custom price on BBM (when the customer is a BBM buyer).
-// The customer is added to the salesperson's customer list on the first quotation (if not already there).
+// The customer is added to the salesperson's customer list on the first quotation (if not already there); if they are
+// already there without a phone / email, the contact used on the quotation is saved on them.
 export async function sendQuote(req, res) {
     try {
         const { actorId, actorName, actorEmail, ownerId, sellerId } = getSalesActor(req);

@@ -4,6 +4,8 @@
 // It never touches the marketplace orders, wallet, stock or pricing. Prices here are for the log only.
 // Catalog products are ordered in whole packs or master packs (never single units).
 // The customer must have a mobile number or an email, and the buyer address is filled from the GST number (editable).
+// Contact details typed while punching an order are saved on the customer, so they are pre-filled next time.
+// An optional Purchase Order (PO) number can be added to an order; it is searchable in the Order Book.
 // When an order is marked processed, the customer is thanked by email / WhatsApp on behalf of the company.
 import multer from "multer";
 import { supabase, supabaseAdmin } from "../config/supabase.js";
@@ -17,6 +19,7 @@ import { getSalesActor, str, safeSearch, cleanGstin, cleanPhone, cleanEmail, rou
 import { BUCKET, STATUSES, LIST_COLS, orderDto, eventDto, signDocs, broadcast } from "../services/orderBook.service.js";
 import { notifyOrderProcessed, notifyOrderPlaced } from "../services/orderBookNotify.service.js";
 import { productDetails } from "../services/orderBookProduct.service.js";
+import { fillCustomerContact } from "../services/sellerCustomerContact.service.js";
 
 const MAX_LINES = 20;
 const NO_SELLER = "Your company's seller account isn't approved yet, so products can't be added.";
@@ -29,6 +32,9 @@ const round4 = (x) => Math.round(x * 1e4) / 1e4;
 const fail = (res, status, message) => res.status(status).json({ success: false, message });
 const oops = (res, e) => { console.error("[order book]", e?.message || e); return fail(res, 500, "Something went wrong. Please try again."); };
 const flatSub = ({ hs_generic_product_brands, ...rest }) => ({ ...rest, brand: hs_generic_product_brands || null });
+
+// The shared orderDto plus the optional PO number (column order_book_orders.po_number).
+const dtoOf = (row, docs) => ({ ...orderDto(row, docs), poNumber: row?.po_number || null });
 
 /* ------------------------------ who is calling ------------------------------ */
 function salesScope(req) {
@@ -69,16 +75,25 @@ async function canonicalCustomerName({ sellerId, companyId, gstin }) {
     return "";
 }
 
-// Adds the customer to the salesperson's customer list (once). Never fails the order.
-async function ensureCustomer({ s, gstin, phone, email }) {
-    if (!gstin) return;
+// Keeps the customer in the salesperson's customer list, WITH the contact details used on the order. Never fails the order.
+//  - new customer (GST number given): added with the contact.
+//  - customer already in the list (picked, or the same GST typed again): any EMPTY phone / email is filled in,
+//    so the contact is pre-filled the next time. Saved details are never overwritten.
+async function ensureCustomer({ s, customerId, gstin, phone, email }) {
     try {
-        const out = await addOne(s.sellerId, s.companyId, gstin, "gst", {
-            assigned_to: s.actorId, assigned_by: s.actorId, assigned_kind: "self", assigned_at: new Date().toISOString(),
-            contact_name: null, contact_phone: phone || null, contact_email: email || null,
-        });
-        if (out?.result === "added" || out?.result === "saved") {
-            Promise.resolve(pingCustomersChanged(s.companyId, [s.actorId])).catch(() => { /* best effort */ });
+        let result = null;
+        if (gstin) {
+            const out = await addOne(s.sellerId, s.companyId, gstin, "gst", {
+                assigned_to: s.actorId, assigned_by: s.actorId, assigned_kind: "self", assigned_at: new Date().toISOString(),
+                contact_name: null, contact_phone: phone || null, contact_email: email || null,
+            });
+            result = out?.result || null;
+            if (result === "added" || result === "saved") {
+                Promise.resolve(pingCustomersChanged(s.companyId, [s.actorId])).catch(() => { /* best effort */ });
+            }
+        }
+        if (result !== "added" && result !== "saved") {
+            await fillCustomerContact({ sellerId: s.sellerId, companyId: s.companyId, actorId: s.actorId, customerId, gstin, phone, email });
         }
     } catch (e) { console.error("[order book] add customer failed:", e?.message || e); }
 }
@@ -204,10 +219,11 @@ async function listFor(req, res, scope) {
         const q = safeSearch(req.query.q);
         const status = STATUSES.includes(req.query.status) ? req.query.status : "";
 
-        let query = supabase.from("order_book_orders").select(LIST_COLS, { count: "exact" }).eq("company_id", scope.companyId);
+        // po_number is added on top of the shared column list so the PO shows in the list and can be searched.
+        let query = supabase.from("order_book_orders").select(`${LIST_COLS}, po_number`, { count: "exact" }).eq("company_id", scope.companyId);
         if (scope.salespersonId) query = query.eq("salesperson_id", scope.salespersonId);
         if (status) query = query.eq("status", status);
-        if (q) query = query.or(`customer_name.ilike.%${q}%,order_no.ilike.%${q}%,customer_gstin.ilike.%${q}%`);
+        if (q) query = query.or(`customer_name.ilike.%${q}%,order_no.ilike.%${q}%,customer_gstin.ilike.%${q}%,po_number.ilike.%${q}%`);
         query = query.order("last_activity_at", { ascending: false }).order("id", { ascending: true }).range(offset, offset + limit - 1);
 
         const first = offset === 0;
@@ -218,7 +234,7 @@ async function listFor(req, res, scope) {
         if (list.error) throw list.error;
         if (cnt?.error) throw cnt.error;
 
-        const items = (list.data || []).map((r) => orderDto(r));
+        const items = (list.data || []).map((r) => dtoOf(r));
         const body = { success: true, items, total: list.count ?? items.length, hasMore: offset + items.length < (list.count ?? 0) };
         if (first) body.counts = countsOf(cnt.data);
         res.json(body);
@@ -240,7 +256,7 @@ async function detailFor(req, res, scope) {
             signDocs(row),
         ]);
         if (ev.error) throw ev.error;
-        res.json({ success: true, order: orderDto(row, docs), events: (ev.data || []).map(eventDto) });
+        res.json({ success: true, order: dtoOf(row, docs), events: (ev.data || []).map(eventDto) });
     } catch (e) { oops(res, e); }
 }
 
@@ -249,9 +265,10 @@ export const listMine = (req, res) => listFor(req, res, salesScope(req));
 export const getMine = (req, res) => detailFor(req, res, salesScope(req));
 
 // POST /api/sales/order-book
-// { customerGstin?, customerName?, customerPhone?, customerEmail?, customerAddress?, customerCity?, customerState?, customerPincode?,
-//   items:[{productSubmissionId, basis:"per_pack"|"per_master_pack", quantity, unitPrice} | {productName, unit, quantity, unitPrice}], notes? }
+// { customerId?, customerGstin?, customerName?, customerPhone?, customerEmail?, customerAddress?, customerCity?, customerState?, customerPincode?,
+//   poNumber?, items:[{productSubmissionId, basis:"per_pack"|"per_master_pack", quantity, unitPrice} | {productName, unit, quantity, unitPrice}], notes? }
 // The customer needs at least a mobile number or an email, so they can be told when the order is processed.
+// customerId is the picked customer's row id (so their contact can be saved even when they have no GST number).
 export async function createOrder(req, res) {
     try {
         const s = salesScope(req);
@@ -267,6 +284,9 @@ export async function createOrder(req, res) {
         if (phoneRaw && !phone) return fail(res, 400, "Enter a valid 10-digit mobile number.");
         if (emailRaw && !email) return fail(res, 400, "Enter a valid email address.");
         if (!phone && !email) return fail(res, 400, NO_CONTACT);
+
+        const customerId = isUuid(b.customerId) ? String(b.customerId) : "";
+        const poNumber = str(b.poNumber, 60);
 
         const address = str(b.customerAddress, 400), city = str(b.customerCity, 80), stateName = str(b.customerState, 60);
         const pincode = str(b.customerPincode, 10).replace(/\s/g, "");
@@ -288,6 +308,7 @@ export async function createOrder(req, res) {
             company_id: s.companyId, seller_id: s.sellerId, salesperson_id: s.actorId, salesperson_name: s.actorName,
             customer_name: customerName, customer_gstin: gstin || null, customer_phone: phone || null, customer_email: email || null,
             customer_address: address || null, customer_city: city || null, customer_state: stateName || null, customer_pincode: pincode || null,
+            po_number: poNumber || null,
             items, total_amount: total, notes: str(b.notes, 1000) || null,
             status: "placed", last_activity_at: now, updated_at: now,
         }).select("*").single();
@@ -297,7 +318,8 @@ export async function createOrder(req, res) {
             order_id: row.id, actor_id: s.actorId, actor_name: s.actorName, kind: "created",
             body: `Order punched by ${s.actorName}`,
         });
-        ensureCustomer({ s, gstin, phone, email });
+        // Not awaited by the response path's critical work, but started before it so the contact is saved right away.
+        ensureCustomer({ s, customerId, gstin, phone, email });
 
         try {
             await logActivity({
@@ -316,7 +338,7 @@ export async function createOrder(req, res) {
         // Greet the customer: order received + order and billing details (email / WhatsApp). After the response path, never blocks it.
         notifyOrderPlaced(row).catch((e) => console.error("[order book] order-placed notify failed:", e?.message || e));
 
-        res.json({ success: true, order: orderDto(row), message: "Order punched." });
+        res.json({ success: true, order: dtoOf(row), message: "Order punched." });
     } catch (e) { oops(res, e); }
 }
 
@@ -370,7 +392,7 @@ async function move(req, res, row, to, { patch = {}, eventBody }) {
         body: `${row.customer_name}: the order ${NOTE[to]}.`, link: `/sales/order-book/${row.id}`,
     }).catch(() => { /* best effort */ });
 
-    res.json({ success: true, order: orderDto(data) });
+    res.json({ success: true, order: dtoOf(data) });
     return true;
 }
 

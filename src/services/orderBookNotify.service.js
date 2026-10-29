@@ -1,155 +1,673 @@
 // services/orderBookNotify.service.js
-// Customer-facing messages for the Order Book, sent on behalf of the selling company. Best effort only:
-// nothing here may ever fail or slow down punching an order or changing its status.
-//   notifyOrderPlaced     -> when the salesperson punches the order: greeting, "we have your details", order + billing details
-//   notifyOrderProcessed  -> when the team marks it processed: "thank you for your purchase"
+//
+// Customer-facing notifications for Order Book.
+//
+// notifyOrderPlaced:
+//   Sends order received details through email and WhatsApp.
+//
+// notifyOrderProcessed:
+//   Sends order processing confirmation through email and WhatsApp.
+//
+// Important:
+//   - Notification failures must not break order operations.
+//   - Seller names are loaded from seller_profiles.display_name.
+//   - Seller shop links use seller_profiles.shop_slug.
+//   - Billing addresses are normalized to avoid duplicate locations.
+
 import { supabase } from "../config/supabase.js";
-import { sendOrderProcessedEmail, sendOrderPlacedEmail } from "./mail.service.js";
-import { sendOrderProcessedWhatsApp, sendOrderPlacedWhatsApp } from "./whatsapp.service.js";
 
-// Where the shop link points: {SITE_URL}/sellers/{slug}. Set FRONTEND_URL=http://localhost:5173 for local testing.
-const SITE_URL = (process.env.FRONTEND_URL || process.env.SITE_URL || "https://bbm.business").replace(/\/+$/, "");
+import {
+    sendOrderProcessedEmail,
+    sendOrderPlacedEmail,
+} from "./mail.service.js";
 
-// ASSUMPTION: adjust these if your sellers table uses other column names.
-const SELLERS_TABLE = "sellers";
-const SLUG_KEYS = ["slug", "shop_slug", "store_slug"];
-const NAME_KEYS = ["shop_name", "store_name", "business_name", "company_name", "name"];
+import {
+    sendOrderProcessedWhatsApp,
+    sendOrderPlacedWhatsApp,
+} from "./whatsapp.service.js";
+
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
+
+const SITE_URL = (
+    process.env.FRONTEND_URL ||
+    process.env.SITE_URL ||
+    "https://bbm.business"
+).replace(/\/+$/, "");
+
+const SELLERS_TABLE = "seller_profiles";
+
+const SLUG_KEYS = [
+    "shop_slug",
+    "slug",
+    "store_slug",
+];
+
+const NAME_KEYS = [
+    "display_name",
+    "shop_name",
+    "store_name",
+    "business_name",
+    "company_name",
+    "name",
+];
+
+// -----------------------------------------------------------------------------
+// General helpers
+// -----------------------------------------------------------------------------
 
 const firstOf = (obj, keys) => {
-    for (const k of keys) {
-        const v = obj?.[k];
-        if (v && String(v).trim()) return String(v).trim();
+    for (const key of keys) {
+        const value = obj?.[key];
+
+        if (value != null && String(value).trim()) {
+            return String(value).trim();
+        }
     }
+
     return "";
 };
 
+const inr = (value, max = 2) =>
+    "₹" +
+    Number(value || 0).toLocaleString("en-IN", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: max,
+    });
+
+const qtyFmt = (value) =>
+    Number(value || 0).toLocaleString("en-IN", {
+        maximumFractionDigits: 4,
+    });
+
+const dateFmt = (value) => {
+    if (!value) return "";
+
+    const date = new Date(value);
+
+    if (Number.isNaN(date.getTime())) {
+        return "";
+    }
+
+    return date.toLocaleDateString("en-IN", {
+        day: "numeric",
+        month: "short",
+        year: "numeric",
+        timeZone: "Asia/Kolkata",
+    });
+};
+
+// -----------------------------------------------------------------------------
+// Seller profile lookup
+// -----------------------------------------------------------------------------
+
+/**
+ * Loads the seller's public-facing shop name and URL.
+ *
+ * Assumption:
+ * row.seller_id references seller_profiles.id.
+ *
+ * The actual seller_profiles columns used here are:
+ *   id
+ *   display_name
+ *   shop_slug
+ *   deleted_at
+ *
+ * This function intentionally does not throw, because notifications
+ * must not break the order flow.
+ */
 async function loadShop(sellerId) {
+    const fallback = {
+        name: "",
+        url: "",
+    };
+
+    if (!sellerId) {
+        console.warn(
+            "[order book] Cannot load shop: seller ID is missing"
+        );
+
+        return fallback;
+    }
+
     try {
-        const { data, error } = await supabase.from(SELLERS_TABLE).select("*").eq("id", sellerId).maybeSingle();
-        if (error) throw error;
+        const { data, error } = await supabase
+            .from(SELLERS_TABLE)
+            .select(
+                "id, shop_slug, display_name, status, deleted_at"
+            )
+            .eq("id", sellerId)
+            .is("deleted_at", null)
+            .maybeSingle();
+
+        if (error) {
+            throw error;
+        }
+
+        if (!data) {
+            console.warn(
+                "[order book] Seller profile not found:",
+                sellerId
+            );
+
+            return fallback;
+        }
+
+        const name = firstOf(data, NAME_KEYS);
         const slug = firstOf(data, SLUG_KEYS);
-        return { name: firstOf(data, NAME_KEYS), url: slug ? `${SITE_URL}/sellers/${encodeURIComponent(slug)}` : "" };
-    } catch (e) {
-        console.error("[order book] shop lookup failed:", e?.message || e);
-        return { name: "", url: "" };
+
+        const url = slug
+            ? `${SITE_URL}/sellers/${encodeURIComponent(slug)}`
+            : "";
+
+        return {
+            name,
+            url,
+        };
+    } catch (error) {
+        console.error(
+            "[order book] Shop lookup failed:",
+            error?.message || error
+        );
+
+        return fallback;
     }
 }
 
-const inr = (n, max = 2) => "₹" + Number(n || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: max });
-const qtyFmt = (n) => Number(n).toLocaleString("en-IN", { maximumFractionDigits: 4 });
-const dateFmt = (d) => (d ? new Date(d).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric", timeZone: "Asia/Kolkata" }) : "");
+// -----------------------------------------------------------------------------
+// Customer address formatting
+// -----------------------------------------------------------------------------
 
-/* ------------------------------ order placed ------------------------------ */
+/**
+ * Normalizes address text for comparison.
+ *
+ * This is only used to compare address components.
+ * The original address is preserved for display.
+ */
+function normalizeAddressPart(value) {
+    return String(value || "")
+        .normalize("NFKC")
+        .replace(/[–—-]/g, " ")
+        .replace(/[,\s]+/g, " ")
+        .trim()
+        .toLowerCase();
+}
 
-// "5 master packs x ₹1,200 per master pack" + "5,000 Kg in total" (pack-based lines), or "500 Kg x ₹2.47" (older / typed lines).
-function describeLine(i) {
-    const n = Number(i.quantity);
-    if (i.basis) {
-        const master = i.basis === "per_master_pack";
-        const word = master ? (n === 1 ? "master pack" : "master packs") : (n === 1 ? "pack" : "packs");
+/**
+ * Builds the customer address without blindly appending
+ * the same city, state, or pincode multiple times.
+ */
+function buildCustomerAddress(row) {
+    const address = String(
+        row.customer_address || ""
+    ).trim();
+
+    const city = String(
+        row.customer_city || ""
+    ).trim();
+
+    const state = String(
+        row.customer_state || ""
+    ).trim();
+
+    const pincode = String(
+        row.customer_pincode || ""
+    ).trim();
+
+    const locationParts = [
+        city,
+        state,
+        pincode,
+    ].filter(Boolean);
+
+    const place = locationParts.join(", ");
+
+    if (!address) {
+        return place;
+    }
+
+    if (!place) {
+        return address;
+    }
+
+    const normalizedAddress = normalizeAddressPart(address);
+
+    const normalizedPlace = normalizeAddressPart(place);
+
+    // If the entire location is already present, don't append it.
+    if (normalizedAddress.includes(normalizedPlace)) {
+        return address;
+    }
+
+    // Avoid duplication when city, state and pincode already appear
+    // separately in the saved address.
+    const allPartsAlreadyPresent = locationParts.every((part) =>
+        normalizedAddress.includes(normalizeAddressPart(part))
+    );
+
+    if (allPartsAlreadyPresent) {
+        return address;
+    }
+
+    // Append only location components not already present.
+    const missingParts = locationParts.filter((part) => {
+        return !normalizedAddress.includes(
+            normalizeAddressPart(part)
+        );
+    });
+
+    if (!missingParts.length) {
+        return address;
+    }
+
+    return `${address}, ${missingParts.join(", ")}`;
+}
+
+// -----------------------------------------------------------------------------
+// Order item formatting
+// -----------------------------------------------------------------------------
+
+/**
+ * Formats pack-based or quantity-based order lines.
+ *
+ * Examples:
+ *   5 packs × ₹500.00 per pack
+ *   5 master packs × ₹1,200.00 per master pack
+ *   500 Kg × ₹2.47
+ */
+function describeLine(item) {
+    const quantity = Number(item.quantity || 0);
+
+    if (item.basis) {
+        const isMasterPack =
+            item.basis === "per_master_pack";
+
+        const unitName = isMasterPack
+            ? "master pack"
+            : "pack";
+
+        const pluralUnitName =
+            quantity === 1
+                ? unitName
+                : `${unitName}s`;
+
         return {
-            qtyText: `${qtyFmt(n)} ${word} × ${inr(i.unitPrice, 4)} per ${master ? "master pack" : "pack"}`,
-            packText: Number(i.totalUnits) > 0 ? `${qtyFmt(i.totalUnits)} ${i.baseUnit || ""} in total`.trim() : "",
+            qtyText:
+                `${qtyFmt(quantity)} ${pluralUnitName} × ` +
+                `${inr(item.unitPrice, 4)} per ${unitName}`,
+
+            packText:
+                Number(item.totalUnits) > 0
+                    ? `${qtyFmt(item.totalUnits)} ${item.baseUnit || ""
+                        } in total`.trim()
+                    : "",
         };
     }
-    return { qtyText: `${qtyFmt(n)} ${i.unit} × ${inr(i.unitPrice, 4)}`, packText: "" };
+
+    const unit = String(item.unit || "").trim();
+
+    return {
+        qtyText:
+            `${qtyFmt(quantity)}${unit ? ` ${unit}` : ""} × ` +
+            `${inr(item.unitPrice, 4)}`,
+
+        packText: "",
+    };
 }
 
-// Prices are saved GST included. When every line has its GST % (catalog products), split the total into taxable value + GST.
+// -----------------------------------------------------------------------------
+// Billing totals
+// -----------------------------------------------------------------------------
+
+/**
+ * Order prices are assumed to include GST.
+ *
+ * When every item has a valid GST percentage, calculates:
+ *   - Taxable value
+ *   - GST amount
+ *   - Order total
+ *
+ * If GST information is incomplete, the function avoids inventing
+ * a taxable/GST split.
+ */
 function billingTotals(items, total) {
-    let taxable = 0, known = items.length > 0;
-    for (const i of items) {
-        const g = i.details?.gstPercent;
-        if (g == null || !Number.isFinite(Number(g))) { known = false; break; }
-        taxable += Number(i.lineTotal || 0) / (1 + Number(g) / 100);
+    let taxable = 0;
+
+    let known = items.length > 0;
+
+    for (const item of items) {
+        const gstPercent = item.details?.gstPercent;
+
+        if (
+            gstPercent == null ||
+            !Number.isFinite(Number(gstPercent))
+        ) {
+            known = false;
+            break;
+        }
+
+        const gstRate = Number(gstPercent);
+
+        taxable +=
+            Number(item.lineTotal || 0) /
+            (1 + gstRate / 100);
     }
-    if (!known) return { split: false, taxable: 0, gst: 0, total };
-    const t = Math.round(taxable * 100) / 100;
-    return { split: true, taxable: t, gst: Math.round((total - t) * 100) / 100, total };
+
+    if (!known) {
+        return {
+            split: false,
+            taxable: 0,
+            gst: 0,
+            total,
+        };
+    }
+
+    const taxableRounded =
+        Math.round(taxable * 100) / 100;
+
+    return {
+        split: true,
+        taxable: taxableRounded,
+        gst:
+            Math.round(
+                (total - taxableRounded) * 100
+            ) / 100,
+        total,
+    };
 }
 
-// `row` is the raw order_book_orders row that was just inserted.
+// -----------------------------------------------------------------------------
+// Shared order data
+// -----------------------------------------------------------------------------
+
+function getOrderItems(row) {
+    return Array.isArray(row.items)
+        ? row.items
+        : [];
+}
+
+function getOrderTotal(row, items) {
+    const savedTotal = Number(row.total_amount);
+
+    if (
+        row.total_amount != null &&
+        Number.isFinite(savedTotal)
+    ) {
+        return savedTotal;
+    }
+
+    return items.reduce(
+        (sum, item) =>
+            sum + (Number(item.lineTotal) || 0),
+        0
+    );
+}
+
+function getBillingDetails(row) {
+    return {
+        name: row.customer_name || "",
+        gstin: row.customer_gstin || "",
+        phone: row.customer_phone || "",
+        email: row.customer_email || "",
+        address: buildCustomerAddress(row),
+    };
+}
+
+// -----------------------------------------------------------------------------
+// Order placed notification
+// -----------------------------------------------------------------------------
+
+/**
+ * Called after an order is inserted into order_book_orders.
+ *
+ * row must be the raw order_book_orders database row.
+ */
 export async function notifyOrderPlaced(row) {
     try {
-        const phone = row.customer_phone || "";
-        const email = row.customer_email || "";
-        if (!phone && !email) return;
+        if (!row) {
+            console.warn(
+                "[order book] Order placed notification skipped: missing row"
+            );
 
+            return;
+        }
+
+        const phone = String(
+            row.customer_phone || ""
+        ).trim();
+
+        const email = String(
+            row.customer_email || ""
+        ).trim();
+
+        if (!phone && !email) {
+            return;
+        }
+
+        // Seller lookup is best-effort.
         const shop = await loadShop(row.seller_id);
-        const companyName = shop.name || "our team";
-        const raw = Array.isArray(row.items) ? row.items : [];
-        const items = raw.map((i) => ({
-            productName: i.productName, brandName: i.brandName || "", lineTotal: Number(i.lineTotal) || 0, ...describeLine(i),
+
+        const companyName =
+            shop.name || "the selling company";
+
+        const rawItems = getOrderItems(row);
+
+        const items = rawItems.map((item) => ({
+            productName:
+                item.productName || "Product",
+
+            brandName:
+                item.brandName || "",
+
+            lineTotal:
+                Number(item.lineTotal) || 0,
+
+            ...describeLine(item),
         }));
-        const total = Number(row.total_amount) || items.reduce((a, i) => a + i.lineTotal, 0);
-        const totals = billingTotals(raw, total);
+
+        const total = getOrderTotal(row, rawItems);
+
+        const totals = billingTotals(
+            rawItems,
+            total
+        );
+
         const placedOn = dateFmt(row.created_at);
-        const place = [row.customer_city, row.customer_state, row.customer_pincode].filter(Boolean).join(", ");
-        const address = [row.customer_address, place && !String(row.customer_address || "").includes(place) ? place : ""].filter(Boolean).join(", ");
-        const billing = { name: row.customer_name, gstin: row.customer_gstin || "", phone, email, address };
+
+        const billing = getBillingDetails(row);
 
         const jobs = [];
+
+        // Email notification.
         if (email) {
-            jobs.push(sendOrderPlacedEmail({
-                to: email, customerName: row.customer_name, companyName, orderNo: row.order_no, placedOn,
-                items, billing, totals, notes: row.notes, shopUrl: shop.url,
-            }));
+            jobs.push(
+                Promise.resolve().then(() =>
+                    sendOrderPlacedEmail({
+                        to: email,
+                        customerName: row.customer_name,
+                        companyName,
+                        orderNo: row.order_no,
+                        placedOn,
+                        items,
+                        billing,
+                        totals,
+                        notes: row.notes,
+                        shopUrl: shop.url,
+                    })
+                )
+            );
         }
+
+        // WhatsApp notification.
         if (phone) {
-            jobs.push(sendOrderPlacedWhatsApp({
-                to: phone, customerName: row.customer_name, companyName, orderNo: row.order_no, placedOn,
-                items, billing, totals, notes: row.notes,
-            }));
+            jobs.push(
+                Promise.resolve().then(() =>
+                    sendOrderPlacedWhatsApp({
+                        to: phone,
+                        customerName: row.customer_name,
+                        companyName,
+                        orderNo: row.order_no,
+                        placedOn,
+                        items,
+                        billing,
+                        totals,
+                        notes: row.notes,
+                    })
+                )
+            );
         }
+
+        // A failed notification must not stop the other notification.
         const results = await Promise.allSettled(jobs);
-        results.forEach((r) => {
-            if (r.status === "rejected") console.error("[order book] order-placed notification failed:", r.reason?.message || r.reason);
+
+        results.forEach((result) => {
+            if (result.status === "rejected") {
+                console.error(
+                    "[order book] Order-placed notification failed:",
+                    result.reason?.message ||
+                    result.reason
+                );
+            } else if (result.value?.success === false) {
+                console.error(
+                    "[order book] Order-placed notification was not delivered"
+                );
+            }
         });
-    } catch (e) {
-        console.error("[order book] notifyOrderPlaced failed:", e?.message || e);
+    } catch (error) {
+        console.error(
+            "[order book] notifyOrderPlaced failed:",
+            error?.message || error
+        );
     }
 }
 
-/* ------------------------------ order processed (unchanged) ------------------------------ */
+// -----------------------------------------------------------------------------
+// Order processed notification
+// -----------------------------------------------------------------------------
 
-// `row` is the raw order_book_orders row (as loaded before the status change).
+/**
+ * Called when the order is marked as processed.
+ *
+ * row must be the order_book_orders row loaded before
+ * changing the order status.
+ */
 export async function notifyOrderProcessed(row) {
     try {
-        const phone = row.customer_phone || "";
-        const email = row.customer_email || "";
-        if (!phone && !email) return;
+        if (!row) {
+            console.warn(
+                "[order book] Order-processed notification skipped: missing row"
+            );
+
+            return;
+        }
+
+        const phone = String(
+            row.customer_phone || ""
+        ).trim();
+
+        const email = String(
+            row.customer_email || ""
+        ).trim();
+
+        if (!phone && !email) {
+            return;
+        }
 
         const shop = await loadShop(row.seller_id);
-        const companyName = shop.name || "our team";
-        const items = (Array.isArray(row.items) ? row.items : []).map((i) => ({
-            productName: i.productName, brandName: i.brandName || "", unit: i.unit,
-            quantity: i.quantity, unitPrice: i.unitPrice, lineTotal: i.lineTotal,
-        }));
-        const total = Number(row.total_amount) || items.reduce((a, i) => a + Number(i.lineTotal || 0), 0);
+
+        const companyName =
+            shop.name || "the selling company";
+
+        const rawItems = getOrderItems(row);
+
+        const total = getOrderTotal(row, rawItems);
+
         const placedOn = dateFmt(row.created_at);
 
+        // Keep the existing email item structure.
+        const emailItems = rawItems.map((item) => ({
+            productName: item.productName,
+            brandName: item.brandName || "",
+            unit: item.unit,
+            quantity: item.quantity,
+            unitPrice: item.unitPrice,
+            lineTotal: item.lineTotal,
+        }));
+
+        // Use the same detailed line formatting as the order-placed
+        // notification for WhatsApp.
+        const whatsappItems = rawItems.map((item) => ({
+            productName:
+                item.productName || "Product",
+
+            brandName:
+                item.brandName || "",
+
+            lineTotal:
+                Number(item.lineTotal) || 0,
+
+            ...describeLine(item),
+        }));
+
         const jobs = [];
+
         if (email) {
-            jobs.push(sendOrderProcessedEmail({
-                to: email, customerName: row.customer_name, companyName, orderNo: row.order_no, placedOn,
-                items, total, notes: row.notes, shopUrl: shop.url,
-            }));
+            jobs.push(
+                Promise.resolve().then(() =>
+                    sendOrderProcessedEmail({
+                        to: email,
+                        customerName: row.customer_name,
+                        companyName,
+                        orderNo: row.order_no,
+                        placedOn,
+                        items: emailItems,
+                        total,
+                        notes: row.notes,
+                        shopUrl: shop.url,
+                    })
+                )
+            );
         }
+
         if (phone) {
-            const waItems = (Array.isArray(row.items) ? row.items : []).map((i) => ({
-                productName: i.productName, brandName: i.brandName || "", lineTotal: Number(i.lineTotal) || 0, ...describeLine(i),
-            }));
-            jobs.push(sendOrderProcessedWhatsApp({
-                to: phone, customerName: row.customer_name, companyName, orderNo: row.order_no, placedOn,
-                items: waItems, total, notes: row.notes, shopUrl: shop.url || SITE_URL,
-            }));
+            jobs.push(
+                Promise.resolve().then(() =>
+                    sendOrderProcessedWhatsApp({
+                        to: phone,
+                        customerName: row.customer_name,
+                        companyName,
+                        orderNo: row.order_no,
+                        placedOn,
+                        items: whatsappItems,
+                        total,
+                        notes: row.notes,
+                        shopUrl:
+                            shop.url || SITE_URL,
+                    })
+                )
+            );
         }
 
         const results = await Promise.allSettled(jobs);
-        results.forEach((r) => {
-            if (r.status === "rejected") console.error("[order book] customer notification failed:", r.reason?.message || r.reason);
+
+        results.forEach((result) => {
+            if (result.status === "rejected") {
+                console.error(
+                    "[order book] Order-processed notification failed:",
+                    result.reason?.message ||
+                    result.reason
+                );
+            } else if (result.value?.success === false) {
+                console.error(
+                    "[order book] Order-processed notification was not delivered"
+                );
+            }
         });
-    } catch (e) {
-        console.error("[order book] notifyOrderProcessed failed:", e?.message || e);
+    } catch (error) {
+        console.error(
+            "[order book] notifyOrderProcessed failed:",
+            error?.message || error
+        );
     }
 }

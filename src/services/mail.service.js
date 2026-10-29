@@ -329,7 +329,7 @@ export async function sendOrderProcessedEmail({ to, customerName, companyName, o
      </table>
      ${notes ? `<p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;"><strong>Your notes:</strong> ${esc(notes)}</p>` : ""}
      <p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#475569;">
-       We will update you again once your order is shipped. If you have any questions about this order, simply reply to this email or contact ${company} and mention order <strong>${esc(orderNo)}</strong>.
+       If you have any questions about this order, simply reply to this email or contact ${company} and mention order <strong>${esc(orderNo)}</strong>.
      </p>
      ${shopUrl ? `<a href="${esc(shopUrl)}" style="display:inline-block;margin-top:14px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
        Visit ${company}'s shop
