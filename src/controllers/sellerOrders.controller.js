@@ -9,12 +9,11 @@
 //   a `mode` when an order somehow has none set (legacy/edge case).
 // - "processing" is removed from the seller-driven flow. Confirmed orders
 //   go straight to "shipped".
-// - shipOrder is NEW and replaces the old bare status flip: the seller
-//   must upload an LR (their reference document for the buyer, e.g. an
-//   LR/consignment note photo or PDF) AND a bill for the order before the
-//   status can move to "shipped". Company-level transport info (which
-//   company, branch, contact) is already on the order from place_order —
-//   this step only asks for the LR number/proof and the bill.
+// - shipOrder: the seller MAY upload an LR (their reference document for the
+//   buyer, e.g. an LR/consignment note photo or PDF), a bill and an LR number,
+//   but none of them is required any more. Whatever is given is saved; the
+//   order moves to "shipped" either way. Company-level transport info (which
+//   company, branch, contact) is already on the order from place_order.
 import { supabase } from "../config/supabase.js";
 import { notifyOrderChanged, notifyUserOrdersChanged, notifyUser, notifyCreditChanged } from "../services/realtimeBroadcast.js";
 import { sendOrderUpdateWhatsApp } from "../services/whatsapp.service.js";
@@ -131,11 +130,20 @@ function transitionHandler(newStatus) {
 
         await notifyOrderChanged(req.params.id, { status: newStatus });
         if (row?.notify_user_id) {
+            // The LR details and the bill are optional now, so only mention them when they were actually added.
+            let shippedHasDocs = false;
+            if (newStatus === "shipped") {
+                const { data: docRow } = await supabase
+                    .from("orders").select("ship_lr_number, ship_lr_proof_url, ship_bill_url").eq("id", req.params.id).maybeSingle();
+                shippedHasDocs = !!(docRow?.ship_lr_number || docRow?.ship_lr_proof_url || docRow?.ship_bill_url);
+            }
             await notifyUser(row.notify_user_id, {
                 type: `order_status_${newStatus}`,
                 title: `Order ${row.order_number} ${newStatus.replace("_", " ")}`,
                 body: newStatus === "shipped"
-                    ? "Your order has shipped — the LR details and bill are attached to your order."
+                    ? (shippedHasDocs
+                        ? "Your order has shipped — the shipping details are attached to your order."
+                        : "Your order has shipped.")
                     : (reason || `Your order status was updated to ${newStatus.replace("_", " ")}.`),
                 link: `/save/orders/${req.params.id}`,
             });
@@ -143,14 +151,20 @@ function transitionHandler(newStatus) {
 
             const { data: orderRow } = await supabase
                 .from("orders")
-                .select("buyer_contact_name, buyer_contact_phone, transport_mode, transport_fields, ship_lr_number")
+                .select("buyer_contact_name, buyer_contact_phone, transport_mode, transport_fields, ship_lr_number, ship_lr_proof_url, ship_bill_url")
                 .eq("id", req.params.id)
                 .maybeSingle();
             if (orderRow?.buyer_contact_phone) {
                 let transportDetail = reason || "";
                 if (newStatus === "shipped") {
-                    const companyLabel = routeOptionSummary(orderRow.transport_mode, orderRow.transport_fields || {});
-                    transportDetail = `Shipped via ${companyLabel}. LR/tracking no.: ${orderRow.ship_lr_number || "—"}. Check your order for the LR document and bill.`;
+                    const companyLabel = orderRow.transport_mode
+                        ? routeOptionSummary(orderRow.transport_mode, orderRow.transport_fields || {})
+                        : "";
+                    const parts = [];
+                    if (companyLabel) parts.push(`Shipped via ${companyLabel}.`);
+                    if (orderRow.ship_lr_number) parts.push(`LR/tracking no.: ${orderRow.ship_lr_number}.`);
+                    if (orderRow.ship_lr_proof_url || orderRow.ship_bill_url) parts.push("Check your order for the shipping documents.");
+                    transportDetail = parts.join(" ") || "Track your order anytime in the app.";
                 }
                 await sendOrderUpdateWhatsApp({
                     to: orderRow.buyer_contact_phone,
@@ -226,22 +240,17 @@ async function uploadShipmentFile(file, orderId, kind) {
 
 // POST /api/seller/orders/:id/ship
 // multipart/form-data: fields lrNumber, lrNotes; files lr_proof, bill
-// (both required). Replaces the previous bare "processing"/"shipped"
-// status flip and folds in what used to be collected at confirm time —
-// but now scoped to the actual shipment, not the transport company
-// choice (which is already fixed from place_order).
+// ALL of them are optional: the seller can ship the order without any LR details or bill.
+// Whatever is provided is saved. (This folds in what used to be collected at confirm time —
+// scoped to the actual shipment, not the transport company choice, which is already fixed from place_order.)
 export async function shipOrder(req, res) {
     const orderId = req.params.id;
     const { lrNumber, lrNotes } = req.body || {};
-
-    if (!lrNumber || !lrNumber.trim()) {
-        return res.status(400).json({ success: false, message: "Please enter the LR / tracking number." });
-    }
+    const lrNo = typeof lrNumber === "string" ? lrNumber.trim().slice(0, 60) : "";
+    const notes = typeof lrNotes === "string" ? lrNotes.trim().slice(0, 500) : "";
 
     const lrFile = req.files?.lr_proof?.[0];
     const billFile = req.files?.bill?.[0];
-    if (!lrFile) return res.status(400).json({ success: false, message: "Please upload the LR document for the buyer's reference." });
-    if (!billFile) return res.status(400).json({ success: false, message: "Please upload the bill for this order." });
 
     const { data: order, error: orderErr } = await supabase
         .from("orders")
@@ -254,10 +263,10 @@ export async function shipOrder(req, res) {
         return res.status(400).json({ success: false, message: "This order isn't ready to be shipped." });
     }
 
-    let lrProofUrl, billUrl;
+    let lrProofUrl = null, billUrl = null;
     try {
-        lrProofUrl = await uploadShipmentFile(lrFile, orderId, "lr");
-        billUrl = await uploadShipmentFile(billFile, orderId, "bill");
+        if (lrFile) lrProofUrl = await uploadShipmentFile(lrFile, orderId, "lr");
+        if (billFile) billUrl = await uploadShipmentFile(billFile, orderId, "bill");
     } catch (e) {
         console.error("[shipOrder] upload failed:", e?.message || e);
         return res.status(500).json({ success: false, message: "Couldn't upload one of the files. Please try again." });
@@ -266,8 +275,8 @@ export async function shipOrder(req, res) {
     const { error: updateErr } = await supabase
         .from("orders")
         .update({
-            ship_lr_number: lrNumber.trim(),
-            ship_lr_notes: lrNotes?.trim() || null,
+            ship_lr_number: lrNo || null,
+            ship_lr_notes: notes || null,
             ship_lr_proof_url: lrProofUrl,
             ship_bill_url: billUrl,
             ship_details_confirmed_at: new Date().toISOString(),

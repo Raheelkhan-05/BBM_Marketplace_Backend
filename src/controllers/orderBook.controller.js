@@ -1,6 +1,6 @@
 // controllers/orderBook.controller.js
 // ORDER BOOK: a standalone CRM log. A salesperson punches an order taken for a customer; the company's team
-// (admin / members) then moves it  placed -> processed -> shipped (LR + bill) -> completed.
+// (admin / members) then moves it  placed -> processed -> shipped (LR + bill, both optional) -> completed.
 // It never touches the marketplace orders, wallet, stock or pricing. Prices here are for the log only.
 // Catalog products are ordered in whole packs or master packs (never single units).
 // The customer must have a mobile number or an email, and the buyer address is filled from the GST number (editable).
@@ -427,7 +427,8 @@ export async function cancelOrder(req, res) {
     } catch (e) { oops(res, e); }
 }
 
-// POST /api/seller/order-book/:id/ship   multipart: lrNumber, lrNotes, lr_proof, bill
+// POST /api/seller/order-book/:id/ship   multipart: lrNumber?, lrNotes?, lr_proof?, bill?
+// The LR number, the LR document and the bill are ALL optional: the team can ship an order without any of them.
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 2 } });
 const parseShip = upload.fields([{ name: "lr_proof", maxCount: 1 }, { name: "bill", maxCount: 1 }]);
 export const shipUpload = (req, res, next) => parseShip(req, res, (err) => (err
@@ -441,10 +442,10 @@ export async function shipOrder(req, res) {
     try {
         const lrNumber = str(req.body?.lrNumber, 60), lrNotes = str(req.body?.lrNotes, 500);
         const lrFile = req.files?.lr_proof?.[0], billFile = req.files?.bill?.[0];
-        if (!lrNumber) return fail(res, 400, "Enter the LR / tracking number.");
-        if (!lrFile) return fail(res, 400, "Attach the LR document.");
-        if (!billFile) return fail(res, 400, "Attach the bill.");
-        if (!ALLOWED_EXT.has(extOf(lrFile)) || !ALLOWED_EXT.has(extOf(billFile))) return fail(res, 400, "This file type isn't supported. Use a photo, PDF, Word, Excel, CSV or text file.");
+        // Only the files that were actually attached are checked.
+        for (const f of [lrFile, billFile]) {
+            if (f && !ALLOWED_EXT.has(extOf(f))) return fail(res, 400, "This file type isn't supported. Use a photo, PDF, Word, Excel, CSV or text file.");
+        }
 
         const row = await loadTeamRow(req, res); if (!row) return;
         if (row.status !== "processed") return fail(res, 409, "Mark the order as processed before shipping it.");
@@ -456,12 +457,12 @@ export async function shipOrder(req, res) {
             uploaded.push(path);
             return path;
         };
-        const lrPath = await put(lrFile, "lr");
-        const billPath = await put(billFile, "bill");
+        const lrPath = lrFile ? await put(lrFile, "lr") : null;
+        const billPath = billFile ? await put(billFile, "bill") : null;
 
         const ok = await move(req, res, row, "shipped", {
-            patch: { lr_number: lrNumber, lr_notes: lrNotes || null, lr_proof_path: lrPath, bill_path: billPath },
-            eventBody: `Order shipped · LR ${lrNumber}`,
+            patch: { lr_number: lrNumber || null, lr_notes: lrNotes || null, lr_proof_path: lrPath, bill_path: billPath },
+            eventBody: lrNumber ? `Order shipped · LR ${lrNumber}` : "Order shipped",
         });
         if (!ok && uploaded.length) supabase.storage.from(BUCKET).remove(uploaded).catch(() => { /* best effort */ });
     } catch (e) {
