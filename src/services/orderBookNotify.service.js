@@ -96,17 +96,9 @@ export async function notifyOrderPlaced(row) {
             }));
         }
         if (phone) {
-            const itemsLine = items
-                .map((i, n) => `${n + 1}) ${i.productName} - ${i.qtyText}${i.packText ? ` (${i.packText})` : ""} = ${inr(i.lineTotal)}`)
-                .join("; ")
-                .slice(0, 900);
-            const billingLine = (
-                `Billed to ${billing.name}${billing.gstin ? `, GSTIN ${billing.gstin}` : ""}${address ? `, ${address}` : ""}. `
-                + (totals.split ? `Taxable value ${inr(totals.taxable)}, GST ${inr(totals.gst)}.` : "All prices include GST.")
-            ).slice(0, 500);
             jobs.push(sendOrderPlacedWhatsApp({
-                to: phone, customerName: row.customer_name, companyName, orderNo: row.order_no,
-                itemsLine, billingLine, total: inr(total),
+                to: phone, customerName: row.customer_name, companyName, orderNo: row.order_no, placedOn,
+                items, billing, totals, notes: row.notes,
             }));
         }
         const results = await Promise.allSettled(jobs);
@@ -144,13 +136,12 @@ export async function notifyOrderProcessed(row) {
             }));
         }
         if (phone) {
-            const itemsLine = items
-                .map((i, n) => `${n + 1}) ${i.productName} - ${qtyFmt(i.quantity)} ${i.unit} x ${inr(i.unitPrice, 4)} = ${inr(i.lineTotal)}`)
-                .join("; ")
-                .slice(0, 900);
+            const waItems = (Array.isArray(row.items) ? row.items : []).map((i) => ({
+                productName: i.productName, brandName: i.brandName || "", lineTotal: Number(i.lineTotal) || 0, ...describeLine(i),
+            }));
             jobs.push(sendOrderProcessedWhatsApp({
-                to: phone, customerName: row.customer_name, companyName, orderNo: row.order_no,
-                itemsLine, total: inr(total), shopUrl: shop.url || SITE_URL,
+                to: phone, customerName: row.customer_name, companyName, orderNo: row.order_no, placedOn,
+                items: waItems, total, notes: row.notes, shopUrl: shop.url || SITE_URL,
             }));
         }
 

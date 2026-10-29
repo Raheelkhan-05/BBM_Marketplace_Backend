@@ -1,188 +1,256 @@
 // services/whatsapp.service.js
 //
-// Thin wrapper around WhatsApp Cloud API's /messages endpoint. Deliberately
-// generic: one low-level sendWhatsAppTemplate() that takes any approved
-// template name + ordered body variables, and one high-level
-// sendOrderUpdateWhatsApp() that maps a plain {name, headline, detail,
-// footer} shape onto our single reusable "order_status_update" utility
-// template. Every call site (order placed, payment verified, order
-// confirmed/rejected/delivered, wallet blocked) calls ONLY the high-level
-// helper — nothing here needs to change to support a new event type.
+// WhatsApp messaging through the DealSMS gateway (https://dealsms.in), replacing the Meta Cloud API.
+// DealSMS sends ordinary text messages from a linked WhatsApp number, so there are no templates to get approved:
+// every message below is written in full here and can be changed at any time.
+//
+// Every exported helper keeps the same name and arguments as before, so existing call sites do not change:
+//   sendOrderUpdateWhatsApp, sendSalesQuotationWhatsApp, sendOrderProcessedWhatsApp, sendOrderPlacedWhatsApp
+//
+// Environment (.env):
+//   DEALSMS_ACCESS_TOKEN=...        your DealSMS access token
+//   DEALSMS_INSTANCE_ID=...         the instance that is linked to the sending WhatsApp number
+//   DEALSMS_BASE_URL=https://dealsms.in/api     (optional)
+//   DEALSMS_GAP_MS=1500             (optional) pause between two messages, keeps sending human-paced
+//
+// Never put the token in the code or in git.
 
-const WHATSAPP_API_VERSION = "v20.0";
-const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
-const ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
+const BASE_URL = (process.env.DEALSMS_BASE_URL || "https://dealsms.in/api").replace(/\/+$/, "");
+const ACCESS_TOKEN = process.env.DEALSMS_ACCESS_TOKEN;
+const INSTANCE_ID = process.env.DEALSMS_INSTANCE_ID;
+const GAP_MS = Number(process.env.DEALSMS_GAP_MS) || 1500;
+const TIMEOUT_MS = 15000;
+const MAX_LEN = 3800;                       // stay well under WhatsApp's message limit
+const BRAND = "BBM Marketplace";
+const RULE = "━━━━━━━━━━━━━━━━━━";
 
-const ORDER_UPDATE_TEMPLATE_NAME = "order_status_update";
-const TEMPLATE_LANGUAGE = "en";
+/* ------------------------------ sending ------------------------------ */
 
 function toE164(rawPhone) {
     if (!rawPhone) return null;
     const digits = String(rawPhone).replace(/[^\d]/g, "");
     if (!digits) return null;
-    // Assumes Indian 10-digit numbers when no country code is present —
-    // adjust if you onboard users outside India.
+    // Assumes Indian 10-digit numbers when no country code is present. Adjust if you onboard users outside India.
     if (digits.length === 10) return `91${digits}`;
     return digits;
 }
 
-// Low-level — routes through here for ANY approved template. Keep every
-// event-specific helper on top of this one function.
-export async function sendWhatsAppTemplate({ to, templateName, languageCode = TEMPLATE_LANGUAGE, bodyParams = [] }) {
-    const toPhone = toE164(to);
-    if (!toPhone) {
-        console.warn("[whatsapp] skipped — no valid phone number", { to });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Messages go out one at a time with a short pause between them. WhatsApp can restrict a number that sends in bursts.
+let chain = Promise.resolve();
+function enqueue(task) {
+    const run = chain.then(task);
+    chain = run.catch(() => { /* a failed send must not block the next one */ }).then(() => sleep(GAP_MS));
+    return run;
+}
+
+// Low-level: send one text message. Best effort: never throws, so a WhatsApp problem can never break an order or a status change.
+export async function sendWhatsAppText({ to, message }) {
+    const number = toE164(to);
+    if (!number) {
+        console.warn("[whatsapp] skipped: no valid phone number", { to });
         return { success: false, skipped: true };
     }
-    if (!PHONE_NUMBER_ID || !ACCESS_TOKEN) {
-        console.error("[whatsapp] WHATSAPP_PHONE_NUMBER_ID / WHATSAPP_ACCESS_TOKEN not configured");
+    if (!ACCESS_TOKEN || !INSTANCE_ID) {
+        console.error("[whatsapp] DEALSMS_ACCESS_TOKEN / DEALSMS_INSTANCE_ID not configured");
         return { success: false, skipped: true };
     }
+    const text = String(message || "").trim().slice(0, MAX_LEN);
+    if (!text) return { success: false, skipped: true };
 
-    const payload = {
-        messaging_product: "whatsapp",
-        to: toPhone,
-        type: "template",
-        template: {
-            name: templateName,
-            language: { code: languageCode },
-            components: bodyParams.length
-                ? [{ type: "body", parameters: bodyParams.map((text) => ({ type: "text", text: String(text) })) }]
-                : [],
-        },
-    };
-
-    try {
-        const res = await fetch(`https://graph.facebook.com/${WHATSAPP_API_VERSION}/${PHONE_NUMBER_ID}/messages`, {
-            method: "POST",
-            headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-            console.error("[whatsapp] send failed", { to: toPhone, templateName, error: data });
-            return { success: false, error: data };
+    return enqueue(async () => {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+        try {
+            const res = await fetch(`${BASE_URL}/send`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ number, type: "text", message: text, instance_id: INSTANCE_ID, access_token: ACCESS_TOKEN }),
+                signal: ctl.signal,
+            });
+            let data = {};
+            try { data = await res.json(); } catch { /* non-JSON reply */ }
+            const bad = !res.ok || data?.status === "error" || data?.success === false || data?.error;
+            if (bad) {
+                console.error("[whatsapp] send failed", { to: number, status: res.status, response: data });
+                return { success: false, error: data };
+            }
+            return { success: true, data };
+        } catch (err) {
+            console.error("[whatsapp] send threw", err?.name === "AbortError" ? "timeout" : (err?.message || err));
+            return { success: false, error: err?.message || String(err) };
+        } finally {
+            clearTimeout(timer);
         }
-        return { success: true, data };
-    } catch (err) {
-        // Best-effort, same philosophy as the existing notifyUser()/socket
-        // broadcasts — a WhatsApp outage must never break order placement,
-        // payment verification, etc.
-        console.error("[whatsapp] send threw", err?.message || err);
-        return { success: false, error: err?.message || String(err) };
+    });
+}
+
+// Kept only so older imports do not break. Templates no longer exist: the variables are simply sent as lines of text.
+export async function sendWhatsAppTemplate({ to, bodyParams = [] }) {
+    return sendWhatsAppText({ to, message: bodyParams.filter(Boolean).join("\n\n") });
+}
+
+/* ------------------------------ message building ------------------------------ */
+
+// *bold* in WhatsApp breaks if the text itself contains an asterisk, so strip them from names.
+const bold = (t) => `*${String(t ?? "").replace(/\*/g, "").trim()}*`;
+const clean = (v) => String(v ?? "").replace(/\r/g, "").replace(/[ \t]+\n/g, "\n").trim();
+const money = (n) => (typeof n === "string" ? n : "₹" + Number(n || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+const field = (label, value) => (clean(value) ? `${bold(label)}: ${clean(value)}` : null);
+// null / false / undefined entries are dropped; "" stays and becomes a blank line.
+const join = (parts, sep = "\n") => parts.filter((p) => p != null && p !== false).join(sep);
+const sign = () => `_${BRAND}_`;
+
+// Items as a numbered list. Accepts structured items, or the old single "itemsLine" string ("1) A - ...; 2) B - ...").
+function itemsBlock({ items, itemsLine }) {
+    let list = Array.isArray(items) ? items : null;
+    if (!list || !list.length) {
+        list = clean(itemsLine).split(/;\s*/).map((s) => s.replace(/^\d+\)\s*/, "").trim()).filter(Boolean).map((t) => ({ text: t }));
     }
+    const MAX_ITEMS = 12;
+    const shown = list.slice(0, MAX_ITEMS).map((i, n) => {
+        if (i.text) return `${n + 1}. ${i.text}`;
+        return join([
+            `${n + 1}. ${bold(i.productName)}${i.brandName ? ` (${clean(i.brandName)})` : null}`,
+            i.qtyText ? `    ${clean(i.qtyText)}` : null,
+            i.packText ? `    ${clean(i.packText)}` : null,
+            i.lineTotal != null ? `    Amount: ${money(i.lineTotal)}` : null,
+        ]);
+    });
+    if (list.length > MAX_ITEMS) shown.push(`…and ${list.length - MAX_ITEMS} more item${list.length - MAX_ITEMS === 1 ? "" : "s"}.`);
+    return shown.join("\n\n");
 }
 
-// High-level — the ONE shape every event maps onto. bodyParams order here
-// MUST match {{1}}, {{2}}, {{3}}, {{4}} in the "order_status_update"
-// template exactly:
-//   Hello {{1}},
-//   {{2}}
-//   {{3}}
-//   {{4}}
-//   If you have any questions about this order, please contact our support team.
+/* ------------------------------ generic order update ------------------------------ */
+
+// One shape for the order events that already call this (payment verified, confirmed, rejected, delivered ...).
 export async function sendOrderUpdateWhatsApp({ to, name, headline, detail, footer }) {
-    return sendWhatsAppTemplate({
-        to,
-        templateName: ORDER_UPDATE_TEMPLATE_NAME,
-        bodyParams: [
-            name || "there",
-            headline || "",
-            detail || "",
-            footer || "Thank you for shopping with BBM Marketplace.",
-        ],
-    });
+    const message = join([
+        bold(headline || "Order update"),
+        "",
+        `Hello ${clean(name) || "there"},`,
+        "",
+        clean(detail),
+        "",
+        "If you have any questions about this order, please reply to this message or contact our support team.",
+        "",
+        clean(footer) || "Thank you for shopping with BBM Marketplace.",
+        sign(),
+    ]);
+    return sendWhatsAppText({ to, message });
 }
 
+/* ------------------------------ sales quotation ------------------------------ */
 
-//
-// You must create this UTILITY template in Meta WhatsApp Manager, name: sales_quotation, language: English (en).
-// Body (7 variables, in this exact order):
-//
-//   Hello {{1}},
-//
-//   {{2}} has shared a quotation for your enquiry: {{3}}.
-//
-//   Items: {{4}}
-//
-//   Total (incl. GST): {{5}}
-//   Valid until: {{6}}
-//
-//   {{7}}
-//
-// Sample values for approval: Acme Traders / BBM Supplies / Stainless Steel Hinges / 1) Hinge 4 inch - 500 Kg x ₹2.47 = ₹1,235.00 - https://bbm.business/p/123 / ₹1,235.00 / 30 Oct 2026 / Please get in touch with us to confirm your order.
-// =====================================================================================================
-const SALES_QUOTE_TEMPLATE_NAME = "sales_quotation";
-
-export async function sendSalesQuotationWhatsApp({ to, customerName, sellerName, enquiryProduct, itemsLine, total, validUntil, closing }) {
-    const v = (x, fallback = "-") => String(x ?? "").replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").trim() || fallback;
-    return sendWhatsAppTemplate({
-        to,
-        templateName: SALES_QUOTE_TEMPLATE_NAME,
-        bodyParams: [v(customerName, "there"), v(sellerName), v(enquiryProduct), v(itemsLine), v(total), v(validUntil), v(closing)],
-    });
+export async function sendSalesQuotationWhatsApp({ to, customerName, sellerName, enquiryProduct, itemsLine, items, total, validUntil, closing }) {
+    const message = join([
+        `${bold("Quotation")} 🧾`,
+        "",
+        `Hello ${clean(customerName) || "there"},`,
+        "",
+        `${bold(sellerName)} has shared a quotation for your enquiry: ${bold(enquiryProduct)}.`,
+        "",
+        RULE,
+        bold("Items"),
+        itemsBlock({ items, itemsLine }),
+        RULE,
+        "",
+        field("Total (incl. GST)", total),
+        field("Valid until", validUntil),
+        "",
+        clean(closing) || "Please get in touch with us to confirm your order.",
+        "",
+        sign(),
+    ]);
+    return sendWhatsAppText({ to, message });
 }
 
+/* ------------------------------ order book: order received ------------------------------ */
 
-//
-// ORDER BOOK: sent to the customer when the company's team marks their order as processed.
-// You must create this UTILITY template in Meta WhatsApp Manager, name: order_processed, language: English (en).
-// Body (6 variables, in this exact order):
-//
-//   Hello {{1}},
-//
-//   Thank you for your purchase from {{2}}. Your order {{3}} is confirmed and is now being processed.
-//
-//   Order details: {{4}}
-//
-//   Order total (incl. GST): {{5}}
-//
-//   You can view our shop here: {{6}}
-//
-//   We will update you again once your order is shipped. If you have any questions about this order, please contact {{2}}.
-//
-// (Meta counts a repeated {{2}} as the same variable; if the form rejects that, reword the last line to
-//  "please reply to this message" and the code needs no change.)
-// Sample values for approval: Acme Traders / BBM Supplies / ORD-1042 / 1) Hinge 4 inch - 500 Kg x ₹2.47 = ₹1,235.00 / ₹1,235.00 / https://bbm.business/sellers/bbm-supplies
-// =====================================================================================================
-const ORDER_PROCESSED_TEMPLATE_NAME = "order_processed";
+// Sent the moment the salesperson punches the order: greeting, details received, order + billing details.
+// items: [{ productName, brandName, qtyText, packText, lineTotal }]
+// billing: { name, gstin, phone, email, address }      totals: { split, taxable, gst, total }
+export async function sendOrderPlacedWhatsApp({ to, customerName, companyName, orderNo, placedOn, items, billing, totals, notes, itemsLine, billingLine, total }) {
+    const b = billing || {};
+    const hasBilling = b.name || b.gstin || b.address || b.phone || b.email;
+    const t = totals || {};
 
-export async function sendOrderProcessedWhatsApp({ to, customerName, companyName, orderNo, itemsLine, total, shopUrl }) {
-    const v = (x, fallback = "-") => String(x ?? "").replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").trim() || fallback;
-    return sendWhatsAppTemplate({
-        to,
-        templateName: ORDER_PROCESSED_TEMPLATE_NAME,
-        bodyParams: [v(customerName, "there"), v(companyName, "our team"), v(orderNo), v(itemsLine), v(total), v(shopUrl)],
-    });
+    const billingBlock = hasBilling
+        ? join([
+            `${bold("Billing Details")} 🧾`,
+            field("Billed to", b.name),
+            field("GSTIN", b.gstin),
+            field("Address", b.address),
+            field("Mobile", b.phone),
+            field("Email", b.email),
+        ])
+        : (clean(billingLine) ? join([`${bold("Billing Details")} 🧾`, clean(billingLine)]) : null);
+
+    const totalsBlock = join([
+        t.split ? field("Taxable value", money(t.taxable)) : null,
+        t.split ? field("GST", money(t.gst)) : null,
+        `${bold("Order total (incl. GST)")}: ${bold(money(t.total ?? total))}`,
+    ]);
+
+    const message = join([
+        `${bold("Order Received")} ✅`,
+        "",
+        `Hello ${clean(customerName) || "there"},`,
+        "",
+        `Thank you for placing your order with ${bold(companyName || "our team")}. We have received your details and your order has been recorded.`,
+        "",
+        field("Order No", orderNo),
+        field("Date", placedOn),
+        field("Status", "Order received"),
+        "",
+        RULE,
+        `${bold("Your Order")} 📦`,
+        itemsBlock({ items, itemsLine }),
+        RULE,
+        billingBlock,
+        billingBlock ? RULE : null,
+        totalsBlock,
+        clean(notes) ? "" : null,
+        clean(notes) ? field("Your notes", notes) : null,
+        "",
+        "Our team will confirm and process your order shortly, and we will keep you updated at every step.",
+        "If anything above looks incorrect, please reply to this message.",
+        "",
+        `Thank you for choosing ${bold(companyName || "us")}.`,
+        sign(),
+    ]);
+    return sendWhatsAppText({ to, message });
 }
 
+/* ------------------------------ order book: order processed ------------------------------ */
 
-//
-// ORDER BOOK: sent to the customer the moment the salesperson punches their order.
-// Create this UTILITY template in Meta WhatsApp Manager, name: order_received, language: English (en).
-// Body (6 variables, in this exact order):
-//
-//   Hello {{1}},
-//
-//   Thank you for placing your order with {{2}}. We have received your details and your order {{3}} has been recorded.
-//
-//   Order details: {{4}}
-//
-//   Billing details: {{5}}
-//
-//   Order total (incl. GST): {{6}}
-//
-//   Our team will confirm and process your order shortly and keep you updated at every step. If anything looks incorrect, please reply to this message.
-//
-// Sample values for approval: Acme Traders / BBM Supplies / ORD-1042 / 1) Hinge 4 inch - 5 master packs x ₹1,200 per master pack (5,000 Kg in total) = ₹6,000.00 / Billed to Acme Traders, GSTIN 24ABCDE1234F1Z5, Ahmedabad, Gujarat 380001. Taxable value ₹5,084.75, GST ₹915.25. / ₹6,000.00
-// =====================================================================================================
-const ORDER_PLACED_TEMPLATE_NAME = "order_received";
-
-export async function sendOrderPlacedWhatsApp({ to, customerName, companyName, orderNo, itemsLine, billingLine, total }) {
-    const v = (x, fallback = "-") => String(x ?? "").replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").trim() || fallback;
-    return sendWhatsAppTemplate({
-        to,
-        templateName: ORDER_PLACED_TEMPLATE_NAME,
-        bodyParams: [v(customerName, "there"), v(companyName, "our team"), v(orderNo), v(itemsLine), v(billingLine), v(total)],
-    });
+export async function sendOrderProcessedWhatsApp({ to, customerName, companyName, orderNo, placedOn, items, itemsLine, total, notes, shopUrl }) {
+    const message = join([
+        `${bold("Thank You for Your Purchase")} 🙏`,
+        "",
+        `Hello ${clean(customerName) || "there"},`,
+        "",
+        `Thank you for your purchase from ${bold(companyName || "our team")}. Your order is confirmed and is now being processed.`,
+        "",
+        field("Order No", orderNo),
+        field("Date", placedOn),
+        field("Status", "Processing"),
+        "",
+        RULE,
+        `${bold("Your Order")} 📦`,
+        itemsBlock({ items, itemsLine }),
+        RULE,
+        `${bold("Order total (incl. GST)")}: ${bold(money(total))}`,
+        clean(notes) ? "" : null,
+        clean(notes) ? field("Your notes", notes) : null,
+        "",
+        "We will update you again once your order is shipped. If you have any questions about this order, simply reply to this message.",
+        shopUrl ? "" : null,
+        shopUrl ? `Visit our shop: ${clean(shopUrl)}` : null,
+        "",
+        `Thank you once again for choosing ${bold(companyName || "us")}.`,
+        sign(),
+    ]);
+    return sendWhatsAppText({ to, message });
 }
