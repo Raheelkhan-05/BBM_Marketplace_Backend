@@ -1,6 +1,7 @@
 // controllers/aiBanners.controller.js
 import { supabaseAdmin } from "../config/supabase.js";
-import { aiConfigured, aiModelName, loadPending, enqueueJobs } from "../services/aiBanners.service.js";
+import { aiConfigured, aiModelName, loadCoverage, enqueueJobs } from "../services/aiBanners.service.js";
+import { isShape } from "../services/bannerImages.service.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TYPES = ["group", "category", "subcategory"];
@@ -10,10 +11,10 @@ const MAX_PER_REQUEST = 300;
 export async function aiOverview(req, res) {
     try {
         const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-        const [pending, jobs, recent] = await Promise.all([
-            loadPending(),
+        const [coverage, jobs, recent] = await Promise.all([
+            loadCoverage(),
             supabaseAdmin.from("ai_banner_jobs").select("status").gte("created_at", since).limit(5000),
-            supabaseAdmin.from("ai_banner_jobs").select("id, entity_type, entity_id, entity_name, status, error, note, publish, force, created_at, finished_at")
+            supabaseAdmin.from("ai_banner_jobs").select("id, entity_type, entity_id, entity_name, status, error, note, shapes, publish, force, created_at, finished_at")
                 .order("created_at", { ascending: false }).limit(60),
         ]);
         if (jobs.error || recent.error) throw new Error((jobs.error || recent.error).message);
@@ -36,14 +37,18 @@ export async function aiOverview(req, res) {
             const hit = j.entity_type === "group" ? gMap.get(j.entity_id) : eMap.get(j.entity_id);
             return { ...j, preview: hit?.image_url || null, ai_generated: hit?.ai_generated ?? null, is_active: hit?.is_active ?? null };
         });
-        return res.json({ success: true, configured: aiConfigured(), model: aiModelName(), pending, stats, recent: recentOut });
+        return res.json({ success: true, configured: aiConfigured(), model: aiModelName(), coverage, stats, recent: recentOut });
     } catch (err) {
         console.error("[ai-banners] overview failed:", err?.message);
         return res.status(500).json({ success: false, message: "Couldn't load the AI banner studio." });
     }
 }
 
-// POST /api/admin/ai-banners/jobs   body: { scope: "group"|"category"|"subcategory"|"all" }  or  { items: [{type,id,name?,force?}] },  publish?
+// POST /api/admin/ai-banners/jobs
+//   { scope: "group"|"category"|"subcategory"|"all" }   -> fills every missing size of every item that lacks any
+//   { items: [{ type, id, name?, shapes?: ["wide","landscape","square","portrait"], force? }] }
+//   publish?
+// Without `force`, existing sizes are never touched. With `force`, the listed `shapes` are replaced.
 export async function aiEnqueue(req, res) {
     if (!aiConfigured()) return res.status(400).json({ success: false, message: "OPENAI_API_KEY is not set on the server." });
     try {
@@ -52,14 +57,19 @@ export async function aiEnqueue(req, res) {
         if (Array.isArray(req.body?.items)) {
             items = req.body.items
                 .filter((i) => TYPES.includes(i?.type) && UUID_RE.test(String(i?.id)))
-                .map((i) => ({ type: i.type, id: i.id, name: String(i.name || "").slice(0, 200), force: i.force === true }));
+                .map((i) => {
+                    const shapes = Array.isArray(i.shapes) ? [...new Set(i.shapes.filter(isShape))] : [];
+                    return { type: i.type, id: i.id, name: String(i.name || "").slice(0, 200), shapes: shapes.length ? shapes : null, force: i.force === true };
+                });
         } else {
             const scope = req.body?.scope;
             if (![...TYPES, "all"].includes(scope)) return res.status(400).json({ success: false, message: "Invalid scope." });
-            const pending = await loadPending();
+            const coverage = await loadCoverage();
             for (const t of TYPES) {
                 if (scope !== "all" && scope !== t) continue;
-                items.push(...pending[t].filter((p) => !p.state).map((p) => ({ type: t, id: p.id, name: p.name, force: false })));
+                items.push(...coverage[t]
+                    .filter((p) => !p.state && p.missing.length > 0)
+                    .map((p) => ({ type: t, id: p.id, name: p.name, shapes: p.missing.length === 4 ? null : p.missing, force: false })));
             }
         }
         items = items.slice(0, MAX_PER_REQUEST);

@@ -1,11 +1,11 @@
-// services/aiBanners.service.js — AI banner generation: pending detection, context, prompts, OpenAI calls, queue worker.
+// services/aiBanners.service.js — AI banner generation: coverage detection, context, prompts, OpenAI calls, queue worker.
 import { supabaseAdmin } from "../config/supabase.js";
-import { validateAndUpload, removeObjects } from "./bannerImages.service.js";
+import { validateAndUpload, removeObjects, SHAPE_KEYS, isShape } from "./bannerImages.service.js";
 import { broadcastBannersChanged } from "./groupBanners.service.js";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export const aiConfigured = () => !!process.env.OPENAI_API_KEY;
-const imageModel = () => process.env.OPENAI_IMAGE_MODEL || "gpt-image-1";
+const imageModel = () => process.env.OPENAI_IMAGE_MODEL || "gpt-image-2";
 const textModel = () => process.env.OPENAI_TEXT_MODEL || "gpt-4.1-mini";
 const imageQuality = () => process.env.OPENAI_IMAGE_QUALITY || "medium";
 const concurrency = () => Math.max(1, parseInt(process.env.AI_BANNER_CONCURRENCY || "1", 10) || 1);
@@ -16,41 +16,73 @@ const MAX_ATTEMPTS = 3;
 const ACCENT = { orange: "#F4511E", blue: "#1E78D6", green: "#22A06B" };
 const hidden = (n) => String(n || "").trim().toLowerCase() === "pending";
 
-/* ───────────────────────── pending detection ───────────────────────── */
-export async function loadPending() {
-    const [reg, gb, cats, subs, eb, open] = await Promise.all([
+/* ───────────────────────── coverage detection ─────────────────────────
+   Every group / category / subcategory, with the sizes it already has and the ones it lacks. */
+export async function loadCoverage() {
+    const [reg, gb, gi, cats, subs, eb, open] = await Promise.all([
         supabaseAdmin.from("catalog_group_registry").select("group_id, name, category_name, variant_count").eq("is_active", true).order("name").range(0, 4999),
-        supabaseAdmin.from("group_banners").select("group_id").range(0, 9999),
+        supabaseAdmin.from("group_banners").select("group_id, image_url, is_active, ai_generated").range(0, 9999),
+        supabaseAdmin.from("group_banner_images").select("group_id, shape, image_url").range(0, 19999),
         supabaseAdmin.from("hs_categories").select("id, name").is("deleted_at", null).neq("review_status", "rejected").order("name").range(0, 4999),
         supabaseAdmin.from("hs_subcategories").select("id, name, category_id").is("deleted_at", null).neq("review_status", "rejected").order("name").range(0, 4999),
-        supabaseAdmin.from("catalog_entity_banners").select("entity_type, entity_id").range(0, 19999),
+        supabaseAdmin.from("catalog_entity_banners").select("entity_type, entity_id, shape, image_url, is_active, ai_generated").range(0, 19999),
         supabaseAdmin.from("ai_banner_jobs").select("entity_type, entity_id, status").in("status", ["queued", "running"]),
     ]);
-    const err = [reg, gb, cats, subs, eb, open].find((r) => r.error);
+    const err = [reg, gb, gi, cats, subs, eb, open].find((r) => r.error);
     if (err) throw new Error(err.error.message);
 
     const openMap = new Map((open.data || []).map((j) => [`${j.entity_type}:${j.entity_id}`, j.status]));
-    const have = new Set((eb.data || []).map((r) => `${r.entity_type}:${r.entity_id}`));
-    const haveGroup = new Set((gb.data || []).map((r) => r.group_id));
     const catName = new Map((cats.data || []).map((c) => [c.id, c.name]));
-    const state = (t, id) => openMap.get(`${t}:${id}`) || null;
+
+    // group_id -> { images: {shape:url}, ai, active }
+    const groupRec = new Map();
+    for (const r of gb.data || []) groupRec.set(r.group_id, { images: r.image_url ? { wide: r.image_url } : {}, ai: !!r.ai_generated, active: r.is_active !== false });
+    for (const r of gi.data || []) {
+        const rec = groupRec.get(r.group_id);
+        if (rec && isShape(r.shape) && r.image_url) rec.images[r.shape] = r.image_url;
+    }
+
+    // "type:id" -> { images, ai (every size AI-made), active (any size live) }
+    const entityRec = new Map();
+    for (const r of eb.data || []) {
+        const key = `${r.entity_type}:${r.entity_id}`;
+        if (!entityRec.has(key)) entityRec.set(key, { images: {}, ai: true, active: false });
+        const rec = entityRec.get(key);
+        if (isShape(r.shape) && r.image_url) rec.images[r.shape] = r.image_url;
+        rec.ai = rec.ai && !!r.ai_generated;
+        rec.active = rec.active || r.is_active !== false;
+    }
+
+    const make = (type, id, name, sub, rec) => {
+        const images = rec?.images || {};
+        return {
+            id, name, sub,
+            have: SHAPE_KEYS.filter((k) => images[k]),
+            missing: SHAPE_KEYS.filter((k) => !images[k]),
+            preview: images.wide || images.landscape || images.square || images.portrait || null,
+            ai: rec ? !!rec.ai : null,
+            active: rec ? rec.active : null,
+            state: openMap.get(`${type}:${id}`) || null,
+        };
+    };
 
     return {
-        group: (reg.data || []).filter((g) => !haveGroup.has(g.group_id))
-            .map((g) => ({ id: g.group_id, name: g.name, sub: g.category_name || null, state: state("group", g.group_id) })),
-        category: (cats.data || []).filter((c) => !hidden(c.name) && !have.has(`category:${c.id}`))
-            .map((c) => ({ id: c.id, name: c.name, sub: null, state: state("category", c.id) })),
-        subcategory: (subs.data || []).filter((s) => !hidden(s.name) && !have.has(`subcategory:${s.id}`))
-            .map((s) => ({ id: s.id, name: s.name, sub: catName.get(s.category_id) ? `in ${catName.get(s.category_id)}` : null, state: state("subcategory", s.id) })),
+        group: (reg.data || []).map((g) => make("group", g.group_id, g.name, g.category_name || null, groupRec.get(g.group_id))),
+        category: (cats.data || []).filter((c) => !hidden(c.name))
+            .map((c) => make("category", c.id, c.name, null, entityRec.get(`category:${c.id}`))),
+        subcategory: (subs.data || []).filter((s) => !hidden(s.name))
+            .map((s) => make("subcategory", s.id, s.name, catName.get(s.category_id) ? `in ${catName.get(s.category_id)}` : null, entityRec.get(`subcategory:${s.id}`))),
     };
 }
 
+// items: [{ type, id, name, shapes?: string[] | null, force? }]
 export async function enqueueJobs(items, { publish = false, userId = null } = {}) {
     if (!items.length) return { queued: 0 };
     const { data: open } = await supabaseAdmin.from("ai_banner_jobs").select("entity_type, entity_id").in("status", ["queued", "running"]);
     const openSet = new Set((open || []).map((j) => `${j.entity_type}:${j.entity_id}`));
     const rows = items.filter((i) => !openSet.has(`${i.type}:${i.id}`)).map((i) => ({
         entity_type: i.type, entity_id: i.id, entity_name: i.name || null,
+        shapes: Array.isArray(i.shapes) && i.shapes.length ? i.shapes.filter(isShape) : null, // null = all four sizes
         publish: !!publish, force: !!i.force, created_by: userId ? String(userId) : null,
     }));
     if (!rows.length) return { queued: 0 };
@@ -167,6 +199,20 @@ async function buildConcept(ctx) {
     }
 }
 
+// When only some sizes are being (re)made, reuse the concept of the last successful run so the new
+// sizes carry the same headline, products and accent colour as the ones already there.
+async function priorConcept(job) {
+    try {
+        const { data } = await supabaseAdmin.from("ai_banner_jobs").select("concept")
+            .eq("entity_type", job.entity_type).eq("entity_id", job.entity_id)
+            .eq("status", "done").not("concept", "is", null)
+            .order("finished_at", { ascending: false }).limit(1).maybeSingle();
+        const c = data?.concept;
+        if (c && typeof c.label === "string" && Array.isArray(c.hero_items) && c.hero_items.length >= 2 && ACCENT[c.accent]) return c;
+    } catch { /* fall back to a fresh concept */ }
+    return null;
+}
+
 const COMPOSITION = {
     landscape: "Wide 3:2 canvas. Headline left-aligned in the left 40%, vertically centred. Product cluster on the right 55%. Generous margins.",
     square: "Square 1:1 canvas. Headline centred across the top 24%. Product cluster centred below it, filling about 60% of the height.",
@@ -189,9 +235,9 @@ BRAND STYLE: bright, clean, trustworthy. Background is white (#FFFFFF) blending 
 TEXT: the ONLY text in the image is the headline "${concept.label}", spelled exactly like that, in a bold modern geometric sans-serif (Figtree-like), deep ink #08222B, very high contrast, large enough to read on a small phone (cap height at least 7% of the image height).${cta} No other words, numbers, prices, logos, watermarks or fine print anywhere.
 
 COMPOSITION: ${COMPOSITION[orientation]}
-SAFE ZONE: keep ALL text and every key product fully inside the central 85% of the frame, because the image will be cropped to several aspect ratios.
+SAFE ZONE: keep ALL text and every key product fully inside the central 80% of the frame, because the image will be cropped to several aspect ratios.
 
-QUALITY: ultra-sharp, crisp edges, no blur, no noise, no grain, no cartoon look, no clutter, no people.`;
+QUALITY: ultra-sharp, crisp edges, no blur, no noise, no grain, no cartoon look, no clutter, no people. `;
 }
 
 async function generateMaster(prompt, orientation) {
@@ -212,11 +258,13 @@ const OUT = {
     portrait: { from: "portrait", w: 960, h: 1280 },
 };
 
-async function deriveShapes(masters) {
+// Only derives the requested shapes (their masters must already exist).
+async function deriveShapes(masters, shapes) {
     let sharp;
     try { sharp = (await import("sharp")).default; } catch { throw new Error("The 'sharp' package is not installed on the server (npm i sharp)."); }
     const files = {};
-    for (const [shape, o] of Object.entries(OUT)) {
+    for (const shape of shapes) {
+        const o = OUT[shape];
         let buf;
         for (const q of [90, 82, 74, 66]) {
             buf = await sharp(masters[o.from]).resize(o.w, o.h, { fit: "cover", position: "centre" }).webp({ quality: q }).toBuffer();
@@ -227,53 +275,70 @@ async function deriveShapes(masters) {
     return files;
 }
 
-/* ───────────────────────── save results ───────────────────────── */
-async function persistGroup(job, files, label) {
+/* ───────────────────────── save results ─────────────────────────
+   Rule: without `force`, only sizes that don't exist yet are written (nothing existing is touched).
+   With `force`, the requested sizes are replaced, whoever made them. */
+async function persistGroup(job, files, label, shapes) {
     const groupId = job.entity_id;
     const { data: existing } = await supabaseAdmin.from("group_banners").select("*").eq("group_id", groupId).maybeSingle();
-    if (existing && !(job.force && existing.ai_generated)) return { skipped: existing.ai_generated ? "Already has an AI banner." : "Has a manually uploaded banner, left untouched." };
+    const { data: oldExtras } = await supabaseAdmin.from("group_banner_images").select("shape, image_path").eq("group_id", groupId);
 
-    const up = await validateAndUpload(files, groupId);
+    const have = new Set(existing ? ["wide", ...(oldExtras || []).map((o) => o.shape)] : []);
+    const toWrite = shapes.filter((s) => job.force || !have.has(s));
+    if (!toWrite.length) return { skipped: "Nothing to do: every requested size already exists." };
+
+    const up = await validateAndUpload(Object.fromEntries(toWrite.map((s) => [s, files[s]])), groupId);
     if (!up.ok) throw new Error(up.message);
     const wide = up.uploaded.find((u) => u.shape === "wide");
     const others = up.uploaded.filter((u) => u.shape !== "wide");
-
-    let sortOrder = existing?.sort_order;
-    if (sortOrder == null) {
-        const { data: last } = await supabaseAdmin.from("group_banners").select("sort_order").order("sort_order", { ascending: false }).limit(1).maybeSingle();
-        sortOrder = (last?.sort_order ?? 0) + 1;
-    }
     const nowIso = new Date().toISOString();
-    const { error } = await supabaseAdmin.from("group_banners").upsert({
-        group_id: groupId, image_url: wide.url, image_path: wide.path, alt_text: label,
-        is_active: existing ? existing.is_active : !!job.publish, sort_order: sortOrder,
-        ai_generated: true, updated_at: nowIso, updated_by: null,
-    }, { onConflict: "group_id" });
-    if (error) {
-        await removeObjects(up.uploaded.map((u) => u.path));
-        throw new Error(error.code === "23503" ? "Group is not in the registry yet." : error.message);
+
+    if (wide || !existing) {
+        let sortOrder = existing?.sort_order;
+        if (sortOrder == null) {
+            const { data: last } = await supabaseAdmin.from("group_banners").select("sort_order").order("sort_order", { ascending: false }).limit(1).maybeSingle();
+            sortOrder = (last?.sort_order ?? 0) + 1;
+        }
+        const { error } = await supabaseAdmin.from("group_banners").upsert({
+            group_id: groupId, image_url: wide.url, image_path: wide.path, alt_text: existing?.alt_text ?? label,
+            is_active: existing ? existing.is_active : !!job.publish, sort_order: sortOrder,
+            ai_generated: true, updated_at: nowIso, updated_by: null,
+        }, { onConflict: "group_id" });
+        if (error) {
+            await removeObjects(up.uploaded.map((u) => u.path));
+            throw new Error(error.code === "23503" ? "Group is not in the registry yet." : error.message);
+        }
     }
-    const { data: old } = await supabaseAdmin.from("group_banner_images").select("image_path").eq("group_id", groupId);
-    const { error: imgErr } = await supabaseAdmin.from("group_banner_images").upsert(
-        others.map((o) => ({ group_id: groupId, shape: o.shape, image_url: o.url, image_path: o.path, width: o.width, height: o.height, updated_at: nowIso, updated_by: null })),
-        { onConflict: "group_id,shape" }
-    );
-    if (imgErr) { await removeObjects(others.map((o) => o.path)); throw new Error(imgErr.message); }
-    await removeObjects([existing?.image_path, ...(old || []).map((o) => o.image_path)]);
+
+    if (others.length) {
+        const { error: imgErr } = await supabaseAdmin.from("group_banner_images").upsert(
+            others.map((o) => ({ group_id: groupId, shape: o.shape, image_url: o.url, image_path: o.path, width: o.width, height: o.height, updated_at: nowIso, updated_by: null })),
+            { onConflict: "group_id,shape" }
+        );
+        if (imgErr) { await removeObjects(up.uploaded.map((u) => u.path)); throw new Error(imgErr.message); }
+    }
+
+    // Remove only the files that were just replaced.
+    const stale = (oldExtras || []).filter((o) => others.some((n) => n.shape === o.shape)).map((o) => o.image_path);
+    if (wide && existing?.image_path) stale.push(existing.image_path);
+    await removeObjects(stale);
+
     broadcastBannersChanged();
     return {};
 }
 
-async function persistEntity(job, files, label) {
+async function persistEntity(job, files, label, shapes) {
     const { entity_type: type, entity_id: id } = job;
     const { data: existing } = await supabaseAdmin.from("catalog_entity_banners").select("shape, image_path, is_active, ai_generated").eq("entity_type", type).eq("entity_id", id);
-    if (existing?.length && !(job.force && existing.every((r) => r.ai_generated))) {
-        return { skipped: existing.every((r) => r.ai_generated) ? "Already has AI images." : "Has manually uploaded images, left untouched." };
-    }
-    const up = await validateAndUpload(files, `${type}/${id}`);
+
+    const have = new Set((existing || []).map((r) => r.shape));
+    const toWrite = shapes.filter((s) => job.force || !have.has(s));
+    if (!toWrite.length) return { skipped: "Nothing to do: every requested size already exists." };
+
+    const up = await validateAndUpload(Object.fromEntries(toWrite.map((s) => [s, files[s]])), `${type}/${id}`);
     if (!up.ok) throw new Error(up.message);
     const nowIso = new Date().toISOString();
-    const active = existing?.length ? existing[0].is_active : !!job.publish;
+    const active = existing?.length ? existing[0].is_active : !!job.publish; // new sizes follow the item's current visibility
     const { error } = await supabaseAdmin.from("catalog_entity_banners").upsert(
         up.uploaded.map((u) => ({
             entity_type: type, entity_id: id, shape: u.shape, image_url: u.url, image_path: u.path, alt_text: label,
@@ -282,7 +347,7 @@ async function persistEntity(job, files, label) {
         { onConflict: "entity_type,entity_id,shape" }
     );
     if (error) { await removeObjects(up.uploaded.map((u) => u.path)); throw new Error(error.message); }
-    await removeObjects((existing || []).map((r) => r.image_path));
+    await removeObjects((existing || []).filter((r) => toWrite.includes(r.shape)).map((r) => r.image_path));
     return {};
 }
 
@@ -294,13 +359,26 @@ async function runJob(job) {
         if (!ctx) return void (await finish({ status: "failed", error: "Couldn't find this item in the catalog." }));
         await supabaseAdmin.from("ai_banner_jobs").update({ entity_name: ctx.name }).eq("id", job.id);
 
-        const concept = await buildConcept(ctx);
+        let shapes = Array.isArray(job.shapes) && job.shapes.length ? SHAPE_KEYS.filter((s) => job.shapes.includes(s)) : [...SHAPE_KEYS];
+        if (!shapes.length) shapes = [...SHAPE_KEYS];
+        // A group can't hold extra sizes without its 16:9 base image.
+        if (job.entity_type === "group" && !shapes.includes("wide")) {
+            const { data: gb } = await supabaseAdmin.from("group_banners").select("group_id").eq("group_id", job.entity_id).maybeSingle();
+            if (!gb) shapes.unshift("wide");
+        }
+
+        const partial = shapes.length < SHAPE_KEYS.length;
+        const concept = (partial && await priorConcept(job)) || await buildConcept(ctx);
+
+        const orientations = [...new Set(shapes.map((s) => OUT[s].from))];
         const masters = {};
-        for (const orientation of ["landscape", "square", "portrait"]) {   // one at a time: gentle on rate limits
+        for (const orientation of orientations) {   // one at a time: gentle on rate limits
             masters[orientation] = await generateMaster(buildImagePrompt(concept, ctx, orientation), orientation);
         }
-        const files = await deriveShapes(masters);
-        const res = job.entity_type === "group" ? await persistGroup(job, files, concept.label) : await persistEntity(job, files, concept.label);
+        const files = await deriveShapes(masters, shapes);
+        const res = job.entity_type === "group"
+            ? await persistGroup(job, files, concept.label, shapes)
+            : await persistEntity(job, files, concept.label, shapes);
         await finish({ status: "done", concept, note: res.skipped || null, error: null });
     } catch (e) {
         console.error("[ai-banners] job failed:", job.id, e?.message);

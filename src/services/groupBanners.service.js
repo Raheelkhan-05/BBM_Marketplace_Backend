@@ -259,7 +259,7 @@ async function notifyAdminsOfNewGroups(groups) {
                 type: "group_banner_needed",
                 title: m.title,
                 body: m.body,
-                link: "/admin/group-banners",
+                link: "/group-banners",
                 ...m.extra, // socket-only hints, not persisted
             });
             if (row) saved += 1;

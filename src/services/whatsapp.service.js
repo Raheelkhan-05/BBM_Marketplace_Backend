@@ -673,7 +673,7 @@ export async function sendOrderProcessedWhatsApp({
 
         "",
 
-        "We will update you again when your order is shipped. If you have any questions, simply reply to this message.",
+        "If you have any questions, simply reply to this message.",
 
         shopUrl ? "" : null,
 
