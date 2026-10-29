@@ -6,6 +6,9 @@ const FROM = process.env.SMTP_FROM || '"BBM" <communication@bbmpvtltd.com>';
 const BRAND_TEAL = "#047084";
 const BRAND_ORANGE = "#d2462b";
 
+const BETA_NOTICE =
+  "Please note: BBM Marketplace is currently in its beta phase. Occasional errors may occur and are being addressed. We appreciate your patience.";
+
 const DEFAULT_FOOTER = `You're receiving this because an account was created or updated on BBM
             using this email address. If this wasn't you, you can ignore this email.`;
 
@@ -15,7 +18,7 @@ function esc(v) {
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-function shell(title, bodyHtml, footer = DEFAULT_FOOTER) {
+function shell(title, bodyHtml, footer = DEFAULT_FOOTER, { beta = true } = {}) {
   return `
   <div style="background:#f4f7f8;padding:32px 0;font-family:Arial,Helvetica,sans-serif;">
     <table role="presentation" width="100%" style="max-width:480px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #eef1f2;">
@@ -30,6 +33,7 @@ function shell(title, bodyHtml, footer = DEFAULT_FOOTER) {
           ${bodyHtml}
         </td>
       </tr>
+      ${beta ? `<tr><td style="padding:8px 28px 0;"><p style="margin:0;font-size:12px;line-height:1.5;color:#9a3412;">${BETA_NOTICE}</p></td></tr>` : ""}
       <tr>
         <td style="padding:20px 28px 28px;">
           <p style="margin:0;font-size:11.5px;color:#94a3b8;">
@@ -164,8 +168,10 @@ export async function sendOtpEmail(email, otp) {
       "Your verification code",
       `<p style="margin:0;font-size:14px;line-height:1.6;color:#475569;">
          Your code is <strong style="font-size:18px;letter-spacing:2px;">${otp}</strong>.
-         It expires in 5 minutes.
-       </p>`
+                  It expires in 5 minutes.
+       </p>`,
+      DEFAULT_FOOTER,
+      { beta: false }
     ),
   });
   return throwIfResendError(result);

@@ -39,6 +39,9 @@ const BRAND = "BBM Marketplace";
 
 const RULE = "━━━━━━━━━━━━━━━━━━";
 
+const BETA_NOTE =
+    "_Please note: BBM Marketplace is currently in its beta phase. Occasional errors may occur and are being addressed. We appreciate your patience._";
+
 // -----------------------------------------------------------------------------
 // Phone number formatting
 // -----------------------------------------------------------------------------
@@ -375,6 +378,10 @@ export async function sendOrderUpdateWhatsApp({
         clean(footer) ||
         "Thank you for shopping with BBM Marketplace.",
 
+        "",
+
+        BETA_NOTE,
+
         sign(),
     ]);
 
@@ -437,6 +444,10 @@ export async function sendSalesQuotationWhatsApp({
 
         clean(closing) ||
         "Please get in touch with us to confirm your order.",
+
+        "",
+
+        BETA_NOTE,
 
         "",
 
@@ -598,6 +609,10 @@ export async function sendOrderPlacedWhatsApp({
 
         `Thank you for choosing ${bold(sellerName)}.`,
 
+        "",
+
+        BETA_NOTE,
+
         sign(),
     ]);
 
@@ -684,6 +699,10 @@ export async function sendOrderProcessedWhatsApp({
         "",
 
         `Thank you for choosing ${bold(sellerName)}.`,
+
+        "",
+
+        BETA_NOTE,
 
         sign(),
     ]);
