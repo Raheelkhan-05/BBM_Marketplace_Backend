@@ -16,8 +16,9 @@ const MAX_ATTEMPTS = 3;
 const ACCENT = { orange: "#F4511E", blue: "#1E78D6", green: "#22A06B" };
 const hidden = (n) => String(n || "").trim().toLowerCase() === "pending";
 
-/* ───────────────────────── coverage detection ─────────────────────────
+/* ------------------------- coverage detection -------------------------
    Every group / category / subcategory, with the sizes it already has and the ones it lacks. */
+
 export async function loadCoverage() {
     const [reg, gb, gi, cats, subs, eb, open] = await Promise.all([
         supabaseAdmin.from("catalog_group_registry").select("group_id, name, category_name, variant_count").eq("is_active", true).order("name").range(0, 4999),
@@ -47,7 +48,9 @@ export async function loadCoverage() {
 
     for (const r of gi.data || []) {
         const rec = groupRec.get(r.group_id);
-        if (rec && isShape(r.shape) && r.image_url) rec.images[r.shape] = r.image_url;
+        if (rec && isShape(r.shape) && r.image_url) {
+            rec.images[r.shape] = r.image_url;
+        }
     }
 
     const entityRec = new Map();
@@ -61,7 +64,9 @@ export async function loadCoverage() {
 
         const rec = entityRec.get(key);
 
-        if (isShape(r.shape) && r.image_url) rec.images[r.shape] = r.image_url;
+        if (isShape(r.shape) && r.image_url) {
+            rec.images[r.shape] = r.image_url;
+        }
 
         rec.ai = rec.ai && !!r.ai_generated;
         rec.active = rec.active || r.is_active !== false;
@@ -115,7 +120,9 @@ export async function enqueueJobs(items, { publish = false, userId = null } = {}
         .select("entity_type, entity_id")
         .in("status", ["queued", "running"]);
 
-    const openSet = new Set((open || []).map((j) => `${j.entity_type}:${j.entity_id}`));
+    const openSet = new Set(
+        (open || []).map((j) => `${j.entity_type}:${j.entity_id}`)
+    );
 
     const rows = items
         .filter((i) => !openSet.has(`${i.type}:${i.id}`))
@@ -123,7 +130,9 @@ export async function enqueueJobs(items, { publish = false, userId = null } = {}
             entity_type: i.type,
             entity_id: i.id,
             entity_name: i.name || null,
-            shapes: Array.isArray(i.shapes) && i.shapes.length ? i.shapes.filter(isShape) : null,
+            shapes: Array.isArray(i.shapes) && i.shapes.length
+                ? i.shapes.filter(isShape)
+                : null,
             publish: !!publish,
             force: !!i.force,
             created_by: userId ? String(userId) : null,
@@ -135,7 +144,7 @@ export async function enqueueJobs(items, { publish = false, userId = null } = {}
 
     if (!error) return { queued: rows.length };
 
-    // A race on the "one open job per entity" index: fall back to one by one.
+    // Handle a race on the one-open-job-per-entity index.
     let queued = 0;
 
     for (const r of rows) {
@@ -146,11 +155,10 @@ export async function enqueueJobs(items, { publish = false, userId = null } = {}
     return { queued };
 }
 
-/* ───────────────────────── catalog context ───────────────────────── */
+/* ------------------------- catalog context ------------------------- */
 
-const uniq = (arr) => [
-    ...new Set(arr.map((s) => String(s || "").trim()).filter(Boolean)),
-];
+const uniq = (arr) =>
+    [...new Set(arr.map((s) => String(s || "").trim()).filter(Boolean))];
 
 async function buildContext(type, id) {
     if (type === "group") {
@@ -272,13 +280,12 @@ async function buildContext(type, id) {
     };
 }
 
-/* ───────────────────────── OpenAI ───────────────────────── */
+/* ------------------------- OpenAI ------------------------- */
 
 async function openai(path, body, { timeoutMs = 150_000, tries = 4 } = {}) {
     for (let attempt = 1; ; attempt++) {
         const ctl = new AbortController();
         const timer = setTimeout(() => ctl.abort(), timeoutMs);
-
         let res;
 
         try {
@@ -312,11 +319,7 @@ async function openai(path, body, { timeoutMs = 150_000, tries = 4 } = {}) {
 
         if ((res.status === 429 || res.status >= 500) && attempt < tries) {
             const ra = Number(res.headers.get("retry-after"));
-
-            await sleep(
-                Number.isFinite(ra) && ra > 0 ? ra * 1000 : 15_000 * attempt
-            );
-
+            await sleep(Number.isFinite(ra) && ra > 0 ? ra * 1000 : 15_000 * attempt);
             continue;
         }
 
@@ -325,23 +328,22 @@ async function openai(path, body, { timeoutMs = 150_000, tries = 4 } = {}) {
         try {
             msg = JSON.parse(text)?.error?.message || text;
         } catch {
-            // Keep raw response text.
+            // Keep the raw response.
         }
 
         throw new Error(`OpenAI ${res.status}: ${String(msg).slice(0, 250)}`);
     }
 }
 
-const CONCEPT_SYSTEM = `You are a senior marketplace creative director for a B2B wholesale marketplace.
-Create ONE distinctive, practical banner concept for the supplied catalog entity. Reply with valid JSON only:
+const CONCEPT_SYSTEM = `You are a senior creative director for a premium B2B wholesale marketplace.
+Create ONE specific, visually distinctive banner concept for the supplied catalog entity. Return valid JSON only:
 {"label": string, "hero_items": string[], "benefits": string[], "accent": "orange"|"blue"|"green", "visual_direction": string}
 Rules:
-- label: a generic buyer-friendly heading, 1-4 words, Title Case. Never use a brand, model number, size, unit, price, or overly specific listing title.
-- hero_items: 3-5 generic, unbranded product types that are visually distinct and immediately recognizable.
-  For a product range, show different common types/variants of that product; for a subcategory, represent several main products; for a category, represent its main subcategories.
-- benefits: 2-3 very short, factual, broadly applicable buyer benefits or use cases grounded in the supplied catalog context. Use compact phrases (2-5 words each); do not invent certifications, guarantees, prices, delivery promises, or technical claims. If the context does not support benefits, return an empty array.
-- visual_direction: one short, specific art-direction phrase. Vary the composition, camera angle, product grouping, and background treatment between concepts while staying premium and uncluttered. Do not suggest text inside the image beyond the heading and approved CTA.
-- accent: pick orange, blue, or green based on the products. Avoid defaulting to the same accent every time.`;
+- label: 1-4 short buyer-friendly words in Title Case. Use the generic product/category name, never a brand, model, price, size, unit, or claim.
+- hero_items: 3-5 generic, unbranded, recognizable product forms. Keep the selection coherent: variants for a product range; representative products for a subcategory; representative subcategories for a broad category.
+- benefits: exactly 2 short, useful benefit OR application labels when the catalog context supports them. Each should be 2-4 words, ideally <=24 characters. Use grounded, ordinary use-cases; never invent certifications, guarantees, prices, delivery promises, performance figures, or technical claims. Use [] rather than guess if unsupported.
+- visual_direction: one specific art-direction sentence that names a distinct composition approach and background/light treatment. Select an approach that fits these products (for example: sculptural pedestal arrangement, precise stepped plinths, diagonal motion, overhead technical flat-lay, architectural framing, offset modular blocks, or elegant material contrast). Avoid the same centered pile, generic gradient, or row-of-products look by default. No text in the artwork.
+- accent: choose orange, blue, or green to suit the products; avoid choosing blue by default.`;
 
 async function buildConcept(ctx) {
     const fallback = {
@@ -353,7 +355,7 @@ async function buildConcept(ctx) {
         ).slice(0, 4),
         benefits: [],
         accent: "blue",
-        visual_direction: "editorial studio product still life with layered depth",
+        visual_direction: "Offset sculptural product arrangement on a pale mineral backdrop, with crisp directional studio light and generous negative space",
     };
 
     try {
@@ -373,36 +375,40 @@ async function buildConcept(ctx) {
             .replace(/\s+/g, " ")
             .trim();
 
-        if (!label || label.length > 40 || label.split(" ").length > 5) {
+        if (!label || label.length > 40 || label.split(" ").length > 4) {
             label = fallback.label;
         }
 
         const low = label.toLowerCase();
 
-        if (
-            ctx.brands.some((b) =>
-                b.length >= 3 &&
-                new RegExp(
-                    `\\b${b.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`
-                ).test(low)
-            )
-        ) {
+        if (ctx.brands.some((b) =>
+            b.length >= 3 &&
+            new RegExp(
+                `\\b${b.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`
+            ).test(low)
+        )) {
             label = fallback.label;
         }
 
         const hero = (Array.isArray(raw.hero_items) ? raw.hero_items : [])
-            .map((s) => String(s).trim().slice(0, 60))
+            .map((v) => String(v).replace(/[\r\n]/g, " ").trim().slice(0, 60))
             .filter(Boolean)
             .slice(0, 5);
 
         const benefits = (Array.isArray(raw.benefits) ? raw.benefits : [])
-            .map((v) => String(v).replace(/[\r\n]/g, " ").trim().slice(0, 36))
+            .map((v) => String(v)
+                .replace(/[\r\n]/g, " ")
+                .replace(/[.!]+$/g, "")
+                .trim()
+                .slice(0, 28)
+            )
             .filter(Boolean)
-            .slice(0, 3);
+            .slice(0, 2);
 
-        const visualDirection = String(
-            raw.visual_direction || fallback.visual_direction
-        ).replace(/[\r\n]/g, " ").trim().slice(0, 160) || fallback.visual_direction;
+        const visualDirection = String(raw.visual_direction || fallback.visual_direction)
+            .replace(/[\r\n]/g, " ")
+            .trim()
+            .slice(0, 220) || fallback.visual_direction;
 
         return {
             label,
@@ -417,7 +423,7 @@ async function buildConcept(ctx) {
     }
 }
 
-// When only some sizes are being (re)made, reuse the concept of the last successful run.
+// When only some sizes are being remade, reuse the concept of the last successful run.
 async function priorConcept(job) {
     try {
         const { data } = await supabaseAdmin
@@ -442,9 +448,9 @@ async function priorConcept(job) {
         ) {
             return {
                 ...c,
-                benefits: Array.isArray(c.benefits) ? c.benefits : [],
+                benefits: Array.isArray(c.benefits) ? c.benefits.slice(0, 2) : [],
                 visual_direction: c.visual_direction ||
-                    "editorial studio product still life with layered depth",
+                    "Offset sculptural product arrangement on a pale mineral backdrop, with crisp directional studio light and generous negative space",
             };
         }
     } catch {
@@ -455,9 +461,11 @@ async function priorConcept(job) {
 }
 
 const COMPOSITION = {
-    landscape: "Landscape master canvas. Use an asymmetrical editorial layout: headline and concise supporting details in a clearly reserved text area on the left; realistic product still life on the right. Keep generous safe margins and strong visual hierarchy.",
-    square: "Square canvas. Use a balanced, premium catalog-cover layout with headline near the top, a compact row of supporting benefit labels beneath it, and a bold product arrangement below. Keep all elements comfortably inside the safe area.",
-    portrait: "Portrait master canvas. Use a vertical editorial layout: headline at the top, benefits as a tidy short list beneath it, and a large, carefully arranged product still life in the lower portion. Avoid stacking products into a cluttered pile.",
+    landscape: "Landscape product photograph. Place the coherent hero arrangement in the right 54-60% of the canvas, with the visual center around 72% of the width. Keep the entire left 44-46% visually quiet and free of objects for a separately typeset headline and copy. The products must remain fully visible and must not intrude into the left copy area.",
+
+    square: "Square product photograph. Build an intentional, dimensional arrangement only in the lower 48-50% of the frame. Keep the upper 48-50% clean, light, low-detail, and completely free of objects for a separately typeset headline and supporting copy. Avoid a centered pile; use a confident silhouette and deliberate negative space.",
+
+    portrait: "Portrait product photograph. Place the product arrangement in the lower 52-58% of the frame, with clear separation between silhouettes. Keep the upper 38-42% light, low-detail, and free of objects for a separately typeset headline and supporting copy. Do not crop the hero products at the edges.",
 };
 
 const KIND_PHRASE = {
@@ -468,34 +476,266 @@ const KIND_PHRASE = {
 
 function buildImagePrompt(concept, ctx, orientation) {
     const accent = ACCENT[concept.accent] || ACCENT.blue;
-    const isGroup = ctx.kind === "group";
 
-    const cta = isGroup
-        ? `Include one small, polished pill-shaped CTA below the headline, reading exactly "Explore range". Use a solid ${accent} fill, white text, clear contrast, even padding, and a clean geometric sans-serif. It must look like a designed UI button, not a floating label, outlined capsule, or oversized badge.`
-        : "Do not include a CTA button.";
+    return `Create a premium, professionally art-directed B2B marketplace campaign photograph for ${KIND_PHRASE[ctx.kind]} "${ctx.name}".
 
-    const benefits = (concept.benefits || []).slice(0, 3);
+PRODUCT SUBJECTS: ${concept.hero_items.join("; ")}. Show 3-5 recognizable, generic, unbranded product forms appropriate to this catalog entity. Keep them physically plausible, correctly proportioned, beautifully lit, and distinct from one another. Do not introduce unrelated props or extra product categories. No visible people, logos, brand marks, packaging copy, labels, letters, numbers, watermarks, typography, interface elements, buttons, badges, icons, or pseudo-text. Absolutely no text anywhere in the generated image: all copy will be typeset separately afterward.
 
-    const benefitText = benefits.length
-        ? `Include these exact short benefit/use-case phrases as a neat, legible supporting list: ${benefits.map((b) => `"${b}"`).join(", ")}. Render them as 2–3 evenly spaced text labels or a compact list with small simple bullets/icons. Keep them secondary to the headline; do not let them overlap the products or CTA.`
-        : "Do not invent benefits, claims, or supporting copy; use only the headline and CTA (if specified).";
+ART DIRECTION: ${concept.visual_direction || "A distinctive sculptural product arrangement with deliberate negative space and crisp studio lighting"}. Make this a product-specific campaign art direction, not a stock-photo template. Use a deliberate asymmetrical silhouette, believable contact shadows, varied product heights, and a controlled camera angle. Avoid an identical centered pile, generic floating products, repeated tiles, and an empty generic gradient as the only design idea.
 
-    return `Create a premium, high-converting e-commerce banner for a B2B wholesale marketplace. It should feel like a professionally art-directed campaign, not a generic template, and remain readable as a small phone thumbnail.
-
-WHAT IT REPRESENTS: ${KIND_PHRASE[ctx.kind]} called "${concept.label}".
-
-HERO VISUALS: ${concept.hero_items.join("; ")}. Show 3–5 distinct, realistic, unbranded products in premium studio product-photography style. Arrange them as a deliberate still life with believable scale, natural depth, subtle contact shadows, and clear separation between silhouettes. No logos, brand marks, packaging text, or made-up product labels.
-
-ART DIRECTION: ${concept.visual_direction || "premium editorial product still life"}. Make the layout specific to this product family: vary product arrangement, camera angle, negative space, background geometry, and light direction. Avoid repeating the same centered pile of products or the same generic gradient composition across banners. Keep it elegant and uncluttered.
-
-BRAND STYLE: clean, modern, trustworthy. Use a mostly white / very pale cool-neutral background with restrained ice-blue (#EDF3F5) and a subtle warm accent glow only where it helps the composition. Text ink #08222B, secondary text #52686F, accent ${accent}. Use accent colour sparingly for a short rule, small icons, or the CTA. Strong contrast and ample whitespace.
-
-TEXT HIERARCHY: The headline "${concept.label}" must be spelled exactly, large, bold, and highly legible in a modern geometric sans-serif. ${benefitText} ${cta} No other words, numbers, prices, logos, watermarks, or fine print. Render all specified text cleanly and correctly; do not add decorative pseudo-text.
+BACKGROUND AND PALETTE: mostly light warm-white / pale mineral neutral, with restrained tonal depth, subtle material texture, and an understated ${accent} accent used only in abstract set design if it genuinely suits the products. Preserve clear negative space for copy. Avoid noisy patterns and high-frequency detail behind where text will be placed.
 
 COMPOSITION: ${COMPOSITION[orientation]}
-SAFE ZONE: keep all text, CTA, benefits, and important product details inside the central 80% of the frame so the artwork can be cropped to 16:9, 4:3, 1:1, and 3:4. Maintain clear separation between headline, benefits, products, and CTA.
 
-QUALITY: crisp commercial product photography, clean edges, realistic materials, soft intentional shadows, no blur, no noise, no grain, no cartoon look, no clutter, no people.`;
+FINISH: premium commercial product photography, crisp focus, realistic materials, refined highlights, soft but defined contact shadows, carefully balanced visual weight, clean silhouettes, sophisticated editorial art direction, no clutter, no blur, no grain, no cartoon rendering.`;
+}
+
+const BENEFIT_INK = "#263D46";
+const HEADLINE_INK = "#10272F";
+const SUPPORT_INK = "#263D46";
+
+const copyEscape = (v) =>
+    String(v ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&apos;");
+
+function estimatedWidth(text, fontSize) {
+    // Conservative width estimate to prevent text from spilling into the image area.
+    let units = 0;
+
+    for (const ch of String(text)) {
+        units += /[ilI.,'!|]/.test(ch) ? 0.33
+            : /[MW@%&]/.test(ch) ? 0.98
+                : /[A-Z0-9]/.test(ch) ? 0.76
+                    : ch === " " ? 0.37
+                        : 0.68;
+    }
+
+    return units * fontSize;
+}
+
+function wrapText(text, maxWidth, fontSize) {
+    const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+    const lines = [];
+    let line = "";
+
+    for (const word of words) {
+        const candidate = line ? `${line} ${word}` : word;
+
+        if (!line || estimatedWidth(candidate, fontSize) <= maxWidth) {
+            line = candidate;
+        } else {
+            lines.push(line);
+            line = word;
+        }
+    }
+
+    if (line) lines.push(line);
+
+    return lines.length ? lines : [""];
+}
+
+function fitHeadline(label, maxWidth, baseSize, maxLines = 3) {
+    let fontSize = baseSize;
+    let lines = wrapText(label, maxWidth, fontSize);
+
+    const doesNotFit = () =>
+        lines.length > maxLines ||
+        lines.some((line) => estimatedWidth(line, fontSize) > maxWidth);
+
+    while (doesNotFit() && fontSize > 36) {
+        fontSize -= 2;
+        lines = wrapText(label, maxWidth, fontSize);
+    }
+
+    return { fontSize, lines };
+}
+
+function copyWash(shape) {
+    if (shape === "wide" || shape === "landscape") {
+        return `<linearGradient id="copyWash" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.99"/><stop offset="34%" stop-color="#FFFFFF" stop-opacity="0.98"/><stop offset="45%" stop-color="#FFFFFF" stop-opacity="0.94"/><stop offset="54%" stop-color="#FFFFFF" stop-opacity="0.72"/><stop offset="63%" stop-color="#FFFFFF" stop-opacity="0.18"/><stop offset="70%" stop-color="#FFFFFF" stop-opacity="0"/></linearGradient>`;
+    }
+
+    return `<linearGradient id="copyWash" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.99"/><stop offset="29%" stop-color="#FFFFFF" stop-opacity="0.98"/><stop offset="39%" stop-color="#FFFFFF" stop-opacity="0.94"/><stop offset="48%" stop-color="#FFFFFF" stop-opacity="0.74"/><stop offset="58%" stop-color="#FFFFFF" stop-opacity="0.16"/><stop offset="66%" stop-color="#FFFFFF" stop-opacity="0"/></linearGradient>`;
+}
+
+function buildOverlaySvg(concept, ctx, shape, width, height) {
+    const accent = ACCENT[concept.accent] || ACCENT.blue;
+
+    const benefits = (Array.isArray(concept.benefits) ? concept.benefits : [])
+        .map((v) => String(v).trim())
+        .filter(Boolean)
+        .slice(0, 2);
+
+    const isGroup = ctx.kind === "group";
+    const isHorizontal = shape === "wide" || shape === "landscape";
+
+    const marginX = Math.round(width * (isHorizontal ? 0.06 : 0.065));
+
+    const textWidth = isHorizontal
+        ? Math.round(width * (shape === "wide" ? 0.43 : 0.425))
+        : width - marginX * 2;
+
+    const kicker = ctx.kind === "group"
+        ? "PRODUCT RANGE"
+        : ctx.kind === "subcategory"
+            ? "PRODUCT SUBCATEGORY"
+            : "PRODUCT CATEGORY";
+
+    const kickerSize = isHorizontal
+        ? (shape === "wide" ? 20 : 18)
+        : 19;
+
+    const titleBaseSize = isHorizontal
+        ? (shape === "wide" ? 78 : 66)
+        : (shape === "square" ? 69 : 64);
+
+    const title = fitHeadline(concept.label, textWidth, titleBaseSize, 3);
+    const titleLineHeight = Math.round(title.fontSize * 1.04);
+
+    const benefitSize = isHorizontal
+        ? (shape === "wide" ? 28 : 26)
+        : 26;
+
+    const benefitRowHeight = isHorizontal ? 43 : 41;
+    const buttonHeight = isHorizontal ? 60 : 58;
+
+    const buttonWidth = shape === "wide"
+        ? 252
+        : shape === "landscape"
+            ? 232
+            : shape === "portrait"
+                ? 248
+                : 240;
+
+    const topKickerH = 25;
+    const titleGap = 15;
+    const afterTitleGap = isHorizontal ? 27 : 24;
+    const afterBenefitsGap = isGroup ? 22 : 0;
+
+    const benefitRows = (!isHorizontal && benefits.length === 2)
+        ? 1
+        : benefits.length;
+
+    const contentHeight =
+        topKickerH +
+        titleGap +
+        title.lines.length * titleLineHeight +
+        afterTitleGap +
+        benefitRows * benefitRowHeight +
+        (isGroup ? afterBenefitsGap + buttonHeight : 0);
+
+    const top = isHorizontal
+        ? Math.max(
+            Math.round((height - contentHeight) / 2) - 2,
+            Math.round(height * 0.08)
+        )
+        : marginX;
+
+    const elements = [];
+
+    elements.push(
+        `<line x1="${marginX}" y1="${top + 4}" x2="${marginX + 36}" y2="${top + 4}" stroke="${accent}" stroke-width="5" stroke-linecap="round"/>`
+    );
+
+    elements.push(
+        `<text x="${marginX + 49}" y="${top + 10 + kickerSize * 0.55}" fill="${SUPPORT_INK}" font-family="DejaVu Sans, Arial, sans-serif" font-size="${kickerSize}" font-weight="700" letter-spacing="1.1">${copyEscape(kicker)}</text>`
+    );
+
+    let cursorY = top + topKickerH + titleGap + title.fontSize * 0.86;
+
+    title.lines.forEach((line, idx) => {
+        elements.push(
+            `<text x="${marginX}" y="${Math.round(cursorY + idx * titleLineHeight)}" fill="${HEADLINE_INK}" font-family="DejaVu Sans, Arial, sans-serif" font-size="${title.fontSize}" font-weight="700" letter-spacing="-1.15">${copyEscape(line)}</text>`
+        );
+    });
+
+    cursorY =
+        cursorY +
+        (title.lines.length - 1) * titleLineHeight +
+        title.fontSize * 0.35 +
+        afterTitleGap;
+
+    if (!isHorizontal && benefits.length === 2) {
+        const columnWidth = textWidth / 2;
+
+        benefits.forEach((benefit, idx) => {
+            const cellX = marginX + idx * columnWidth;
+            const allowed = columnWidth - 32;
+
+            let fs = benefitSize;
+
+            while (fs > 20 && estimatedWidth(benefit, fs) > allowed) {
+                fs -= 1;
+            }
+
+            const y = Math.round(cursorY + fs * 0.82);
+
+            elements.push(
+                `<circle cx="${cellX + 7}" cy="${y - fs * 0.33}" r="5.5" fill="${accent}"/>`
+            );
+
+            elements.push(
+                `<text x="${cellX + 25}" y="${y}" fill="${BENEFIT_INK}" font-family="DejaVu Sans, Arial, sans-serif" font-size="${fs}" font-weight="600">${copyEscape(benefit)}</text>`
+            );
+        });
+
+        cursorY += benefitRowHeight;
+    } else {
+        benefits.forEach((benefit) => {
+            const allowed = textWidth - 30;
+            let fs = benefitSize;
+
+            while (fs > 21 && estimatedWidth(benefit, fs) > allowed) {
+                fs -= 1;
+            }
+
+            const y = Math.round(cursorY + fs * 0.82);
+
+            elements.push(
+                `<circle cx="${marginX + 7}" cy="${y - fs * 0.33}" r="5.5" fill="${accent}"/>`
+            );
+
+            elements.push(
+                `<text x="${marginX + 25}" y="${y}" fill="${BENEFIT_INK}" font-family="DejaVu Sans, Arial, sans-serif" font-size="${fs}" font-weight="600">${copyEscape(benefit)}</text>`
+            );
+
+            cursorY += benefitRowHeight;
+        });
+    }
+
+    if (isGroup) {
+        const buttonX = marginX;
+        const buttonY = Math.round(cursorY + afterBenefitsGap - 5);
+
+        // Render the CTA as vector artwork instead of relying on AI-generated lettering.
+        elements.push(
+            `<rect x="${buttonX}" y="${buttonY + 4}" width="${buttonWidth}" height="${buttonHeight}" rx="17" fill="#10272F" opacity="0.14"/>`
+        );
+
+        elements.push(
+            `<rect x="${buttonX}" y="${buttonY}" width="${buttonWidth}" height="${buttonHeight}" rx="17" fill="${accent}"/>`
+        );
+
+        elements.push(
+            `<rect x="${buttonX + 1.5}" y="${buttonY + 1.5}" width="${buttonWidth - 3}" height="${buttonHeight - 3}" rx="15.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.28" stroke-width="1.5"/>`
+        );
+
+        elements.push(
+            `<text x="${buttonX + 23}" y="${buttonY + 37}" fill="#FFFFFF" font-family="DejaVu Sans, Arial, sans-serif" font-size="22" font-weight="700">Explore range</text>`
+        );
+
+        elements.push(
+            `<path d="M ${buttonX + buttonWidth - 42} ${buttonY + 23} l 7 7 -7 7 M ${buttonX + buttonWidth - 35} ${buttonY + 30} h -15" fill="none" stroke="#FFFFFF" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>`
+        );
+    }
+
+    return Buffer.from(
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><defs>${copyWash(shape)}</defs><rect width="${width}" height="${height}" fill="url(#copyWash)"/>${elements.join("")}</svg>`
+    );
 }
 
 async function generateMaster(prompt, orientation) {
@@ -515,22 +755,25 @@ async function generateMaster(prompt, orientation) {
     });
 
     const b64 = data?.data?.[0]?.b64_json;
-    if (!b64) throw new Error("OpenAI returned no image.");
+
+    if (!b64) {
+        throw new Error("OpenAI returned no image.");
+    }
 
     return Buffer.from(b64, "base64");
 }
 
-/* ───────────────────────── crop to exact ratios ───────────────────────── */
+/* ------------------------- crop to exact ratios ------------------------- */
 
 const OUT = {
-    wide: { from: "landscape", w: 1536, h: 864 },      // 16:9
-    landscape: { from: "landscape", w: 1280, h: 960 }, // 4:3
-    square: { from: "square", w: 1024, h: 1024 },      // 1:1
-    portrait: { from: "portrait", w: 960, h: 1280 },    // 3:4
+    wide: { from: "landscape", w: 1536, h: 864 },
+    landscape: { from: "landscape", w: 1280, h: 960 },
+    square: { from: "square", w: 1024, h: 1024 },
+    portrait: { from: "portrait", w: 960, h: 1280 },
 };
 
-// Only derives the requested shapes (their masters must already exist).
-async function deriveShapes(masters, shapes) {
+// Crop to the requested ratio, then add sharp vector text and CTA artwork.
+async function deriveShapes(masters, shapes, concept, ctx) {
     let sharp;
 
     try {
@@ -544,11 +787,13 @@ async function deriveShapes(masters, shapes) {
     for (const shape of shapes) {
         const o = OUT[shape];
         let buf;
+        const overlay = buildOverlaySvg(concept, ctx, shape, o.w, o.h);
 
-        for (const q of [90, 82, 74, 66]) {
+        for (const q of [90, 84, 78, 72]) {
             buf = await sharp(masters[o.from])
                 .resize(o.w, o.h, { fit: "cover", position: "centre" })
-                .webp({ quality: q })
+                .composite([{ input: overlay, blend: "over" }])
+                .webp({ quality: q, effort: 5 })
                 .toBuffer();
 
             if (buf.length <= 1.8 * 1024 * 1024) break;
@@ -560,8 +805,8 @@ async function deriveShapes(masters, shapes) {
     return files;
 }
 
-/* ───────────────────────── save results ─────────────────────────
-   Without force, only sizes that don't exist yet are written.
+/* ------------------------- save results -------------------------
+   Without force, only missing sizes are written.
    With force, the requested sizes are replaced. */
 
 async function persistGroup(job, files, label, shapes) {
@@ -661,7 +906,6 @@ async function persistGroup(job, files, label, shapes) {
         }
     }
 
-    // Remove only the files that were just replaced.
     const stale = (oldExtras || [])
         .filter((o) => others.some((n) => n.shape === o.shape))
         .map((o) => o.image_path);
@@ -735,16 +979,13 @@ async function persistEntity(job, files, label, shapes) {
     return {};
 }
 
-/* ───────────────────────── queue worker ───────────────────────── */
+/* ------------------------- queue worker ------------------------- */
 
 async function runJob(job) {
     const finish = (patch) =>
         supabaseAdmin
             .from("ai_banner_jobs")
-            .update({
-                finished_at: new Date().toISOString(),
-                ...patch,
-            })
+            .update({ finished_at: new Date().toISOString(), ...patch })
             .eq("id", job.id);
 
     try {
@@ -762,14 +1003,13 @@ async function runJob(job) {
             .update({ entity_name: ctx.name })
             .eq("id", job.id);
 
-        let shapes =
-            Array.isArray(job.shapes) && job.shapes.length
-                ? SHAPE_KEYS.filter((s) => job.shapes.includes(s))
-                : [...SHAPE_KEYS];
+        let shapes = Array.isArray(job.shapes) && job.shapes.length
+            ? SHAPE_KEYS.filter((s) => job.shapes.includes(s))
+            : [...SHAPE_KEYS];
 
         if (!shapes.length) shapes = [...SHAPE_KEYS];
 
-        // A group can't hold extra sizes without its 16:9 base image.
+        // A group needs its 16:9 base image if it doesn't have one.
         if (job.entity_type === "group" && !shapes.includes("wide")) {
             const { data: gb } = await supabaseAdmin
                 .from("group_banners")
@@ -787,14 +1027,13 @@ async function runJob(job) {
         const masters = {};
 
         for (const orientation of orientations) {
-            // Generate one at a time to be gentle on rate limits.
             masters[orientation] = await generateMaster(
                 buildImagePrompt(concept, ctx, orientation),
                 orientation
             );
         }
 
-        const files = await deriveShapes(masters, shapes);
+        const files = await deriveShapes(masters, shapes, concept, ctx);
 
         const res = job.entity_type === "group"
             ? await persistGroup(job, files, concept.label, shapes)
@@ -883,9 +1122,11 @@ export function startAiBannerWorker() {
 
             while (active < concurrency()) {
                 const job = await claimNext();
+
                 if (!job) break;
 
                 active++;
+
                 runJob(job).finally(() => {
                     active--;
                 });
