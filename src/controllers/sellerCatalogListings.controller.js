@@ -458,6 +458,15 @@ async function resolvePolicyText(kind, key) {
     return data?.full_text || null;
 }
 
+// Reuse the exact spelling of an existing brand ("bosch" -> "Bosch") so a new product never creates a second brand row.
+async function canonicalBrand(name) {
+    try {
+        const { data } = await supabaseAdmin.rpc("seller_catalog_brands_page", { p_q: name, p_limit: 3, p_offset: 0 });
+        const want = String(name).trim().replace(/\s+/g, " ").toLowerCase();
+        return (data?.brands || []).find((b) => String(b.brand_name).toLowerCase() === want) || null;
+    } catch { return null; }
+}
+
 /* ------------------------- create submission (brand-new-or-matched flow) ------------------------- */
 
 export async function createSubmission(req, res) {
@@ -469,6 +478,11 @@ export async function createSubmission(req, res) {
 
     const missing = validateListingPayload(body);
     if (missing.length) return res.status(400).json({ success: false, message: `Please provide: ${missing.join(", ")}.`, missing });
+
+    if (!body.brandNotApplicable && body.brandName?.trim()) {
+        const c = await canonicalBrand(body.brandName);
+        if (c) { body.brandName = c.brand_name; if (!body.brandImage && c.brand_image) body.brandImage = c.brand_image; }
+    }
 
     // 1) Does this exact product+brand already exist in the catalog?
     let brand;

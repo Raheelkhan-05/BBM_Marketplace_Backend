@@ -33,6 +33,7 @@ import {
     deleteTemplate,
 } from "../controllers/sellerListingTemplates.controller.js";
 import { searchBrandNames, findBrandItemMatch } from "../controllers/sellerBrands.controller.js";
+import { listPickerBrands, listPickerItems } from "../controllers/sellerCatalogPicker.controller.js";
 
 const router = Router();
 
@@ -71,5 +72,8 @@ router.delete("/templates/:id", requireAuth, requireApprovedSeller, deleteTempla
 
 router.get("/brands", searchBrandNames);
 router.get("/brand-item-match", findBrandItemMatch);
+
+router.get("/picker/brands", requireAuth, requireApprovedSeller, listPickerBrands);
+router.get("/picker/items", requireAuth, requireApprovedSeller, listPickerItems);
 
 export default router;
