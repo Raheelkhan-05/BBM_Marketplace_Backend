@@ -3,6 +3,7 @@ import { Router } from "express";
 import { requireAuth } from "../middleware/auth.middleware.js";
 import { requireSalesperson } from "../middleware/requireSalesperson.js";
 import { authWriteLimiter } from "../middleware/rateLimiter.js";
+import salesActivityLogger from "../middleware/salesActivityLogger.js";
 import { getSummary, listMyCustomers, lookupCustomer, addCustomer } from "../controllers/sales.controller.js";
 import { listSalesEnquiries, createSalesEnquiry, updateSalesEnquiry, closeSalesEnquiry } from "../controllers/salesEnquiries.controller.js";
 import { gstAddress } from "../controllers/orderBook.controller.js";
@@ -11,7 +12,8 @@ import orderBookSalesRoutes from "./orderBookSales.routes.js";
 
 
 const router = Router();
-router.use(requireAuth, requireSalesperson);
+// The logger records each successful salesperson write for the admin's Sales monitor.
+router.use(requireAuth, requireSalesperson, salesActivityLogger);
 router.get("/summary", getSummary);
 router.get("/customers", listMyCustomers);
 router.post("/customers/lookup", lookupCustomer);

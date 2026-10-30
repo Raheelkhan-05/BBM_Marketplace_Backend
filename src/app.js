@@ -43,6 +43,7 @@ import adminSellerListingsRoutes from "./routes/adminSellerListings.routes.js";
 import salesRoutes from "./routes/sales.routes.js";
 import { impersonationGuard } from "./middleware/impersonationGuard.middleware.js";
 import orderBookTeamRoutes from "./routes/orderBookTeam.routes.js";
+import salesMonitorRoutes from "./routes/salesMonitor.routes.js";
 
 export function createApp() {
   const app = express();
@@ -148,7 +149,8 @@ export function createApp() {
   app.use("/api/cart", cartRoutes);
   app.use("/api/help", helpRoutes);
   app.use("/api/transport-library", transportLibraryRoutes);
-  app.use("/api/team", teamRoutes)
+  app.use("/api/team", teamRoutes);
+  app.use("/api/sales-monitor", salesMonitorRoutes);
 
   app.use((err, req, res, next) => {
     console.error(err);
