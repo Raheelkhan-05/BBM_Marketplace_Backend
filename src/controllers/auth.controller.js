@@ -4,6 +4,7 @@ import { validateGSTIN, fetchGstinDetails } from "../services/gst.service.js";
 import { channelTokenFor } from "../services/channelToken.js";
 import { sendWelcomeEmail, sendBusinessVerifiedEmail } from "../services/mail.service.js";
 import { getTeamContext } from "../services/team.service.js";
+import { applyPendingCustomPricesForBuyer } from "../services/salesQuotePricing.service.js";
 
 // Team members never register a company of their own; the admin's company is theirs.
 async function blockTeamMember(req, res) {
@@ -238,6 +239,13 @@ export async function completeProfile(req, res) {
     }
     console.error("[complete-profile] business upsert failed:", bizErr.message);
     return res.status(500).json({ success: false, message: "Couldn't save your company details. Try again." });
+  }
+
+  // Prices a salesperson quoted / punched for this GST number before the buyer joined become their custom prices now
+  // (background, idempotent, never blocks or fails signup). Only for an Active GST registration, like the "verified" email.
+  if (g.gstin_status === "Active") {
+    void applyPendingCustomPricesForBuyer({ userId: req.user.id, gstin: gstCheck.gstin })
+      .catch((e) => console.error("[complete-profile] applying remembered custom prices failed:", e?.message || e));
   }
 
   const { data: profile } = await supabaseAdmin.from("profiles").select("email, name").eq("id", req.user.id).single();

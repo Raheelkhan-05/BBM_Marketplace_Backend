@@ -1,7 +1,9 @@
 // controllers/orderBook.controller.js
 // ORDER BOOK: a standalone CRM log. A salesperson punches an order taken for a customer; the company's team
 // (admin / members) then moves it  placed -> processed -> shipped (LR + bill, both optional) -> completed.
-// It never touches the marketplace orders, wallet, stock or pricing. Prices here are for the log only.
+// It never touches the marketplace orders, wallet or stock. Prices on the order are logged as entered, but, exactly like a
+// quotation, the catalog prices also become the customer's custom price (by GST number): set at once when the customer is
+// on BBM, and applied automatically when they join with that GST number. The salesperson can switch this off per order.
 // Catalog products are ordered in whole packs or master packs (never single units).
 // The customer must have a mobile number or an email, and the buyer address is filled from the GST number (editable).
 // Contact details typed while punching an order are saved on the customer, so they are pre-filled next time.
@@ -20,6 +22,7 @@ import { BUCKET, STATUSES, LIST_COLS, orderDto, eventDto, signDocs, broadcast } 
 import { notifyOrderProcessed, notifyOrderPlaced } from "../services/orderBookNotify.service.js";
 import { productDetails } from "../services/orderBookProduct.service.js";
 import { fillCustomerContact } from "../services/sellerCustomerContact.service.js";
+import { applyOrderCustomPrices } from "../services/salesQuotePricing.service.js";
 
 const MAX_LINES = 20;
 const NO_SELLER = "Your company's seller account isn't approved yet, so products can't be added.";
@@ -28,6 +31,7 @@ const SUB_SELECT = "*, hs_generic_product_brands!inner(id, name, brand_name, ima
 const ALLOWED_EXT = new Set(["jpg", "jpeg", "png", "webp", "gif", "heic", "pdf", "doc", "docx", "xls", "xlsx", "csv", "txt"]);
 const PINCODE_RE = /^\d{6}$/;
 const round4 = (x) => Math.round(x * 1e4) / 1e4;
+const NO_PRICING = { status: "none", buyerName: null, applied: [], removed: [], unchanged: [], skipped: [] };
 
 const fail = (res, status, message) => res.status(status).json({ success: false, message });
 const oops = (res, e) => { console.error("[order book]", e?.message || e); return fail(res, 500, "Something went wrong. Please try again."); };
@@ -144,6 +148,7 @@ export async function gstAddress(req, res) {
 //   unit      "Pack" | "Master Pack" (catalog)  or the typed unit (manual)
 //   quantity  number of packs / master packs     unitPrice  per pack / master pack (GST included)
 //   baseUnit, unitsPerSaleUnit, totalUnits, perUnitPrice  (catalog only) the same line in the listing's own unit
+// Returns { items, subsById } - subsById (the catalog listings read here) is reused for the custom-price step.
 async function buildItems(raw, sellerId) {
     if (!Array.isArray(raw) || !raw.length || raw.length > MAX_LINES) return { status: 400, error: `Add between 1 and ${MAX_LINES} products.` };
     const ids = raw.map((i) => i?.productSubmissionId).filter(Boolean);
@@ -201,7 +206,7 @@ async function buildItems(raw, sellerId) {
             details: productDetails(sub),   // snapshot: pack sizes, HSN, specs, documents
         });
     }
-    return { items };
+    return { items, subsById: byId };
 }
 
 /* ------------------------------ shared reads ------------------------------ */
@@ -266,9 +271,11 @@ export const getMine = (req, res) => detailFor(req, res, salesScope(req));
 
 // POST /api/sales/order-book
 // { customerId?, customerGstin?, customerName?, customerPhone?, customerEmail?, customerAddress?, customerCity?, customerState?, customerPincode?,
-//   poNumber?, items:[{productSubmissionId, basis:"per_pack"|"per_master_pack", quantity, unitPrice} | {productName, unit, quantity, unitPrice}], notes? }
+//   poNumber?, setCustomPrices? (default true),
+//   items:[{productSubmissionId, basis:"per_pack"|"per_master_pack", quantity, unitPrice} | {productName, unit, quantity, unitPrice}], notes? }
 // The customer needs at least a mobile number or an email, so they can be told when the order is processed.
 // customerId is the picked customer's row id (so their contact can be saved even when they have no GST number).
+// With a GST number, the catalog prices also become the customer's BBM prices (see applyOrderCustomPrices).
 export async function createOrder(req, res) {
     try {
         const s = salesScope(req);
@@ -287,6 +294,7 @@ export async function createOrder(req, res) {
 
         const customerId = isUuid(b.customerId) ? String(b.customerId) : "";
         const poNumber = str(b.poNumber, 60);
+        const setCustomPrices = b.setCustomPrices !== false;
 
         const address = str(b.customerAddress, 400), city = str(b.customerCity, 80), stateName = str(b.customerState, 60);
         const pincode = str(b.customerPincode, 10).replace(/\s/g, "");
@@ -314,6 +322,11 @@ export async function createOrder(req, res) {
         }).select("*").single();
         if (error) throw error;
 
+        // Custom prices by GST number, started right away so it runs alongside the work below. It never throws.
+        const pricingP = setCustomPrices && gstin
+            ? applyOrderCustomPrices({ sellerId: s.sellerId, ownerId: s.companyId, actorId: s.actorId, gstin, items, subsById: built.subsById })
+            : Promise.resolve(NO_PRICING);
+
         await supabase.from("order_book_events").insert({
             order_id: row.id, actor_id: s.actorId, actor_name: s.actorName, kind: "created",
             body: `Order punched by ${s.actorName}`,
@@ -329,6 +342,18 @@ export async function createOrder(req, res) {
             });
         } catch { /* best effort */ }
 
+        // Wait for the prices BEFORE greeting the customer, so the product links in their message already show them.
+        const customPricing = await pricingP;
+        if (customPricing.status === "done" && (customPricing.applied.length || customPricing.removed.length)) {
+            try {
+                await logActivity({
+                    teamId: s.teamId, actorId: s.actorId, actorRole: "member", category: "sales", action: "order_book.custom_price",
+                    label: `Set order prices for ${customPricing.buyerName || customerName} (${customPricing.applied.length} product${customPricing.applied.length === 1 ? "" : "s"})`,
+                    entityType: "order_book", entityId: row.id, meta: { link: "/grow/customers", orderId: row.id },
+                });
+            } catch { /* best effort */ }
+        }
+
         broadcast({ companyId: s.companyId, salespersonId: s.actorId, payload: { kind: "created", orderId: row.id, orderNo: row.order_no, customer: customerName, status: "placed" } });
         notifyUser(s.companyId, {
             type: "order_book_new", title: `New order ${row.order_no}`,
@@ -338,7 +363,7 @@ export async function createOrder(req, res) {
         // Greet the customer: order received + order and billing details (email / WhatsApp). After the response path, never blocks it.
         notifyOrderPlaced(row).catch((e) => console.error("[order book] order-placed notify failed:", e?.message || e));
 
-        res.json({ success: true, order: dtoOf(row), message: "Order punched." });
+        res.json({ success: true, order: dtoOf(row), customPricing, message: "Order punched." });
     } catch (e) { oops(res, e); }
 }
 
