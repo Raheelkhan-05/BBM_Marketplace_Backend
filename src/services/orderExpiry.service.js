@@ -62,7 +62,7 @@ async function runSideEffects(r) {
             type: "order_not_accepted",
             title: `Order ${r.r_order_number} expired`,
             body: "You didn't accept this order in time, so it was marked as not accepted and the buyer has been refunded.",
-            link: `/grow/orders/${r.r_order_id}`,
+            link: `/sell/orders/${r.r_order_id}`,
         });
         await notifyUserOrdersChanged(r.r_seller_user_id);
     });

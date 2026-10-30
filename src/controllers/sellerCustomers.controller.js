@@ -259,7 +259,7 @@ export async function assignCustomer(req, res) {
             teamId: ctx.teamId, actorId, actorRole: "admin", category: "sales",
             action: sid ? "sales.customer_assigned" : "sales.customer_unassigned",
             label: sid ? `Assigned ${row.business_name} to ${sp}` : `Unassigned ${row.business_name}`,
-            entityType: "customer", entityId: row.id, meta: { link: "/grow/customers" },
+            entityType: "customer", entityId: row.id, meta: { link: "/sell/customers" },
         });
         res.json({ success: true, assignment: sid ? { userId: sid, name: sp, kind: "admin" } : null });
     } catch (e) {

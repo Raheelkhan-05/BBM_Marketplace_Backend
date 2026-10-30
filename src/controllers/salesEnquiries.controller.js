@@ -111,7 +111,7 @@ export async function createSalesEnquiry(req, res) {
         try {
             await logActivity({
                 teamId, actorId, actorRole: "member", category: "sales", action: "sales.rfq_posted",
-                label: `Posted RFQ ${data.product_name}`, entityType: "rfq", entityId: data.id, meta: { link: "/grow/rfq" },
+                label: `Posted RFQ ${data.product_name}`, entityType: "rfq", entityId: data.id, meta: { link: "/sell/rfq" },
             });
         } catch { /* best effort */ }
 

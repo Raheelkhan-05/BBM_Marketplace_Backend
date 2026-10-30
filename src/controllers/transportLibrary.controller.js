@@ -68,7 +68,7 @@ async function notifySellerOfProposal(sellerId, option, { mode, originCity, dest
         type: "transport_proposal_received",
         title: "New transport route proposed",
         body: `A buyer proposed a new ${mode.replace(/_/g, " ")} option for ${originCity} → ${destCity}.`,
-        link: `/grow/transport?tab=manage&proposal=${option.id}`,
+        link: `/sell/transport?tab=manage&proposal=${option.id}`,
     });
 }
 

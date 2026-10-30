@@ -300,7 +300,7 @@ async function runEffects(r) {
         await safely("wallet notify", async () => {
             await notifyUser(r.user_id, {
                 type: "wallet_credited", title: "Credits added",
-                body: `${inr(r.amount_paise)} has been added to your wallet.`, link: "/grow/wallet",
+                body: `${inr(r.amount_paise)} has been added to your wallet.`, link: "/sell/wallet",
             });
             await notifyIfWalletJustBlocked({ sellerId: r.seller_id, sellerUserId: r.user_id });
         });
@@ -321,7 +321,7 @@ async function runEffects(r) {
         await safely("seller notify", async () => {
             await notifyUser(sellerUserId, {
                 type: "order_placed", title: `New order: ${o.order_number}`,
-                body: "Payment confirmed. Check your Sales Orders to confirm it.", link: `/grow/orders/${o.id}`,
+                body: "Payment confirmed. Check your Sales Orders to confirm it.", link: `/sell/orders/${o.id}`,
             });
             await notifyUserOrdersChanged(sellerUserId);
         });

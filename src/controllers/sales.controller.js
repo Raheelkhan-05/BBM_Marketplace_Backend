@@ -162,7 +162,7 @@ export async function addCustomer(req, res) {
         await logActivity({
             teamId, actorId, actorRole: "member", category: "sales", action: "sales.customer_added",
             label: `Added customer ${out.name}`, entityType: "customer", entityId: out.customer?.id,
-            meta: { link: "/grow/customers", gstin: out.gstin },
+            meta: { link: "/sell/customers", gstin: out.gstin },
         });
         res.json({
             success: true, result: out.result, name: out.name,

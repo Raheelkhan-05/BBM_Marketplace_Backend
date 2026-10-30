@@ -103,7 +103,7 @@ async function ensureCustomer({ sellerId, companyId, actorId, teamId, thread }) 
                 await logActivity({
                     teamId, actorId, actorRole: "member", category: "sales", action: "sales.customer_added",
                     label: `Added customer ${out.name} (from a quotation)`, entityType: "customer", entityId: out.customer?.id,
-                    meta: { link: "/grow/customers", gstin: out.gstin },
+                    meta: { link: "/sell/customers", gstin: out.gstin },
                 });
             } catch { /* best effort */ }
             return { status: "added", name: out.name || "" };
@@ -864,7 +864,7 @@ export async function sendQuote(req, res) {
                 await logActivity({
                     teamId: req.sales?.teamId, actorId, actorRole: "member", category: "sales", action: "sales.quote_custom_price",
                     label: `Set quoted prices for ${customPricing.buyerName || thread.customer_name || "a buyer"} (${customPricing.applied.length} product${customPricing.applied.length === 1 ? "" : "s"})`,
-                    entityType: "rfq", entityId: thread.id, meta: { link: "/grow/customers", quoteId: quote.id },
+                    entityType: "rfq", entityId: thread.id, meta: { link: "/sell/customers", quoteId: quote.id },
                 });
             } catch { /* best effort */ }
         }

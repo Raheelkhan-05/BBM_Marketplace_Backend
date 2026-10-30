@@ -150,7 +150,7 @@ export async function cancelMyOrder(req, res) {
                 type: "order_status_cancelled",
                 title: `Order ${row.order_number} cancelled`,
                 body: `The buyer cancelled this order. Reason: ${note}`,
-                link: `/grow/orders/${orderId}`,
+                link: `/sell/orders/${orderId}`,
             });
             await notifyUserOrdersChanged(row.notify_user_id);
         }
@@ -240,7 +240,7 @@ export async function raiseDispute(req, res) {
             type: "dispute_raised",
             title: `Dispute raised on order ${row.r_order_number}`,
             body: `The buyer reported: ${category.label}. Your payout for this order is on hold — please respond with your side.`,
-            link: `/grow/orders/${orderId}`,
+            link: `/sell/orders/${orderId}`,
         });
         await notifyUserOrdersChanged(row.r_seller_user_id);
     }

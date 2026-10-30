@@ -139,7 +139,7 @@ export async function verifyPayment(req, res) {
                 type: "order_placed",
                 title: `New order: ${order.order_number}`,
                 body: "Check your Sales Orders to confirm it.",
-                link: `/grow/orders/${orderId}`,
+                link: `/sell/orders/${orderId}`,
             });
             await notifyUserOrdersChanged(sellerUserId);
 

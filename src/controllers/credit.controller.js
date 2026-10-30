@@ -10,7 +10,7 @@ import { trackCreditEvent } from "../services/creditEvents.js";
 //   tab: "requests" (seller inbox) | "approved" | "sellers"
 // Seller-facing credit events now land on the Customers page, buyer-facing ones stay on /credit.
 // !! VERIFY: this must be the real route of GrowCustomersPage in your router.
-const CUSTOMERS_PATH = process.env.SELLER_CUSTOMERS_PATH || "/grow/customers";
+const CUSTOMERS_PATH = process.env.SELLER_CUSTOMERS_PATH || "/sell/customers";
 const sellerCreditLink = (creditId) =>
     `${CUSTOMERS_PATH}?filter=requests${creditId ? `&highlight=${creditId}` : ""}`;
 

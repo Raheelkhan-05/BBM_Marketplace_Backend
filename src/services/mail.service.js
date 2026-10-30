@@ -104,7 +104,7 @@ export async function sendBusinessVerifiedEmail(toEmail, businessName) {
        <strong>${businessName}</strong> is verified. You can list products
        and open your storefront whenever you're ready.
      </p>
-     <a href="https://bbm.business/grow/dashboard" style="display:inline-block;margin-top:6px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
+     <a href="https://bbm.business/sell/dashboard" style="display:inline-block;margin-top:6px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
        Open your shop
      </a>`
   );

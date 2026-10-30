@@ -338,7 +338,7 @@ export async function createOrder(req, res) {
             await logActivity({
                 teamId: s.teamId, actorId: s.actorId, actorRole: "member", category: "sales", action: "order_book.placed",
                 label: `Punched order ${row.order_no} for ${customerName}`, entityType: "order_book", entityId: row.id,
-                meta: { link: `/grow/order-book/${row.id}`, total },
+                meta: { link: `/sell/order-book/${row.id}`, total },
             });
         } catch { /* best effort */ }
 
@@ -349,7 +349,7 @@ export async function createOrder(req, res) {
                 await logActivity({
                     teamId: s.teamId, actorId: s.actorId, actorRole: "member", category: "sales", action: "order_book.custom_price",
                     label: `Set order prices for ${customPricing.buyerName || customerName} (${customPricing.applied.length} product${customPricing.applied.length === 1 ? "" : "s"})`,
-                    entityType: "order_book", entityId: row.id, meta: { link: "/grow/customers", orderId: row.id },
+                    entityType: "order_book", entityId: row.id, meta: { link: "/sell/customers", orderId: row.id },
                 });
             } catch { /* best effort */ }
         }
@@ -357,7 +357,7 @@ export async function createOrder(req, res) {
         broadcast({ companyId: s.companyId, salespersonId: s.actorId, payload: { kind: "created", orderId: row.id, orderNo: row.order_no, customer: customerName, status: "placed" } });
         notifyUser(s.companyId, {
             type: "order_book_new", title: `New order ${row.order_no}`,
-            body: `${s.actorName} punched an order for ${customerName}.`, link: `/grow/order-book/${row.id}`,
+            body: `${s.actorName} punched an order for ${customerName}.`, link: `/sell/order-book/${row.id}`,
         }).catch(() => { /* best effort */ });
 
         // Greet the customer: order received + order and billing details (email / WhatsApp). After the response path, never blocks it.
@@ -407,7 +407,7 @@ async function move(req, res, row, to, { patch = {}, eventBody }) {
     try {
         await logActivity({
             teamId: t.teamId, actorId: t.actorId, actorRole: req.obTeam?.role || "member", category: "sales", action: `order_book.${to}`,
-            label: `${VERB[to]} order ${row.order_no}`, entityType: "order_book", entityId: row.id, meta: { link: `/grow/order-book/${row.id}` },
+            label: `${VERB[to]} order ${row.order_no}`, entityType: "order_book", entityId: row.id, meta: { link: `/sell/order-book/${row.id}` },
         });
     } catch { /* best effort */ }
 

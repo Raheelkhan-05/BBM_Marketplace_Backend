@@ -49,7 +49,7 @@ const STATIC_DEFAULTS = {
     "/": ["BBM – Wholesale Marketplace for Verified Sellers", "Compare wholesale prices, MOQs and delivery from verified sellers across India. Buy or sell on BBM."],
     "/brands": ["Brands on BBM – Shop wholesale products by brand", "Browse industrial and wholesale brands on BBM. Compare verified sellers, MOQs and delivery times for every brand."],
     "/sellers": ["Sellers on BBM – Verified wholesale suppliers", "Find verified wholesale sellers and suppliers on BBM. See their products, MOQs and delivery locations."],
-    "/grow/details": ["Sell on BBM – Grow Your Wholesale Business", "List your products, receive enquiries and sell to buyers across India on BBM."],
+    "/sell/details": ["Sell on BBM – Grow Your Wholesale Business", "List your products, receive enquiries and sell to buyers across India on BBM."],
     "/save": ["Save on Wholesale Purchases | BBM", "Source products at better prices from verified sellers on BBM."],
 };
 
@@ -267,7 +267,7 @@ async function buildPaths() {
             : Promise.resolve([]),
     ]);
 
-    const groups = { static: ["/", "/brands", "/sellers", "/grow/details", "/save"], brands: [], sellers: [], products: [] };
+    const groups = { static: ["/", "/brands", "/sellers", "/sell/details", "/save"], brands: [], sellers: [], products: [] };
 
     const seenBrands = new Set();
     for (const b of brands) {
