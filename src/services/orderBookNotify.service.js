@@ -158,7 +158,7 @@ async function loadShop(sellerId) {
         const slug = firstOf(data, SLUG_KEYS);
 
         const url = slug
-            ? `${SITE_URL}/sellers/${encodeURIComponent(slug)}`
+            ? `${SITE_URL}/seller/${encodeURIComponent(slug)}`
             : "";
 
         return {
