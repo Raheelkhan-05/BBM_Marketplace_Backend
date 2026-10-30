@@ -338,7 +338,7 @@ export async function sellerRespondToDispute(req, res) {
     await notifyOrderChanged(orderId, { status: "delivered", dispute: "responded" });
     await notifyUser(order.buyer_id, {
         type: "dispute_seller_responded", title: `Seller responded on order ${order.order_number}`,
-        body: "The seller has shared their side. Our team will review both and decide.", link: `/save/orders/${orderId}`,
+        body: "The seller has shared their side. Our team will review both and decide.", link: `/buy/orders/${orderId}`,
     });
     await notifyUserOrdersChanged(order.buyer_id);
     await notifyAdmins({

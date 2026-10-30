@@ -148,7 +148,7 @@ export async function adminStartReview(req, res) {
 
     const sUser = await sellerUserId(dispute.seller_id);
     await notifyOrderChanged(dispute.order_id, { status: "delivered", dispute: "under_review" });
-    await notifyUser(dispute.buyer_id, { type: "dispute_under_review", title: "Your dispute is under review", body: "Our team is looking into it and will share the decision here.", link: `/save/orders/${dispute.order_id}` });
+    await notifyUser(dispute.buyer_id, { type: "dispute_under_review", title: "Your dispute is under review", body: "Our team is looking into it and will share the decision here.", link: `/buy/orders/${dispute.order_id}` });
     if (sUser) await notifyUser(sUser, { type: "dispute_under_review", title: "A dispute on your order is under review", body: "Please make sure you've shared your response and any proof.", link: `/sell/orders/${dispute.order_id}` });
     await notifyUserOrdersChanged(dispute.buyer_id);
     if (sUser) await notifyUserOrdersChanged(sUser);
@@ -173,7 +173,7 @@ export async function adminPostMessage(req, res) {
 
     const sUser = await sellerUserId(dispute.seller_id);
     await notifyOrderChanged(dispute.order_id, { status: "delivered", dispute: "message" });
-    await notifyUser(dispute.buyer_id, { type: "dispute_message", title: "Message from our team on your dispute", body: message.slice(0, 140), link: `/save/orders/${dispute.order_id}` });
+    await notifyUser(dispute.buyer_id, { type: "dispute_message", title: "Message from our team on your dispute", body: message.slice(0, 140), link: `/buy/orders/${dispute.order_id}` });
     if (sUser) await notifyUser(sUser, { type: "dispute_message", title: "Message from our team on a dispute", body: message.slice(0, 140), link: `/sell/orders/${dispute.order_id}` });
     res.json({ success: true });
 }
@@ -227,7 +227,7 @@ export async function adminResolveDispute(req, res) {
 
     if (r) {
         await notifyOrderChanged(r.r_order_id, { status: "delivered", dispute: "resolved" });
-        await notifyUser(r.r_buyer_id, { type: "dispute_resolved", title: `Dispute resolved — order ${r.r_order_number}`, body: buyerBody, link: `/save/orders/${r.r_order_id}` });
+        await notifyUser(r.r_buyer_id, { type: "dispute_resolved", title: `Dispute resolved — order ${r.r_order_number}`, body: buyerBody, link: `/buy/orders/${r.r_order_id}` });
         await notifyUserOrdersChanged(r.r_buyer_id);
         if (r.r_seller_user_id) {
             await notifyUser(r.r_seller_user_id, { type: "dispute_resolved", title: `Dispute resolved — order ${r.r_order_number}`, body: sellerBody, link: `/sell/orders/${r.r_order_id}` });

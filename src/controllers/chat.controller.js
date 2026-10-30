@@ -330,7 +330,7 @@ async function postSendTasks({ userId, conversationId, message }) {
         const title = senderShop?.display_name || businessName(senderBusiness) || senderProfile?.name || "New message";
         const { data: inserted } = await supabase
             .from("notifications")
-            .insert(toNotify.map((r) => ({ user_id: r.user_id, type: "message", title, body: preview, link: `/save/chat/${conversationId}`, read: false })))
+            .insert(toNotify.map((r) => ({ user_id: r.user_id, type: "message", title, body: preview, link: `/buy/chat/${conversationId}`, read: false })))
             .select("id, user_id, title, body, link, created_at");
         const io = getIO();
         (inserted || []).forEach((n) => io.to(`user:${n.user_id}`).emit("notification:new", n));

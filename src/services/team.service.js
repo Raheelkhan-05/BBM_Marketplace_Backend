@@ -284,7 +284,7 @@ export async function announceSellerLive(ctx) {
             type: "team_seller_enabled",
             title: "Your team can now sell",
             body: `${name} is now set up as a seller. Everyone on the team can list products, answer enquiries and manage orders.`,
-            link: "/grow",
+            link: "/sell",
         }).catch(() => { });
     }
     await logActivity({
@@ -376,7 +376,7 @@ const RULES = [
     [/^POST \/api\/seller\/orders\/:id\/dispute\/respond$/, "orders", "Responded to a dispute"],
     [/^(POST|PATCH|PUT) \/api\/seller\/orders\/:id\//, "orders", "Updated a sales order"],
     [/^POST \/api\/seller\/onboarding\/submit$/, "shop", "Submitted seller onboarding"],
-    [/^POST \/api\/seller\/onboarding\/save$/, "shop", "Saved seller onboarding details"],
+    [/^POST \/api\/seller\/onboarding\/buy$/, "shop", "Saved seller onboarding details"],
     [/^POST \/api\/seller\/bank-details$/, "shop", "Updated bank details"],
     [/^PATCH \/api\/seller\/profile$/, "shop", "Updated shop details"],
     [/^PATCH \/api\/seller\/theme$/, "shop", "Changed the shop theme"],
@@ -481,7 +481,7 @@ async function enrichChat(d, req, ctx) {
             conversationId: String(d.entityId),
             counterpart: info?.otherName || null,
             preview: text ? text.trim().replace(/\s+/g, " ").slice(0, 120) : null,
-            link: info ? `${info.asSeller ? "/grow" : "/save"}/chat/${d.entityId}` : null,
+            link: info ? `${info.asSeller ? "/sell" : "/buy"}/chat/${d.entityId}` : null,
         },
     };
 }
@@ -648,7 +648,7 @@ export async function enrichStoredRows(rows, companyId) {
             return {
                 ...r,
                 label: info.otherName ? `Messaged ${info.otherName}` : r.label,
-                meta: { ...r.meta, conversationId: String(r.entity_id), counterpart: info.otherName || null, link: `${info.asSeller ? "/grow" : "/save"}/chat/${r.entity_id}` },
+                meta: { ...r.meta, conversationId: String(r.entity_id), counterpart: info.otherName || null, link: `${info.asSeller ? "/sell" : "/buy"}/chat/${r.entity_id}` },
             };
         }
         if (r.category === "orders") {

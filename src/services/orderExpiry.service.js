@@ -51,7 +51,7 @@ async function runSideEffects(r) {
             body: refund > 0
                 ? `The seller didn't accept your order in time, so it was cancelled. A full refund of ${inr(refund)} has been initiated (ref ${r.r_reference}).`
                 : "The seller didn't accept your order in time, so it was cancelled. You haven't been charged.",
-            link: `/save/orders/${r.r_order_id}`,
+            link: `/buy/orders/${r.r_order_id}`,
         });
         await notifyUserOrdersChanged(r.r_buyer_id);
     });

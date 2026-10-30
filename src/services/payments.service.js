@@ -341,7 +341,7 @@ async function runEffects(r) {
         await notifyUser(r.user_id, {
             type: "payment_success", title: "Payment received",
             body: `We received your payment of ${inr(r.amount_paise)}. The seller has been notified.`,
-            link: ids.length === 1 ? `/save/orders/${ids[0]}` : "/save/orders",
+            link: ids.length === 1 ? `/buy/orders/${ids[0]}` : "/buy/orders",
         });
         await notifyUserOrdersChanged(r.user_id);
     });

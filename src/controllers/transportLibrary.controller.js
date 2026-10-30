@@ -275,7 +275,7 @@ export async function approveProposal(req, res) {
             type: "transport_proposal_approved",
             title: "Transport option approved",
             body: `The seller approved your proposed transport option for ${row.origin_city} → ${row.dest_city}. You can now select it when ordering.`,
-            link: `/save/orders`,
+            link: `/buy/orders`,
             routeOptionId: row.id,
         });
     }
@@ -324,7 +324,7 @@ export async function rejectProposal(req, res) {
             type: "transport_proposal_rejected",
             title: "Transport option declined",
             body: reason?.trim() || `The seller couldn't accept the proposed transport option for ${row.origin_city} → ${row.dest_city}.`,
-            link: `/save/orders`,
+            link: `/buy/orders`,
             routeOptionId: row.id, // NEW
             reason: reason?.trim() || null,
         });

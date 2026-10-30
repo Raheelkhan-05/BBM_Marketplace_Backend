@@ -15,7 +15,7 @@ const sellerCreditLink = (creditId) =>
     `${CUSTOMERS_PATH}?filter=requests${creditId ? `&highlight=${creditId}` : ""}`;
 
 const creditLink = (tab, creditId) =>
-    creditId ? `/save/credit?tab=${tab}&highlight=${creditId}` : `/save/credit?tab=${tab}`;
+    creditId ? `/buy/credit?tab=${tab}&highlight=${creditId}` : `/buy/credit?tab=${tab}`;
 
 // ---- helpers ------------------------------------------------------------
 

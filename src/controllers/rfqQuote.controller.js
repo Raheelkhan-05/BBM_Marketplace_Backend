@@ -316,7 +316,7 @@ export async function submitQuote(req, res) {
                     type: "rfq_quote",
                     title: "New quote on your price list",
                     body: `${sp?.display_name || "A supplier"} sent a quote for ${enquiry.product_name}.`,
-                    link: "/save/rfq",
+                    link: "/buy/rfq",
                 });
             } catch { /* best effort */ }
         }

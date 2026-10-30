@@ -34,7 +34,7 @@ export function pageType(slug) {
 }
 
 // Mirrors public/robots.txt: only these are meant to be indexed.
-const PUBLIC_PATTERNS = [/^\/$/, /^\/brands(\/[^/]+)?$/, /^\/sellers(\/[^/]+)?$/, /^\/grow\/details$/, /^\/save$/];
+const PUBLIC_PATTERNS = [/^\/$/, /^\/brands(\/[^/]+)?$/, /^\/sellers(\/[^/]+)?$/, /^\/sell\/details$/, /^\/buy$/];
 export const isPublicPage = (slug) => PUBLIC_PATTERNS.some((r) => r.test(slug));
 
 /* ───────────── defaults, built from real data ───────────── */
@@ -50,7 +50,7 @@ const STATIC_DEFAULTS = {
     "/brands": ["Brands on BBM – Shop wholesale products by brand", "Browse industrial and wholesale brands on BBM. Compare verified sellers, MOQs and delivery times for every brand."],
     "/sellers": ["Sellers on BBM – Verified wholesale suppliers", "Find verified wholesale sellers and suppliers on BBM. See their products, MOQs and delivery locations."],
     "/sell/details": ["Sell on BBM – Grow Your Wholesale Business", "List your products, receive enquiries and sell to buyers across India on BBM."],
-    "/save": ["Save on Wholesale Purchases | BBM", "Source products at better prices from verified sellers on BBM."],
+    "/buy": ["Save on Wholesale Purchases | BBM", "Source products at better prices from verified sellers on BBM."],
 };
 
 async function lookupBrand(name) {
@@ -267,7 +267,7 @@ async function buildPaths() {
             : Promise.resolve([]),
     ]);
 
-    const groups = { static: ["/", "/brands", "/sellers", "/sell/details", "/save"], brands: [], sellers: [], products: [] };
+    const groups = { static: ["/", "/brands", "/sellers", "/sell/details", "/buy"], brands: [], sellers: [], products: [] };
 
     const seenBrands = new Set();
     for (const b of brands) {
