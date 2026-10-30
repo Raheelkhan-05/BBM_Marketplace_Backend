@@ -26,6 +26,10 @@ import {
     sendOrderPlacedWhatsApp,
 } from "./whatsapp.service.js";
 
+import {
+    sendSalespersonCopy, loadSalesperson, creatorIdOf,
+} from "./salespersonCopy.service.js";
+
 // -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
@@ -56,6 +60,24 @@ const NAME_KEYS = [
 // -----------------------------------------------------------------------------
 // General helpers
 // -----------------------------------------------------------------------------
+
+// Runs one channel, never throws, reports whether it was delivered.
+const track = async (channel, promise) => {
+    try {
+        const r = await promise;
+        return { channel, ok: r?.success !== false };
+    } catch (error) {
+        console.error(`[order book] ${channel} notification failed:`, error?.message || error);
+        return { channel, ok: false };
+    }
+};
+
+// Salesperson(s) who should get the copy: the creator, plus whoever acted if different.
+async function copyRecipients(row, actorId) {
+    const ids = [...new Set([creatorIdOf(row), actorId].filter(Boolean))];
+    const people = await Promise.all(ids.map(loadSalesperson));
+    return people.filter(Boolean);
+}
 
 const firstOf = (obj, keys) => {
     for (const key of keys) {
@@ -479,61 +501,49 @@ export async function notifyOrderPlaced(row) {
 
         const jobs = [];
 
-        // Email notification.
         if (email) {
-            jobs.push(
-                Promise.resolve().then(() =>
-                    sendOrderPlacedEmail({
-                        to: email,
-                        customerName: row.customer_name,
-                        companyName,
-                        orderNo: row.order_no,
-                        placedOn,
-                        items,
-                        billing,
-                        totals,
-                        notes: row.notes,
-                        shopUrl: shop.url,
-                    })
-                )
-            );
+            jobs.push(track("Email", sendOrderPlacedEmail({
+                to: email, customerName: row.customer_name, companyName,
+                orderNo: row.order_no, placedOn, items, billing, totals,
+                notes: row.notes, shopUrl: shop.url,
+            })));
         }
-
-        // WhatsApp notification.
         if (phone) {
-            jobs.push(
-                Promise.resolve().then(() =>
-                    sendOrderPlacedWhatsApp({
-                        to: phone,
-                        customerName: row.customer_name,
-                        companyName,
-                        orderNo: row.order_no,
-                        placedOn,
-                        items,
-                        billing,
-                        totals,
-                        notes: row.notes,
-                    })
-                )
-            );
+            jobs.push(track("WhatsApp", sendOrderPlacedWhatsApp({
+                to: phone, customerName: row.customer_name, companyName,
+                orderNo: row.order_no, placedOn, items, billing, totals,
+                notes: row.notes,
+            })));
         }
 
-        // A failed notification must not stop the other notification.
-        const results = await Promise.allSettled(jobs);
+        const delivery = await Promise.all(jobs);
 
-        results.forEach((result) => {
-            if (result.status === "rejected") {
-                console.error(
-                    "[order book] Order-placed notification failed:",
-                    result.reason?.message ||
-                    result.reason
-                );
-            } else if (result.value?.success === false) {
-                console.error(
-                    "[order book] Order-placed notification was not delivered"
-                );
-            }
-        });
+        // Salesperson's own copy (best-effort, after the customer's messages).
+        for (const salesperson of await copyRecipients(row)) {
+            await sendSalespersonCopy({
+                salesperson,
+                title: "Order recorded",
+                customerName: row.customer_name,
+                customerPhone: phone,
+                customerEmail: email,
+                facts: [
+                    ["Order No", row.order_no],
+                    ["Order Date", placedOn],
+                    ["Seller", companyName],
+                    ["Notes", row.notes],
+                ],
+                items: items.map((i) => ({
+                    name: `${i.productName}${i.brandName ? ` (${i.brandName})` : ""}`,
+                    detail: i.qtyText,
+                    amount: inr(i.lineTotal),
+                })),
+                total: inr(total),
+                delivery,
+                note: delivery.some((d) => !d.ok)
+                    ? "One channel failed. Please share the order details with the customer directly."
+                    : "When the order is ready, mark it as processed so the customer is updated.",
+            });
+        }
     } catch (error) {
         console.error(
             "[order book] notifyOrderPlaced failed:",
@@ -552,7 +562,7 @@ export async function notifyOrderPlaced(row) {
  * row must be the order_book_orders row loaded before
  * changing the order status.
  */
-export async function notifyOrderProcessed(row) {
+export async function notifyOrderProcessed(row, { actorId, processedBy } = {}) {
     try {
         if (!row) {
             console.warn(
@@ -613,57 +623,47 @@ export async function notifyOrderProcessed(row) {
         const jobs = [];
 
         if (email) {
-            jobs.push(
-                Promise.resolve().then(() =>
-                    sendOrderProcessedEmail({
-                        to: email,
-                        customerName: row.customer_name,
-                        companyName,
-                        orderNo: row.order_no,
-                        placedOn,
-                        items: emailItems,
-                        total,
-                        notes: row.notes,
-                        shopUrl: shop.url,
-                    })
-                )
-            );
+            jobs.push(track("Email", sendOrderProcessedEmail({
+                to: email, customerName: row.customer_name, companyName,
+                orderNo: row.order_no, placedOn, items: emailItems, total,
+                notes: row.notes, shopUrl: shop.url,
+            })));
         }
-
         if (phone) {
-            jobs.push(
-                Promise.resolve().then(() =>
-                    sendOrderProcessedWhatsApp({
-                        to: phone,
-                        customerName: row.customer_name,
-                        companyName,
-                        orderNo: row.order_no,
-                        placedOn,
-                        items: whatsappItems,
-                        total,
-                        notes: row.notes,
-                        shopUrl:
-                            shop.url || SITE_URL,
-                    })
-                )
-            );
+            jobs.push(track("WhatsApp", sendOrderProcessedWhatsApp({
+                to: phone, customerName: row.customer_name, companyName,
+                orderNo: row.order_no, placedOn, items: whatsappItems, total,
+                notes: row.notes, shopUrl: shop.url || SITE_URL,
+            })));
         }
 
-        const results = await Promise.allSettled(jobs);
+        const delivery = await Promise.all(jobs);
 
-        results.forEach((result) => {
-            if (result.status === "rejected") {
-                console.error(
-                    "[order book] Order-processed notification failed:",
-                    result.reason?.message ||
-                    result.reason
-                );
-            } else if (result.value?.success === false) {
-                console.error(
-                    "[order book] Order-processed notification was not delivered"
-                );
-            }
-        });
+        for (const salesperson of await copyRecipients(row, actorId)) {
+            await sendSalespersonCopy({
+                salesperson,
+                title: "Order marked as processed",
+                customerName: row.customer_name,
+                customerPhone: phone,
+                customerEmail: email,
+                facts: [
+                    ["Order No", row.order_no],
+                    ["Order Date", placedOn],
+                    ["Status", "Processing"],
+                    ["Processed by", processedBy],
+                ],
+                items: whatsappItems.map((i) => ({
+                    name: `${i.productName}${i.brandName ? ` (${i.brandName})` : ""}`,
+                    detail: i.qtyText,
+                    amount: inr(i.lineTotal),
+                })),
+                total: inr(total),
+                delivery,
+                note: delivery.some((d) => !d.ok)
+                    ? "One channel failed. Please confirm the order with the customer directly."
+                    : "The customer has been told the order is being processed.",
+            });
+        }
     } catch (error) {
         console.error(
             "[order book] notifyOrderProcessed failed:",

@@ -712,3 +712,64 @@ export async function sendOrderProcessedWhatsApp({
         message,
     });
 }
+
+// -----------------------------------------------------------------------------
+// Salesperson copy
+// -----------------------------------------------------------------------------
+
+/**
+ * A record for the salesperson of what was just sent to a customer.
+ * Deliberately different from the customer message: no greeting to the
+ * customer, no beta note, adds delivery status and a next step.
+ */
+export async function sendSalespersonCopyWhatsApp({
+    to,
+    salespersonName,
+    title,
+    customerName,
+    customerContact,
+    facts = [],
+    items = [],
+    total,
+    delivery = [],
+    note,
+}) {
+    const MAX = 12;
+
+    const lines = items.slice(0, MAX).map((it, i) =>
+        join([
+            `${i + 1}. ${clean(it.name)}`,
+            it.detail ? `    ${clean(it.detail)}` : null,
+            it.amount ? `    ${clean(it.amount)}` : null,
+        ])
+    );
+    if (items.length > MAX) lines.push(`...and ${items.length - MAX} more items.`);
+
+    const deliveryLine = delivery
+        .map((d) => `${d.channel}: ${d.ok ? "delivered" : "failed"}`)
+        .join("  |  ");
+
+    const message = join([
+        bold(`YOUR COPY: ${title}`),
+        "",
+        `Hi ${clean(salespersonName) || "there"},`,
+        "",
+        `Here's a record of what was just sent to ${bold(customerName || "your customer")}. Only you receive this copy.`,
+        "",
+        field("Customer contact", customerContact),
+        field("Delivery", deliveryLine),
+        ...facts.map(([label, value]) => field(label, value)),
+        lines.length ? "" : null,
+        lines.length ? RULE : null,
+        lines.length ? bold("SENT TO CUSTOMER") : null,
+        lines.length ? lines.join("\n\n") : null,
+        lines.length ? RULE : null,
+        total != null ? `${bold("Total (incl. GST)")}: ${bold(money(total))}` : null,
+        clean(note) ? "" : null,
+        clean(note) ? `${bold("Next step")}: ${clean(note)}` : null,
+        "",
+        sign(),
+    ]);
+
+    return sendWhatsAppText({ to, message });
+}

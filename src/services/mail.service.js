@@ -353,3 +353,55 @@ export async function sendOrderProcessedEmail({ to, customerName, companyName, o
   });
   return throwIfResendError(result);
 }
+
+// Salesperson's own copy of a customer notification (a record, not a replay).
+export async function sendSalespersonCopyEmail({
+  to, salespersonName, title, customerName, customerContact,
+  facts = [], items = [], total, delivery = [], note,
+}) {
+  if (!to) return;
+  const factRows = facts.filter(([, v]) => v).map(([l, v]) =>
+    `<tr><td style="padding:3px 0;color:#64748b;width:38%;vertical-align:top;">${esc(l)}</td><td style="padding:3px 0;color:#0f172a;">${esc(v)}</td></tr>`).join("");
+
+  const deliveryRows = delivery.map((d) =>
+    `<tr><td style="padding:3px 0;color:#64748b;">${esc(d.channel)}</td>
+         <td align="right" style="padding:3px 0;font-weight:700;color:${d.ok ? "#15803d" : "#b91c1c"};">${d.ok ? "Delivered" : "Failed"}</td></tr>`).join("");
+
+  const itemRows = items.map((i) => `
+    <tr>
+      <td style="padding:6px 0;border-top:1px solid #eef1f2;font-size:13px;color:#0f172a;">
+        ${esc(i.name)}${i.detail ? `<div style="font-size:12px;color:#64748b;">${esc(i.detail)}</div>` : ""}
+      </td>
+      <td align="right" style="padding:6px 0;border-top:1px solid #eef1f2;font-size:13px;color:#0f172a;white-space:nowrap;vertical-align:top;">${esc(i.amount || "")}</td>
+    </tr>`).join("");
+
+  const html = shell(
+    `Your copy: ${esc(title)}`,
+    `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
+       Hi ${esc(salespersonName || "there")}, this is a record of what was just sent to
+       <strong>${esc(customerName || "your customer")}</strong>. Only you receive this copy.
+     </p>
+     <table role="presentation" width="100%" style="font-size:13px;margin-bottom:12px;">
+       ${customerContact ? `<tr><td style="padding:3px 0;color:#64748b;width:38%;">Customer contact</td><td style="padding:3px 0;color:#0f172a;">${esc(customerContact)}</td></tr>` : ""}
+       ${factRows}
+     </table>
+     ${deliveryRows ? `<p style="margin:0 0 4px;font-size:13px;font-weight:700;color:#0f172a;">Delivery status</p>
+     <table role="presentation" width="100%" style="font-size:13px;margin-bottom:14px;">${deliveryRows}</table>` : ""}
+     ${itemRows ? `<p style="margin:0 0 4px;font-size:13px;font-weight:700;color:#0f172a;">What the customer received</p>
+     <table role="presentation" width="100%" style="margin-bottom:6px;">${itemRows}</table>` : ""}
+     ${total != null ? `<table role="presentation" width="100%" style="border-top:1px solid #e5eaee;">
+       <tr><td style="padding:8px 0 0;font-size:15px;font-weight:800;color:#0f172a;">Total (incl. GST)</td>
+           <td align="right" style="padding:8px 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(total)}</td></tr></table>` : ""}
+     ${note ? `<p style="margin:14px 0 0;padding:10px 12px;background:#f4f7f8;border-radius:10px;font-size:12.5px;line-height:1.6;color:#334155;"><strong>Next step:</strong> ${esc(note)}</p>` : ""}`,
+    "You're receiving this because you sent a message to a customer from BBM Marketplace. This copy was sent only to you.",
+    { beta: false }
+  );
+  const clean = (v) => String(v || "").replace(/[\r\n]+/g, " ");
+  const result = await resend.emails.send({
+    from: FROM,
+    to,
+    subject: `Your copy: ${clean(title)} - ${clean(customerName || "customer")}`,
+    html,
+  });
+  return throwIfResendError(result);
+}

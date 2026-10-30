@@ -428,7 +428,12 @@ export async function processOrder(req, res) {
         const ok = await move(req, res, row, "processed", { eventBody: "Order marked as processed" });
         // Thank the customer by email / WhatsApp. Runs after the response, so it never slows or breaks the step.
         // The guarded UPDATE in move() means this fires once per order.
-        if (ok) notifyOrderProcessed(row).catch((e) => console.error("[order book] customer notify failed:", e?.message || e));
+        // controllers/orderBook.controller.js, processOrder
+        if (ok) {
+            const t = teamScope(req);
+            notifyOrderProcessed(row, { actorId: null, processedBy: t.actorName })
+                .catch((e) => console.error("[order book] customer notify failed:", e?.message || e));
+        }
     } catch (e) { oops(res, e); }
 }
 

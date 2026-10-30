@@ -17,6 +17,7 @@ import { isUuid, RFQ_UNITS } from "../services/rfqValidation.js";
 import { sameUnit } from "../services/rfqQuotes.service.js";
 import { sendSalesQuotationWhatsApp } from "../services/whatsapp.service.js";
 import { sendSalesQuotationEmail } from "../services/mail.service.js";
+import { sendSalespersonCopy, loadSalesperson } from "../services/salespersonCopy.service.js";
 import { logActivity } from "../services/team.service.js";
 import { pingCustomersChanged } from "../services/salesSync.service.js";
 import { cached, getVer, bumpVer, hashKey } from "../services/cache.service.js";
@@ -681,7 +682,9 @@ export async function listQuoteProducts(req, res) {
 }
 
 // ---- delivery ------------------------------------------------------------------------------------------
-async function deliver({ quote, thread, sellerName, actorName, actorEmail, channels }) {
+// Sends the quotation to the customer on the chosen channels, then (fire-and-forget) sends the salesperson their own
+// "your copy" record with the delivery result per channel. `resend` only changes the wording of that copy.
+async function deliver({ quote, thread, sellerName, actorId, actorName, actorEmail, channels, resend = false }) {
     const items = quote.items;
     const out = {};
     const run = async (channel, fn) => {
@@ -712,6 +715,44 @@ async function deliver({ quote, thread, sellerName, actorName, actorEmail, chann
         return { status: "sent", at: new Date().toISOString() };
     }));
     await Promise.all(tasks);
+
+    // Salesperson's copy: fire-and-forget so it never delays the response or breaks the quotation.
+    // It is queued after the customer's message, so the customer's WhatsApp always goes first.
+    void (async () => {
+        const me = await loadSalesperson(actorId);
+        const salesperson = me
+            ? { ...me, email: me.email || actorEmail }
+            : (actorEmail ? { name: actorName, email: actorEmail } : null);
+        await sendSalespersonCopy({
+            salesperson,
+            title: resend ? "Quotation resent" : "Quotation sent",
+            customerName: thread.customer_name,
+            // Only list the contact channels actually used for this send.
+            customerPhone: channels.includes("whatsapp") ? thread.customer_phone : "",
+            customerEmail: channels.includes("email") ? thread.customer_email : "",
+            facts: [
+                ["Enquiry", thread.product_name],
+                ["Valid until", validText(quote.valid_until)],
+                ["Your note", quote.note],
+            ],
+            items: items.map((i) => ({
+                name: `${i.productName}${i.brandName ? ` (${i.brandName})` : ""}`,
+                detail: `${i.quantity} ${i.unit} × ${inr(i.unitPriceIncl)}`,
+                amount: inr(i.totalIncl),
+            })),
+            total: inr(quote.total),
+            delivery: Object.entries(out).map(([ch, d]) => ({
+                channel: ch === "whatsapp" ? "WhatsApp" : "Email",
+                ok: d.status === "sent",
+            })),
+            note: Object.values(out).some((d) => d.status !== "sent")
+                ? "Some channels failed. Retry them from the enquiry thread."
+                : channels.includes("email")
+                    ? "Customer email replies come straight to you. Set a follow-up reminder on this enquiry."
+                    : "Set a follow-up reminder on this enquiry so the quote doesn't go cold.",
+        });
+    })().catch((e) => console.error("[sales threads] salesperson copy failed:", e?.message || e));
+
     return out;
 }
 
@@ -834,7 +875,7 @@ export async function sendQuote(req, res) {
         }).select("*").single();
         if (eErr) throw eErr;
 
-        const delivery = await deliver({ quote, thread, sellerName: await sellerNameOf(sellerId), actorName, actorEmail, channels });
+        const delivery = await deliver({ quote, thread, sellerName: await sellerNameOf(sellerId), actorId, actorName, actorEmail, channels });
         const { data: done } = await supabase.from("sales_quotes").update({ delivery }).eq("id", quote.id).select("*").single();
         await touch(thread.id, `Quotation sent · ${inr(quote.total)}`);
         await notify(ownerId, actorId, thread.id);
@@ -866,7 +907,7 @@ export async function resendQuote(req, res) {
         const contactErr = contactCheck(thread, channels);
         if (contactErr) return fail(res, 400, contactErr);
 
-        const sent = await deliver({ quote, thread, sellerName: await sellerNameOf(sellerId), actorName, actorEmail, channels });
+        const sent = await deliver({ quote, thread, sellerName: await sellerNameOf(sellerId), actorId, actorName, actorEmail, channels, resend: true });
         const delivery = { ...(quote.delivery || {}), ...sent };
         const merged = [...new Set([...(quote.channels || []), ...channels])];
         const { data: upd, error: uErr } = await supabase.from("sales_quotes").update({ delivery, channels: merged }).eq("id", quote.id).select("*").single();
