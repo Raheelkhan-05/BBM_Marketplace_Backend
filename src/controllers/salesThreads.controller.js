@@ -28,7 +28,7 @@ import {
     threadDto, entryDto, quoteDto, hydrateEntries, inr, fmtDate, whatsappItemsLine,
 } from "../services/salesThreads.service.js";
 import {
-    findBuyerCompanyByGstin, fetchBuyerOverrides, customUnitPriceOf, syncQuoteCustomPrices,
+    findBuyerCompanyByGstin, fetchBuyerOverrides, customUnitPriceOf, syncQuoteCustomPrices, lookupBuyerCompany,
 } from "../services/salesQuotePricing.service.js";
 
 const ENTRY_PAGE = 20;          // default entries per page (newest first)
@@ -203,6 +203,8 @@ export async function listThreads(req, res) {
 }
 
 // ---- products (shared shape for the quote picker and the new-enquiry picker) ----------------------------
+// listSalePrice = the listing's marketplace price per SALE unit (unit / pack / master pack), GST included. It is what
+// custom prices are resolved against; listUnitPriceIncl is the same price per base unit (Kg, Pcs ...).
 function productItem(s, { unit, last, overrides, taggedId } = {}) {
     const pack = Number(s.pack_size) > 0 ? Number(s.pack_size) : 1;
     const master = Number(s.units_per_master_pack) > 0 ? Number(s.units_per_master_pack) : 1;
@@ -216,6 +218,7 @@ function productItem(s, { unit, last, overrides, taggedId } = {}) {
         unit: s.unit, packSize: pack, masterPackSize: master,
         gstPercent: Number(s.gst_percent) || 0,
         moq: s.moq != null ? Number(s.moq) : null,
+        listSalePrice: Number(s.price) > 0 ? Number(s.price) : null,
         listUnitPriceIncl: list,
         lastUnitPriceIncl: last?.get(s.id) ?? null,
         customUnitPriceIncl: overrides ? customUnitPriceOf(s, overrides.get(s.id)) : null,
@@ -235,18 +238,74 @@ function productQuery(sellerId, q) {
     return query;
 }
 
-// ---- GET /sales/threads/products?q=&limit=&offset=  (company catalog, no thread needed) -----------------
+const CATALOG_IDS_MAX = 50;
+const idsOf = (raw) => [...new Set(String(raw || "").split(",").map((s) => s.trim()).filter((s) => isUuid(s)))].slice(0, CATALOG_IDS_MAX);
+
+// The customer's side of the prices, added on top of the (cached) catalog page. Always read fresh, never cached:
+//  - lastUnitPriceIncl   : the price last quoted / punched for this GST number (any customer, on BBM or not)
+//  - customUnitPriceIncl : the custom price the customer has on BBM right now (only when they are a BBM buyer)
+//  - buyer               : { onBbm, name } | { onBbm: false, own } | null when unknown
+// Never throws: the picker must keep working even if the customer lookup fails.
+async function customerPriceOverlay({ sellerId, ownerId, gstin, items }) {
+    if (!gstin || !items.length) return { items, buyer: null };
+    const subIds = items.map((i) => i.submissionId);
+
+    const lastP = (async () => {
+        const m = new Map();
+        try {
+            const { data, error } = await supabase.from("sales_customer_prices").select("submission_id, unit_price_incl")
+                .eq("seller_id", sellerId).eq("customer_gstin", gstin).in("submission_id", subIds);
+            if (error) throw error;
+            for (const c of data || []) m.set(c.submission_id, Number(c.unit_price_incl));
+        } catch (e) { console.error("[sales] last prices lookup failed:", e?.message || e); }
+        return m;
+    })();
+    const buyerP = (async () => {
+        try {
+            const b = await lookupBuyerCompany(gstin, ownerId);
+            if (b && !b.self) return { buyer: { onBbm: true, name: b.name }, overrides: await fetchBuyerOverrides(sellerId, b.companyId, subIds) };
+            return { buyer: { onBbm: false, name: null, own: !!b?.self }, overrides: new Map() };
+        } catch (e) {
+            console.error("[sales] buyer lookup failed:", e?.message || e);
+            return { buyer: null, overrides: new Map() };
+        }
+    })();
+    const [last, { buyer, overrides }] = await Promise.all([lastP, buyerP]);
+
+    return {
+        buyer,
+        items: items.map((i) => {
+            const ov = overrides.get(i.submissionId);
+            return {
+                ...i,
+                lastUnitPriceIncl: last.get(i.submissionId) ?? null,
+                customUnitPriceIncl: ov && i.listSalePrice
+                    ? customUnitPriceOf({ price: i.listSalePrice, pack_size: i.packSize, units_per_master_pack: i.masterPackSize }, ov)
+                    : null,
+            };
+        }),
+    };
+}
+
+// ---- GET /sales/threads/products?q=&limit=&offset=&gstin=&ids=  (company catalog, no thread needed) ----
+// gstin (optional, a full valid GST number): also returns that customer's last price and custom price per product.
+// ids   (optional, comma separated listing ids): only those listings (used to re-check the lines already added).
 export async function listCatalogProducts(req, res) {
     try {
         res.set("Cache-Control", "no-store");
-        const { sellerId } = getSalesActor(req);
+        const { sellerId, ownerId } = getSalesActor(req);
         if (!sellerId) return fail(res, 409, NO_SELLER);
-        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 8, 1), 50);
+        const ids = idsOf(req.query.ids);
+        const limit = ids.length ? CATALOG_IDS_MAX : Math.min(Math.max(parseInt(req.query.limit, 10) || 8, 1), 50);
         const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
         const q = safeSearch(req.query.q);
+        const g = cleanGstin(req.query.gstin);
+        const gstin = GSTIN_RE.test(g) ? g : "";
 
-        const body = await cached(`stc:${sellerId}:${hashKey([q, limit, offset])}`, 20, async () => {
-            const { data, count, error } = await productQuery(sellerId, q)
+        const base = await cached(`stc:${sellerId}:${hashKey([q, limit, offset, ids.join(",")])}`, 20, async () => {
+            let query = productQuery(sellerId, q);
+            if (ids.length) query = query.in("id", ids);
+            const { data, count, error } = await query
                 .order("created_at", { ascending: false }).range(offset, offset + limit - 1);
             if (error) throw error;
             const items = (data || []).map((r) => productItem(flatSub(r)));
@@ -255,7 +314,9 @@ export async function listCatalogProducts(req, res) {
                 hasMore: offset + items.length < (count ?? 0), nextOffset: offset + items.length,
             };
         });
-        res.json(body);
+
+        const { items, buyer } = await customerPriceOverlay({ sellerId, ownerId, gstin, items: base.items });
+        res.json({ ...base, items, buyer });
     } catch (e) { oops(res, e); }
 }
 
