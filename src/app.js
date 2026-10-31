@@ -44,6 +44,8 @@ import salesRoutes from "./routes/sales.routes.js";
 import { impersonationGuard } from "./middleware/impersonationGuard.middleware.js";
 import orderBookTeamRoutes from "./routes/orderBookTeam.routes.js";
 import salesMonitorRoutes from "./routes/salesMonitor.routes.js";
+import { apiAnalytics } from "./middleware/apiAnalytics.middleware.js";
+import { captureServerException } from "./services/analytics.service.js";
 
 export function createApp() {
   const app = express();
@@ -63,6 +65,11 @@ export function createApp() {
   // for free, so this is pure savings with no client-side change needed.
   // Placed early, before routes, so it wraps every response this app sends.
   app.use(compression());
+
+  // PostHog API analytics: records status codes, durations and errors (never bodies,
+  // headers other than the opt-in distinct id, or query strings). Sampled to protect the
+  // free tier. Placed before the payments webhook so those requests are measured too.
+  app.use(apiAnalytics);
 
   // JioPay's webhook (server-to-server) and the buyer's browser return (a cross-site form POST that
   // carries an Origin header) must be reachable WITHOUT the browser CORS allow-list below, so they
@@ -154,6 +161,8 @@ export function createApp() {
 
   app.use((err, req, res, next) => {
     console.error(err);
+    // Only the error message + route is sent to PostHog; no request body or headers.
+    captureServerException(err, req, { route: req.originalUrl.split("?")[0], method: req.method });
     res.status(500).json({
       success: false,
       message: "Something went wrong.",

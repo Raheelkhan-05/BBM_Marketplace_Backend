@@ -12,6 +12,7 @@ import { startSettlementScheduler } from "./services/settlement.service.js";
 import { startPaymentScheduler } from "./services/paymentScheduler.service.js";
 import { startGroupBannerWatcher } from "./services/groupBanners.service.js";
 import { startAiBannerWorker } from "./services/aiBanners.service.js";
+import { shutdownAnalytics } from "./services/analytics.service.js";
 
 const PORT = process.env.PORT || 4000;
 const app = createApp();
@@ -77,3 +78,11 @@ startGroupBannerWatcher();
 
 startAiBannerWorker();
 start();
+
+// Render sends SIGTERM on every deploy/restart: flush queued PostHog events first.
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, async () => {
+    await shutdownAnalytics();
+    process.exit(0);
+  });
+}

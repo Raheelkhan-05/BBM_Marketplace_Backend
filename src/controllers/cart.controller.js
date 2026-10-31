@@ -3,6 +3,7 @@ import { supabase } from "../config/supabase.js";
 import { purchaseQtyToSaleUnitQty, saleUnitLabel } from "../../shared/packUnits.js";
 import { checkOrderWindow, checkLocationServiceable } from "../../shared/orderConstraints.js";
 import { notifyAdmins, notifyAdminPaymentsChanged } from "../services/notifications.service.js";
+import { captureServer } from "../services/analytics.service.js";
 
 // Fetches just enough from seller_product_submissions to validate a
 // requested quantity against available stock. Shared by addCartItem,
@@ -186,6 +187,7 @@ export async function checkoutCart(req, res) {
     for (const sid of sellerIds) {
         const { data: status } = await supabase.rpc("wallet_get_status", { p_seller_id: sid }).single();
         if (status?.is_blocked) {
+            captureServer(req, "order_failed", { flow: "cart", code: "SELLER_BLOCKED" });
             return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: "One or more sellers in your selection aren't accepting new orders right now. Please remove their items to continue." });
         }
     }
@@ -202,6 +204,7 @@ export async function checkoutCart(req, res) {
     for (const item of cartItems) {
         const stockError = checkStockLimit(submissionById.get(item.submission_id), Number(item.quantity), item.purchase_basis || "per_pack");
         if (stockError) {
+            captureServer(req, "order_failed", { flow: "cart", code: "EXCEEDS_AVAILABLE_STOCK" });
             return res.status(400).json({
                 success: false, code: "EXCEEDS_AVAILABLE_STOCK",
                 message: `${item.product_name || "One item"} in your cart: ${stockError}`,
@@ -217,6 +220,7 @@ export async function checkoutCart(req, res) {
     for (const item of cartItems) {
         const locationCheck = checkLocationServiceable(submissionById.get(item.submission_id)?.dispatching_locations, address);
         if (!locationCheck.serviceable) {
+            captureServer(req, "order_failed", { flow: "cart", code: "NOT_SERVICEABLE" });
             return res.status(400).json({
                 success: false, code: locationCheck.reason,
                 message: `${item.product_name || "One item"} in your cart: ${locationCheck.message}`,
@@ -241,6 +245,7 @@ export async function checkoutCart(req, res) {
         for (const pref of relevantPrefs) {
             const route = routeById.get(pref.routeOptionId);
             if (!route || route.seller_id !== pref.sellerId || route.status !== "approved") {
+                captureServer(req, "order_failed", { flow: "cart", code: "INVALID_TRANSPORT_OPTION" });
                 return res.status(400).json({
                     success: false, code: "INVALID_TRANSPORT_OPTION",
                     message: "One of your selected transport options is no longer valid — please pick another.",
@@ -292,9 +297,20 @@ export async function checkoutCart(req, res) {
 
         const map = { CART_EMPTY: 400, BUYER_NOT_VERIFIED: 403, ADDRESS_NOT_FOUND: 404, EXCEEDS_AVAILABLE_STOCK: 400 };
         const code = error.message?.split(":")[0];
+        captureServer(req, "order_failed", {
+            flow: "cart",
+            code: Object.prototype.hasOwnProperty.call(map, code) ? code : "UNKNOWN",
+        });
         const message = code === "EXCEEDS_AVAILABLE_STOCK" ? "One or more items exceed the seller's available stock." : "Couldn't place the order.";
         return res.status(map[code] || 400).json({ success: false, code, message });
     }
+    captureServer(req, "order_placed", {
+        flow: "cart",
+        order_status: "awaiting_payment",
+        item_count: cartItems.length,
+        seller_order_count: data.seller_order_count,
+        partial_checkout: partial,
+    });
     res.json({
         success: true,
         orderGroupId: data.order_group_id,

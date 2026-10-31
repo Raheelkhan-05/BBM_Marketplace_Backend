@@ -22,6 +22,7 @@ import { notifyUser, notifyUserOrdersChanged } from "./realtimeBroadcast.js";
 import { notifyAdmins } from "./notifications.service.js";
 import { notifyIfWalletJustBlocked } from "./walletNotifications.service.js";
 import { sendOrderUpdateWhatsApp } from "./whatsapp.service.js";
+import { captureServerAnon } from "./analytics.service.js";
 
 export class PaymentError extends Error {
     constructor(status, message, code, details = null) {
@@ -285,6 +286,19 @@ async function processOutcome({ ref, source, outcome, code, message, gatewayTxnI
 
 async function runEffects(r) {
     if (!r || typeof r !== "object") return;
+
+    // Analytics (anonymous, never tied to a person): the authoritative payment outcomes.
+    if (r.outcome === "applied") {
+        captureServerAnon("payment_succeeded", {
+            purpose: r.purpose || null,
+            amount_inr: (Number(r.amount_paise) || 0) / 100,
+            order_count: Array.isArray(r.order_ids) ? r.order_ids.length : 0,
+        });
+    } else if (r.outcome === "mismatch") {
+        captureServerAnon("payment_mismatch", {});
+    } else if (r.outcome === "refund_queued") {
+        captureServerAnon("payment_refund_queued", { amount_inr: (Number(r.amount_paise) || 0) / 100 });
+    }
 
     if (r.outcome === "mismatch") {
         await alertAdmins("Payment amount mismatch", `Gateway reported ${inr(r.received_paise)} but ${inr(r.expected_paise)} was expected (attempt ${r.attempt_id}). Needs manual review.`);

@@ -29,6 +29,7 @@
     "nodemailer": "^6.9.14",
     "openai": "^6.49.0",
     "pdfjs-dist": "^6.2.108",
+    "posthog-node": "^5.61.1",
     "redis": "^6.2.1",
     "resend": "^6.30.0",
     "sharp": "^0.35.5",

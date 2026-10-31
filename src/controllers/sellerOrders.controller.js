@@ -20,6 +20,7 @@ import { sendOrderUpdateWhatsApp } from "../services/whatsapp.service.js";
 import { notifyIfWalletJustBlocked } from "../services/walletNotifications.service.js";
 import { getTransportOption, transportLabel } from "../../shared/transportOptions.js";
 import { routeOptionSummary } from "../../shared/routeTransportFields.js";
+import { captureServer } from "../services/analytics.service.js";
 
 function whatsappHeadlineForStatus(newStatus, orderNumber) {
     const map = {
@@ -113,6 +114,9 @@ function transitionHandler(newStatus) {
                     : status === 400 ? "That status change isn't allowed right now." : "Couldn't update the order.",
             });
         }
+
+        // Analytics: seller-side order funnel (confirmed -> shipped -> delivered, or rejected). No order data.
+        captureServer(req, "seller_order_status_changed", { status: newStatus });
 
         if (newStatus === "rejected") {
             await supabase.rpc("wallet_reverse_commission", { p_order_id: req.params.id });

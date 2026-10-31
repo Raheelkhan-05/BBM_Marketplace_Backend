@@ -7,6 +7,7 @@ import { fetchCustomPriceMap, resolveEffectiveBasePrice } from "../../shared/cus
 import { isListingExpired } from "../../shared/listingValidity.js";
 import { processRefundQueue } from "../services/payments.service.js";
 import { attachRepricePreview } from "../services/orderReprice.service.js";
+import { captureServer } from "../services/analytics.service.js";
 
 import { getRoadDistanceKm } from "../services/pincodeDistance.js";
 import { purchaseQtyToSaleUnitQty, saleUnitQtyToBaseUnits, getSaleUnit, saleUnitLabel, round2 } from "../../shared/packUnits.js";
@@ -622,6 +623,9 @@ export async function placeOrder(req, res) {
     if (error) {
         console.error("place_order RPC failed:", error);
         const mapped = mapRpcError(error);
+        const failCode = (error.message || "").trim();
+        // Only known codes are sent to analytics, never raw database error text.
+        captureServer(req, "order_failed", { flow: "buy_now", code: ERROR_MAP[failCode] ? failCode : "UNKNOWN" });
         return res.status(mapped.status).json({ success: false, code: error.message, message: mapped.message });
     }
 
@@ -630,6 +634,15 @@ export async function placeOrder(req, res) {
         console.error("place_order RPC returned no row", { submissionId, orderType: safeOrderType, data });
         return res.status(500).json({ success: false, message: "Couldn't place the order — please try again." });
     }
+
+    captureServer(req, "order_placed", {
+        flow: "buy_now",
+        order_type: safeOrderType,
+        order_status: row.order_status,
+        payment_method: row.payment_method || null,
+        purchase_basis: purchaseBasis,
+        has_transport_option: !!transportRouteOptionId,
+    });
 
     {
         const { data: buyerProfile } = await supabase
