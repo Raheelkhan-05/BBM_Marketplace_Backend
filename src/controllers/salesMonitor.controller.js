@@ -42,6 +42,10 @@ function rangeOf(query, { required }) {
 }
 
 /* ------------------------------ GET /people ------------------------------ */
+// enquiries    = different enquiries that got at least one update in the period (each counted once)
+// newEnquiries = enquiries created in the period
+// orders       = orders punched in the period
+// total        = every logged update
 export async function getPeople(req, res) {
     try {
         res.set("Cache-Control", "no-store");
@@ -50,7 +54,7 @@ export async function getPeople(req, res) {
         if (r.error) return fail(res, 400, r.error);
 
         const ver = await getVer(`sm:${ctx.companyId}`);
-        const body = await cached(`smp:${ctx.companyId}:${ver}:${hashKey([r.from, r.to])}`, 20, async () => {
+        const body = await cached(`smp2:${ctx.companyId}:${ver}:${hashKey([r.from, r.to])}`, 20, async () => {
             let members = [];
             if (ctx.teamId) {
                 const { data, error } = await supabaseAdmin.from("team_members").select("user_id, joined_at")
@@ -75,7 +79,8 @@ export async function getPeople(req, res) {
                 const p = pById.get(m.user_id) || {}, s = sById.get(m.user_id) || {};
                 return {
                     userId: m.user_id, name: p.name || p.email || p.phone || "Unnamed", phone: p.phone || null, email: p.email || null,
-                    total: Number(s.total || 0), enquiries: Number(s.enquiries || 0), orders: Number(s.orders || 0), customers: Number(s.customers || 0),
+                    total: Number(s.total || 0), enquiries: Number(s.enquiries || 0), newEnquiries: Number(s.new_enquiries || 0),
+                    orders: Number(s.orders || 0), customers: Number(s.customers || 0),
                     idleCount: Number(s.idle_count || 0), longestGap: Number(s.longest_gap || 0),
                     firstAt: s.first_at || null, lastAt: s.last_at || null, lastAny: s.last_any || null,
                 };
