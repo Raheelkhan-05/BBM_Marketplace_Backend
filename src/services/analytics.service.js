@@ -36,6 +36,22 @@ export function captureServer(req, event, properties = {}) {
     }
 }
 
+// For server-only events that have no browser request behind them (payment webhooks, reconciler).
+// Always anonymous: never linked to a person, so it is safe for users who declined analytics.
+// Use it for counts and revenue, not for per-user funnels.
+export function captureServerAnon(event, properties = {}) {
+    if (!client) return;
+    try {
+        client.capture({
+            distinctId: "server-events",
+            event,
+            properties: { ...properties, source: "backend", $process_person_profile: false },
+        });
+    } catch (e) {
+        console.warn("[analytics] anon capture failed:", e.message);
+    }
+}
+
 export function captureServerException(err, req, properties = {}) {
     if (!client) return;
     // Blocked-origin probes are noise, not app errors.
