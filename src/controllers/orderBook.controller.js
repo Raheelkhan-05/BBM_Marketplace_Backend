@@ -24,6 +24,7 @@ import { productDetails } from "../services/orderBookProduct.service.js";
 import { fillCustomerContact } from "../services/sellerCustomerContact.service.js";
 import { applyOrderCustomPrices } from "../services/salesQuotePricing.service.js";
 import { notifyDispatchersOrderPlaced } from "../services/dispatcherNotify.service.js";
+import { loadSalesperson } from "../services/salespersonCopy.service.js";
 
 const MAX_LINES = 20;
 const NO_SELLER = "Your company's seller account isn't approved yet, so products can't be added.";
@@ -217,6 +218,15 @@ function countsOf(rows) {
     return c;
 }
 
+// Real names of the salespeople, read from their profiles (fixes the generic "Salesperson" label, old orders too).
+async function nameMap(rows) {
+    const ids = [...new Set((rows || []).map((r) => r.salesperson_id).filter(Boolean))];
+    if (!ids.length) return new Map();
+    const { data, error } = await supabase.from("profiles").select("id, name").in("id", ids);
+    if (error) { console.error("[order book] names lookup failed:", error.message); return new Map(); }
+    return new Map((data || []).filter((p) => p.name).map((p) => [p.id, String(p.name).trim()]));
+}
+
 async function listFor(req, res, scope) {
     try {
         res.set("Cache-Control", "no-store");
@@ -240,7 +250,12 @@ async function listFor(req, res, scope) {
         if (list.error) throw list.error;
         if (cnt?.error) throw cnt.error;
 
-        const items = (list.data || []).map((r) => dtoOf(r));
+        const rows = list.data || [];
+        const names = await nameMap(rows);
+        const items = rows.map((r) => {
+            const d = dtoOf(r);
+            return { ...d, salespersonName: names.get(r.salesperson_id) || d.salespersonName };
+        });
         const body = { success: true, items, total: list.count ?? items.length, hasMore: offset + items.length < (list.count ?? 0) };
         if (first) body.counts = countsOf(cnt.data);
         res.json(body);
@@ -262,7 +277,13 @@ async function detailFor(req, res, scope) {
             signDocs(row),
         ]);
         if (ev.error) throw ev.error;
-        res.json({ success: true, order: dtoOf(row, docs), events: (ev.data || []).map(eventDto) });
+        const names = await nameMap([row]);
+        const d = dtoOf(row, docs);
+        res.json({
+            success: true,
+            order: { ...d, salespersonName: names.get(row.salesperson_id) || d.salespersonName },
+            events: (ev.data || []).map(eventDto),
+        });
     } catch (e) { oops(res, e); }
 }
 
@@ -281,6 +302,8 @@ export async function createOrder(req, res) {
     try {
         const s = salesScope(req);
         if (!s.sellerId) return fail(res, 409, NO_SELLER);
+        const me = await loadSalesperson(s.actorId);
+        if (me?.name) s.actorName = String(me.name).trim().slice(0, 120);
         const b = req.body || {};
 
         let customerName = str(b.customerName, 160);
