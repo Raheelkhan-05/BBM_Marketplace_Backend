@@ -12,6 +12,7 @@ const DAY_MS = 86_400_000;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MODULES = ["enquiry", "order", "customer"];
 const FEED_PAGE = 30, FEED_MAX = 60, AFTER_MAX = 100, ENTRY_PAGE = 30;
+const ALL_FROM = "2000-01-01"; // "All" = every date from here up to today (IST)
 
 const actorIdOf = (req) => req.actor?.id || req.user.id;
 const fail = (res, status, message) => res.status(status).json({ success: false, message });
@@ -20,6 +21,25 @@ const safeSearch = (q) => String(q || "").replace(/[%_,()\\*]/g, " ").trim().toL
 const istDate = (ms) => new Date(ms + IST_MS).toISOString().slice(0, 10);
 const isoOf = (v) => { const t = Date.parse(v); return Number.isNaN(t) ? null : new Date(t).toISOString(); };
 
+/* ------------------------------ real names ------------------------------ */
+// Placeholder values that are a role tag, not a person's name.
+const GENERIC_NAMES = new Set(["salesperson", "sales person", "sales", "sales executive", "user", "unnamed", "unknown"]);
+const realName = (v) => {
+    const s = String(v || "").trim();
+    return s && !GENERIC_NAMES.has(s.toLowerCase()) ? s : "";
+};
+// Best display name for a profile row: real name, else email, else phone.
+const nameOfProfile = (p) => realName(p?.name) || p?.email || p?.phone || "";
+
+// id -> display name, read live from profiles (so old rows saved with a generic tag are fixed too).
+async function namesFor(ids) {
+    const uniq = [...new Set((ids || []).filter(Boolean))];
+    if (!uniq.length) return new Map();
+    const { data, error } = await supabaseAdmin.from("profiles").select("id, name, email, phone").in("id", uniq);
+    if (error) { console.error("[sales monitor] namesFor:", error.message); return new Map(); }
+    return new Map((data || []).map((p) => [p.id, nameOfProfile(p)]));
+}
+
 async function requireAdmin(req, res) {
     const ctx = await getTeamContext(actorIdOf(req));
     if (!ctx.isAdmin) { fail(res, 403, "Only your team admin can do this."); return null; }
@@ -27,7 +47,16 @@ async function requireAdmin(req, res) {
 }
 
 // from / to are inclusive IST dates (YYYY-MM-DD). Returns timestamps [fromTs, toTs).
+// ?all=1 (with required: true) means every date available: no one-year limit applies.
 function rangeOf(query, { required }) {
+    const toTsOf = (ymd) => new Date(Date.parse(`${ymd}T00:00:00+05:30`) + DAY_MS).toISOString();
+    const fromTsOf = (ymd) => new Date(Date.parse(`${ymd}T00:00:00+05:30`)).toISOString();
+
+    if (required && query.all === "1") {
+        const from = ALL_FROM, to = istDate(Date.now());
+        return { from, to, fromTs: fromTsOf(from), toTs: toTsOf(to) };
+    }
+
     let from = DATE_RE.test(query.from || "") ? query.from : null;
     let to = DATE_RE.test(query.to || "") ? query.to : null;
     if (required) {
@@ -42,6 +71,7 @@ function rangeOf(query, { required }) {
 }
 
 /* ------------------------------ GET /people ------------------------------ */
+// ?from&to  or  ?all=1 (every date available)
 // enquiries    = different enquiries that got at least one update in the period (each counted once)
 // newEnquiries = enquiries created in the period
 // orders       = orders punched in the period
@@ -54,7 +84,7 @@ export async function getPeople(req, res) {
         if (r.error) return fail(res, 400, r.error);
 
         const ver = await getVer(`sm:${ctx.companyId}`);
-        const body = await cached(`smp2:${ctx.companyId}:${ver}:${hashKey([r.from, r.to])}`, 20, async () => {
+        const body = await cached(`smp3:${ctx.companyId}:${ver}:${hashKey([r.from, r.to])}`, 20, async () => {
             let members = [];
             if (ctx.teamId) {
                 const { data, error } = await supabaseAdmin.from("team_members").select("user_id, joined_at")
@@ -78,7 +108,7 @@ export async function getPeople(req, res) {
             const people = members.map((m) => {
                 const p = pById.get(m.user_id) || {}, s = sById.get(m.user_id) || {};
                 return {
-                    userId: m.user_id, name: p.name || p.email || p.phone || "Unnamed", phone: p.phone || null, email: p.email || null,
+                    userId: m.user_id, name: nameOfProfile(p) || "Unnamed", phone: p.phone || null, email: p.email || null,
                     total: Number(s.total || 0), enquiries: Number(s.enquiries || 0), newEnquiries: Number(s.new_enquiries || 0),
                     orders: Number(s.orders || 0), customers: Number(s.customers || 0),
                     idleCount: Number(s.idle_count || 0), longestGap: Number(s.longest_gap || 0),
@@ -96,8 +126,11 @@ export async function getPeople(req, res) {
 
 /* ------------------------------ GET /feed ------------------------------ */
 // ?actorId&module&idleOnly=1&q&from&to&limit&before&beforeId | after
-const dto = (r) => ({
-    id: r.id, actorId: r.actor_id, actorName: r.actor_name, module: r.module, kind: r.kind,
+// No from / to = every date available (this is what the "All" filter sends).
+const dto = (r, names) => ({
+    id: r.id, actorId: r.actor_id,
+    actorName: names.get(r.actor_id) || realName(r.actor_name) || "Unknown",
+    module: r.module, kind: r.kind,
     title: r.title, subtitle: r.subtitle, preview: r.preview, entityType: r.entity_type, entityId: r.entity_id,
     meta: r.meta || {}, gapMinutes: r.gap_minutes, idle: !!r.idle_flag, createdAt: r.created_at,
 });
@@ -121,7 +154,7 @@ export async function getFeed(req, res) {
         if ((qy.before && !before) || (qy.after && !after)) return fail(res, 400, "Invalid cursor.");
 
         const ver = await getVer(`sm:${ctx.companyId}`);
-        const key = `smf:${ctx.companyId}:${ver}:${hashKey([actorId, module, idleOnly, search, r.fromTs, r.toTs, limit, before, beforeId, after])}`;
+        const key = `smf2:${ctx.companyId}:${ver}:${hashKey([actorId, module, idleOnly, search, r.fromTs, r.toTs, limit, before, beforeId, after])}`;
         const body = await cached(key, 30, async () => {
             let q = supabaseAdmin.from("sales_activity").select("*").eq("company_id", ctx.companyId);
             if (actorId) q = q.eq("actor_id", actorId);
@@ -136,7 +169,9 @@ export async function getFeed(req, res) {
                     .order("created_at", { ascending: true }).order("id", { ascending: true }).limit(AFTER_MAX + 1);
                 if (error) throw error;
                 if ((data || []).length > AFTER_MAX) return { success: true, events: [], hasMore: false, reset: true };
-                return { success: true, events: (data || []).reverse().map(dto), hasMore: false };
+                const rows = (data || []).reverse();
+                const names = await namesFor(rows.map((x) => x.actor_id));
+                return { success: true, events: rows.map((x) => dto(x, names)), hasMore: false };
             }
             if (before) {
                 q = beforeId ? q.or(`created_at.lt.${before},and(created_at.eq.${before},id.lt.${beforeId})`) : q.lt("created_at", before);
@@ -144,7 +179,9 @@ export async function getFeed(req, res) {
             const { data, error } = await q.order("created_at", { ascending: false }).order("id", { ascending: false }).limit(limit + 1);
             if (error) throw error;
             const rows = data || [];
-            return { success: true, events: rows.slice(0, limit).map(dto), hasMore: rows.length > limit };
+            const page = rows.slice(0, limit);
+            const names = await namesFor(page.map((x) => x.actor_id));
+            return { success: true, events: page.map((x) => dto(x, names)), hasMore: rows.length > limit };
         });
         res.json(body);
     } catch (e) { oops(res, e, "getFeed"); }
@@ -153,12 +190,12 @@ export async function getFeed(req, res) {
 /* ------------------------------ GET /threads/:id ------------------------------ */
 // Read-only view of any salesperson's enquiry thread of this company.
 // ?limit&before&beforeId  (newest page first, older pages by cursor)
-const threadOf = (row, extra) => ({
+const threadOf = (row, extra, names) => ({
     ...threadDto(row, extra),
     outcome: row.sales_outcome || null,
     reminderAt: row.reminder_at || null,
     salespersonId: row.created_by_actor_id || null,
-    salespersonName: row.created_by_actor_name || null,
+    salespersonName: names.get(row.created_by_actor_id) || realName(row.created_by_actor_name) || null,
 });
 
 export async function getThreadView(req, res) {
@@ -182,14 +219,15 @@ export async function getThreadView(req, res) {
             .order("created_at", { ascending: false }).order("id", { ascending: false }).limit(limit + 1);
         if (before) q = beforeId ? q.or(`created_at.lt.${before},and(created_at.eq.${before},id.lt.${beforeId})`) : q.lt("created_at", before);
 
-        const [list, qc] = await Promise.all([
+        const [list, qc, names] = await Promise.all([
             q,
             supabaseAdmin.from("sales_quotes").select("id", { count: "exact", head: true }).eq("enquiry_id", row.id),
+            namesFor([row.created_by_actor_id]),
         ]);
         if (list.error) throw list.error;
         const data = list.data || [];
         res.json({
-            success: true, thread: threadOf(row, { quotesCount: qc.count || 0 }),
+            success: true, thread: threadOf(row, { quotesCount: qc.count || 0 }, names),
             entries: await hydrateEntries(data.slice(0, limit).reverse()), hasOlder: data.length > limit,
         });
     } catch (e) { oops(res, e, "getThreadView"); }
