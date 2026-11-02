@@ -9,8 +9,10 @@
 //    `after` for a tiny "what's new" refresh (used by the live poll / socket).
 //
 // Outcomes: an enquiry is "open" (db status approved) or closed with sales_outcome "won" | "lost".
+// Kinds: sales_kind "enquiry" (product tagged / typed at creation) or "cold_call" (a call log with a first note and
+// NO product yet). A cold call can get its product ONCE later (PATCH /:id/product); a quotation needs a product.
 // Product: an enquiry may be created with a product tagged from the company catalog (product_submission_id);
-// it is set once at creation and never editable afterwards.
+// once set it is never editable afterwards.
 import { randomUUID } from "node:crypto";
 import { supabase } from "../config/supabase.js";
 import { isUuid, RFQ_UNITS } from "../services/rfqValidation.js";
@@ -44,7 +46,9 @@ const validText = (iso) => (new Date(iso).getUTCFullYear() >= 9000 ? "further no
 const VALIDITY = [1, 3, 7, 15, 30];
 const CHANNELS = ["whatsapp", "email"];
 const TS_RE = /^\d{4}-\d{2}-\d{2}T[\d:.]+(Z|[+-]\d{2}(:?\d{2})?)$/;
-const STATUS_FILTERS = ["open", "won", "lost", "reminder"];
+const STATUS_FILTERS = ["open", "won", "lost", "reminder", "cold"];
+const KIND_COLD = "cold_call";
+const NOTE_MAX = 4000;
 const REMINDER_MAX_MS = 366 * 24 * 60 * 60 * 1000;
 const REMINDER_TZ = "Asia/Kolkata";   // only used for the wording of the log line; the stored value is a UTC instant
 const remText = (iso) => new Date(iso).toLocaleString("en-IN", {
@@ -53,9 +57,15 @@ const remText = (iso) => new Date(iso).toLocaleString("en-IN", {
 
 const dtoOf = (row, extra) => ({
     ...threadDto(row, extra),
+    // product fields can be empty for a cold call that has no product yet
+    productName: row.product_name || "",
+    quantity: row.quantity ?? null,
+    unit: row.unit || "",
     outcome: row.sales_outcome || null,
     productSubmissionId: row.product_submission_id || null,
     reminderAt: row.reminder_at || null,
+    kind: row.sales_kind || "enquiry",
+    hasProduct: !!row.product_name,
 });
 const SUB_SELECT = "*, hs_generic_product_brands!inner(id, name, brand_name, image, deleted_at)";
 
@@ -120,6 +130,32 @@ async function ensureCustomer({ sellerId, companyId, actorId, teamId, thread }) 
     }
 }
 
+// Reads + validates the product part of a request (used when creating an enquiry and when adding a product later).
+// Returns { error: { status, message } } or { product, productName, quantity, unit }.
+async function readProduct(b, sellerId) {
+    let product = null;
+    if (b.productSubmissionId) {
+        if (!isUuid(b.productSubmissionId)) return { error: { status: 400, message: "The selected product is invalid." } };
+        if (!sellerId) return { error: { status: 409, message: NO_SELLER } };
+        const { data: sub, error: sErr } = await supabase.from("seller_product_submissions").select(SUB_SELECT)
+            .eq("seller_id", sellerId).eq("id", b.productSubmissionId).neq("review_status", "rejected")
+            .is("hs_generic_product_brands.deleted_at", null).maybeSingle();
+        if (sErr) throw sErr;
+        if (!sub) return { error: { status: 404, message: "This product isn't in your company's catalog." } };
+        product = flatSub(sub);
+        const why = listingProblem(product);
+        if (why) return { error: { status: 409, message: `"${product.brand?.name || product.product_name}" can't be used right now (${why.toLowerCase()}).` } };
+    }
+    const productName = product ? (product.brand?.name || product.product_name) : str(b.productName, 200);
+    if (productName.length < 2) return { error: { status: 400, message: "Product name must be at least 2 characters." } };
+
+    const quantity = Number(b.quantity);
+    if (!(quantity > 0) || quantity > 1e9) return { error: { status: 400, message: "Enter a valid quantity." } };
+    const unit = product && RFQ_UNITS.includes(product.unit) ? product.unit : b.unit;
+    if (!RFQ_UNITS.includes(unit)) return { error: { status: 400, message: "Select a valid unit." } };
+    return { product, productName, quantity, unit };
+}
+
 // ---- loading -------------------------------------------------------------------------------------------
 async function loadOwnThread(req, res) {
     const { actorId, ownerId } = getSalesActor(req);
@@ -142,7 +178,7 @@ async function touch(enquiryId, preview) {
         .eq("id", enquiryId);
 }
 
-// ---- GET /sales/threads?q=&status=open|won|lost&limit=&offset= ------------------------------------------
+// ---- GET /sales/threads?q=&status=open|won|lost|reminder|cold&limit=&offset= ----------------------------
 export async function listThreads(req, res) {
     try {
         res.set("Cache-Control", "no-store");
@@ -159,13 +195,10 @@ export async function listThreads(req, res) {
 
             let query = scoped(supabase.from("rfq_enquiries").select("*", { count: "exact" }));
             if (status === "open") query = query.neq("status", "closed");
-            if (status === "won") query = query.eq("status", "closed").eq("sales_outcome", "won");
-            if (status === "lost") query = query.eq("status", "closed").eq("sales_outcome", "lost");
-            if (q) query = query.or(`product_name.ilike.%${q}%,customer_name.ilike.%${q}%,customer_gstin.ilike.%${q}%`);
-            query = query.order("last_activity_at", { ascending: false }).order("id", { ascending: true }).range(offset, offset + limit - 1);
-
-            if (status === "reminder") query = query.not("reminder_at", "is", null).neq("status", "closed");
-            // (keep the open / won / lost lines as they are)
+            else if (status === "won") query = query.eq("status", "closed").eq("sales_outcome", "won");
+            else if (status === "lost") query = query.eq("status", "closed").eq("sales_outcome", "lost");
+            else if (status === "reminder") query = query.not("reminder_at", "is", null).neq("status", "closed");
+            else if (status === "cold") query = query.eq("sales_kind", KIND_COLD);
             if (q) query = query.or(`product_name.ilike.%${q}%,customer_name.ilike.%${q}%,customer_gstin.ilike.%${q}%`);
             query = (status === "reminder"
                 ? query.order("reminder_at", { ascending: true })        // soonest first
@@ -173,13 +206,14 @@ export async function listThreads(req, res) {
             ).order("id", { ascending: true }).range(offset, offset + limit - 1);
 
             const first = offset === 0;
-            const [list, all, open, won, lost, rem] = await Promise.all([
+            const [list, all, open, won, lost, rem, cold] = await Promise.all([
                 query,
                 first ? count() : null,
                 first ? count().neq("status", "closed") : null,
                 first ? count().eq("status", "closed").eq("sales_outcome", "won") : null,
                 first ? count().eq("status", "closed").eq("sales_outcome", "lost") : null,
                 first ? count().neq("status", "closed").not("reminder_at", "is", null) : null,
+                first ? count().eq("sales_kind", KIND_COLD) : null,
             ]);
             if (list.error) throw list.error;
 
@@ -196,7 +230,12 @@ export async function listThreads(req, res) {
                 success: true, items, total: list.count ?? items.length,
                 hasMore: offset + items.length < (list.count ?? 0),
             };
-            if (first) out.counts = { all: all?.count || 0, open: open?.count || 0, won: won?.count || 0, lost: lost?.count || 0, reminder: rem?.count || 0 };
+            if (first) {
+                out.counts = {
+                    all: all?.count || 0, open: open?.count || 0, won: won?.count || 0, lost: lost?.count || 0,
+                    reminder: rem?.count || 0, cold: cold?.count || 0,
+                };
+            }
             return out;
         });
         res.json(body);
@@ -322,11 +361,15 @@ export async function listCatalogProducts(req, res) {
 }
 
 // ---- POST /sales/threads -------------------------------------------------------------------------------
-// { customerGstin?, customerName?, customerPhone?, customerEmail?, productSubmissionId? | productName, quantity, unit, specifications? }
+// Enquiry:   { kind?: "enquiry", customerGstin?, customerName?, customerPhone?, customerEmail?,
+//              productSubmissionId? | productName, quantity, unit, specifications? }
+// Cold call: { kind: "cold_call", customerGstin?, customerName?, customerPhone?, customerEmail?, note }
+//            -> a thread with no product and the note as its first message. The product can be added later.
 export async function createThread(req, res) {
     try {
         const { actorId, actorName, ownerId, sellerId } = getSalesActor(req);
         const b = req.body || {};
+        const cold = b.kind === KIND_COLD;
 
         let customerName = str(b.customerName, 160);
         const gstin = cleanGstin(b.customerGstin);
@@ -339,27 +382,15 @@ export async function createThread(req, res) {
         if (phoneRaw && !phone) return fail(res, 400, "Enter a valid 10-digit mobile number.");
         if (emailRaw && !email) return fail(res, 400, "Enter a valid email address.");
 
-        // Product: tagged from the company catalog, or typed by hand.
-        let product = null;
-        if (b.productSubmissionId) {
-            if (!isUuid(b.productSubmissionId)) return fail(res, 400, "The selected product is invalid.");
-            if (!sellerId) return fail(res, 409, NO_SELLER);
-            const { data: sub, error: sErr } = await supabase.from("seller_product_submissions").select(SUB_SELECT)
-                .eq("seller_id", sellerId).eq("id", b.productSubmissionId).neq("review_status", "rejected")
-                .is("hs_generic_product_brands.deleted_at", null).maybeSingle();
-            if (sErr) throw sErr;
-            if (!sub) return fail(res, 404, "This product isn't in your company's catalog.");
-            product = flatSub(sub);
-            const why = listingProblem(product);
-            if (why) return fail(res, 409, `"${product.brand?.name || product.product_name}" can't be used right now (${why.toLowerCase()}).`);
+        let product = null, productName = null, quantity = null, unit = null, note = "";
+        if (cold) {
+            note = str(b.note, NOTE_MAX);
+            if (note.length < 2) return fail(res, 400, "Write a short note about the call.");
+        } else {
+            const r = await readProduct(b, sellerId);
+            if (r.error) return fail(res, r.error.status, r.error.message);
+            ({ product, productName, quantity, unit } = r);
         }
-        const productName = product ? (product.brand?.name || product.product_name) : str(b.productName, 200);
-        if (productName.length < 2) return fail(res, 400, "Product name must be at least 2 characters.");
-
-        const quantity = Number(b.quantity);
-        if (!(quantity > 0) || quantity > 1e9) return fail(res, 400, "Enter a valid quantity.");
-        const unit = product && RFQ_UNITS.includes(product.unit) ? product.unit : b.unit;
-        if (!RFQ_UNITS.includes(unit)) return fail(res, 400, "Select a valid unit.");
 
         // The company name always comes from the GST number when it can be found.
         if (gstin) {
@@ -367,30 +398,37 @@ export async function createThread(req, res) {
             if (official) customerName = official;
         }
 
-        const now = new Date().toISOString();
+        const t0 = Date.now();
+        const now = new Date(t0).toISOString();
         const { data, error } = await supabase.from("rfq_enquiries").insert({
             buyer_id: ownerId,                       // belongs to the company, so the team sees it on the Save page
             source: "sales", visibility: "private",  // never listed publicly
             status: "approved", published_at: now,   // no admin review: it is not shown to suppliers
             product_name: productName, product_submission_id: product?.id || null,
             quantity, unit, pack_size: 1,
-            specifications: str(b.specifications, 2000) || null,
+            specifications: cold ? null : (str(b.specifications, 2000) || null),
             accept_equivalent: false, images: [], supplier_locations: [],
             payment_terms: "flexible", consumption_type: "one_time",
             customer_name: customerName || null, customer_gstin: gstin || null,
             customer_phone: phone || null, customer_email: email || null,
             created_by_actor_id: actorId, created_by_actor_name: actorName,
-            last_activity_at: now, last_entry_preview: "Enquiry created",
+            last_activity_at: now, last_entry_preview: cold ? clipPreview(note, 0) : "Enquiry created",
+            ...(cold ? { sales_kind: KIND_COLD } : {}),   // normal enquiries use the column default
         }).select("*").single();
         if (error) throw error;
 
-        await supabase.from("sales_thread_entries").insert({
-            enquiry_id: data.id, author_id: actorId, author_name: actorName, kind: "system",
-            body: `Enquiry created: ${productName} · ${quantity} ${unit}`,
-        });
+        const entries = cold
+            ? [
+                { enquiry_id: data.id, author_id: actorId, author_name: actorName, kind: "system", body: "Cold call logged", created_at: now },
+                // 1 ms later, so the note always sorts after the system line
+                { enquiry_id: data.id, author_id: actorId, author_name: actorName, kind: "note", body: note, attachments: [], created_at: new Date(t0 + 1).toISOString() },
+            ]
+            : [{ enquiry_id: data.id, author_id: actorId, author_name: actorName, kind: "system", body: `Enquiry created: ${productName} · ${quantity} ${unit}` }];
+        const { error: eErr } = await supabase.from("sales_thread_entries").insert(entries);
+        if (eErr) console.error("[sales threads] first entries failed:", eErr.message);
 
         await notify(ownerId, actorId, data.id);
-        res.json({ success: true, thread: dtoOf(data, { quotesCount: 0 }), message: "Enquiry created." });
+        res.json({ success: true, thread: dtoOf(data, { quotesCount: 0 }), message: cold ? "Cold call logged." : "Enquiry created." });
     } catch (e) { oops(res, e); }
 }
 
@@ -491,6 +529,47 @@ export async function updateThread(req, res) {
     } catch (e) { oops(res, e); }
 }
 
+// ---- PATCH /sales/threads/:id/product ------------------------------------------------------------------
+// { productSubmissionId? | productName, quantity, unit, specifications? }
+// Adds the product to a thread that has none yet (a cold call). Allowed ONCE: after that the product is locked, like on
+// any enquiry. Writes a system line to the thread, so the salesperson's log and the admin's monitor both show it.
+export async function setThreadProduct(req, res) {
+    try {
+        const { actorId, actorName, ownerId, sellerId } = getSalesActor(req);
+        const row = await loadOwnThread(req, res); if (!row) return;
+        if (row.product_name) return fail(res, 409, "This enquiry already has a product. It can't be changed.");
+        if (row.status === "closed") return fail(res, 409, "This enquiry is closed. Reopen it to add a product.");
+
+        const b = req.body || {};
+        const r = await readProduct(b, sellerId);
+        if (r.error) return fail(res, r.error.status, r.error.message);
+        const { product, productName, quantity, unit } = r;
+        const specs = str(b.specifications, 2000);
+
+        const body = `Product added: ${productName} · ${quantity} ${unit}`;
+        const patch = {
+            product_name: productName, product_submission_id: product?.id || null,
+            quantity, unit, pack_size: 1,
+            last_activity_at: new Date().toISOString(), last_entry_preview: body, reminder_at: null,
+            ...(specs ? { specifications: specs } : {}),
+        };
+        // `product_name is null` makes this race-safe: two quick taps can never add two products.
+        const { data, error } = await supabase.from("rfq_enquiries").update(patch)
+            .eq("id", row.id).is("product_name", null).select("*").maybeSingle();
+        if (error) throw error;
+        if (!data) return fail(res, 409, "A product was just added to this enquiry. Refresh to see it.");
+
+        const { data: entryRow, error: eErr } = await supabase.from("sales_thread_entries")
+            .insert({ enquiry_id: row.id, author_id: actorId, author_name: actorName, kind: "system", body })
+            .select("*").single();
+        if (eErr) throw eErr;
+
+        await notify(ownerId, actorId, row.id);
+        const [entry] = await hydrateEntries([entryRow]);
+        res.json({ success: true, thread: dtoOf(data, { quotesCount: 0 }), entry, message: "Product added." });
+    } catch (e) { oops(res, e); }
+}
+
 // ---- PATCH /sales/threads/:id/status  { status: "open" | "won" | "lost" } ------------------------------
 export async function setThreadStatus(req, res) {
     try {
@@ -504,7 +583,6 @@ export async function setThreadStatus(req, res) {
 
         const body = next === "won" ? "Enquiry marked as won" : next === "lost" ? "Enquiry marked as lost" : "Enquiry reopened";
         const { data, error } = await supabase.from("rfq_enquiries")
-            // .update({ status: dbStatus, sales_outcome: outcome, last_activity_at: new Date().toISOString(), last_entry_preview: body })
             .update({ status: dbStatus, sales_outcome: outcome, reminder_at: null, last_activity_at: new Date().toISOString(), last_entry_preview: body })
             .eq("id", row.id).select("*").single();
         if (error) throw error;
@@ -594,7 +672,7 @@ export async function addEntry(req, res) {
         const row = await loadOwnThread(req, res); if (!row) return;
         if (row.status === "closed") return fail(res, 409, "This enquiry is closed. Reopen it to add updates.");
 
-        const body = str(req.body?.body, 4000);
+        const body = str(req.body?.body, NOTE_MAX);
         const attachments = cleanAttachments(req.body?.attachments, row.id);
         if (attachments === null) return fail(res, 400, "Attachments are invalid.");
         if (!body && !attachments.length) return fail(res, 400, "Write an update or attach a file.");
@@ -780,6 +858,7 @@ export async function sendQuote(req, res) {
         const { actorId, actorName, actorEmail, ownerId, sellerId } = getSalesActor(req);
         const loaded = await loadOwnThread(req, res); if (!loaded) return;
         if (loaded.status === "closed") return fail(res, 409, "This enquiry is closed. Reopen it to send a quotation.");
+        if (!loaded.product_name) return fail(res, 409, "Add the product to this enquiry before sending a quotation.");
         if (!sellerId) return fail(res, 409, NO_SELLER);
 
         const b = req.body || {};

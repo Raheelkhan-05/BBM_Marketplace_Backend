@@ -3,7 +3,7 @@
 import { Router } from "express";
 import { authWriteLimiter } from "../middleware/rateLimiter.js";
 import {
-    listThreads, createThread, getThread, updateThread, setThreadStatus, setReminder,
+    listThreads, createThread, getThread, updateThread, setThreadStatus, setReminder, setThreadProduct,
     signAttachment, addEntry, listQuoteProducts, listCatalogProducts, sendQuote, resendQuote,
 } from "../controllers/salesThreads.controller.js";
 
@@ -19,6 +19,7 @@ router.get("/:id", getThread);
 router.patch("/:id", authWriteLimiter, updateThread);
 router.patch("/:id/status", authWriteLimiter, setThreadStatus);
 router.patch("/:id/reminder", authWriteLimiter, setReminder);
+router.patch("/:id/product", authWriteLimiter, setThreadProduct);   // adds the product to a cold call (once)
 
 router.post("/:id/attachments/sign", authWriteLimiter, signAttachment);
 router.post("/:id/entries", authWriteLimiter, addEntry);

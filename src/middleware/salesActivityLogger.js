@@ -10,16 +10,21 @@ const inr = (n) => `₹${Number(n || 0).toLocaleString("en-IN", { maximumFractio
 const clip = (s, n) => { const t = String(s || "").replace(/\s+/g, " ").trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const CH = { whatsapp: "WhatsApp", email: "Email" };
+const INFO_TTL = 10 * 60_000;
 
 const infoCache = new Map();
+const putInfo = (id, v) => {
+    if (infoCache.size > 3000) infoCache.clear();
+    infoCache.set(id, { v, exp: Date.now() + INFO_TTL });
+};
 async function threadInfo(id) {
     const hit = infoCache.get(id);
     if (hit && hit.exp > Date.now()) return hit.v;
     const { data } = await supabaseAdmin.from("rfq_enquiries")
         .select("customer_name, product_name, quantity, unit").eq("id", id).maybeSingle();
     const v = data ? { customer: data.customer_name || "", product: data.product_name || "" } : { customer: "", product: "" };
-    if (infoCache.size > 3000) infoCache.clear();
-    infoCache.set(id, { v, exp: Date.now() + 10 * 60_000 });
+    // A cold call has no product yet: don't remember that, or later logs would keep showing it empty after it is added.
+    if (v.product) putInfo(id, v);
     return v;
 }
 const sub = (i) => [i.customer, i.product].filter(Boolean).join(" · ") || null;
@@ -35,9 +40,16 @@ async function describe(req, out) {
     if (m[1] === "threads") {
         if (M === "POST" && seg.length === 0) {
             const t = out?.thread; if (!t?.id) return null;
+            const customer = t.displayName || t.customerName;
+            if (t.kind === "cold_call") {
+                return {
+                    module: "enquiry", kind: "enquiry.cold_call", title: "Logged a cold call", entityType: "enquiry", entityId: t.id,
+                    subtitle: customer || null, preview: clip(b.note, 200) || null, meta: { coldCall: true },
+                };
+            }
             return {
                 module: "enquiry", kind: "enquiry.created", title: "Created an enquiry", entityType: "enquiry", entityId: t.id,
-                subtitle: sub({ customer: t.displayName || t.customerName, product: t.productName }),
+                subtitle: sub({ customer, product: t.productName }),
                 preview: t.quantity ? `${t.quantity} ${t.unit || ""}`.trim() : null, meta: {},
             };
         }
@@ -50,6 +62,14 @@ async function describe(req, out) {
         const subtitle = sub(info);
 
         if (M === "PATCH" && seg.length === 1) return { ...base, kind: "enquiry.customer_updated", title: "Updated customer details", subtitle, meta: {} };
+        if (M === "PATCH" && seg[1] === "product") {
+            const t = out?.thread;
+            if (t?.productName) putInfo(id, { customer: t.displayName || t.customerName || "", product: t.productName });   // keep later logs current
+            return {
+                ...base, kind: "enquiry.product_added", title: "Added a product", subtitle,
+                preview: t?.quantity ? `${t.quantity} ${t.unit || ""}`.trim() : null, meta: { coldCall: true },
+            };
+        }
         if (M === "PATCH" && seg[1] === "status") {
             const s = b.status;
             const title = s === "won" ? "Marked enquiry as won" : s === "lost" ? "Marked enquiry as lost" : "Reopened the enquiry";

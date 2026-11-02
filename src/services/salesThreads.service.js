@@ -91,7 +91,9 @@ export const listingDescription = (s) =>
     String(s.short_description ?? s.description ?? s.brand?.description ?? "").replace(/\s+/g, " ").trim().slice(0, 220);
 
 // ---- DTOs -----------------------------------------------------------------------------------------------
+// A cold call has no product yet: productName / unit are "" and quantity is null (never 0), hasProduct is false.
 export function threadDto(row, extra = {}) {
+    const hasProduct = !!row.product_name;
     return {
         id: row.id,
         customerName: row.customer_name || "",
@@ -99,9 +101,11 @@ export function threadDto(row, extra = {}) {
         customerPhone: row.customer_phone || "",
         customerEmail: row.customer_email || "",
         displayName: row.customer_name || (row.customer_gstin ? `GSTIN ${row.customer_gstin}` : "Customer"),
-        productName: row.product_name,
-        quantity: Number(row.quantity),
-        unit: row.unit,
+        productName: row.product_name || "",
+        quantity: row.quantity == null ? null : Number(row.quantity),
+        unit: row.unit || "",
+        hasProduct,
+        kind: row.sales_kind || "enquiry",
         specifications: row.specifications || "",
         status: row.status === "closed" ? "closed" : "open",
         createdAt: row.created_at,
