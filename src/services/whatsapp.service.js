@@ -773,3 +773,43 @@ export async function sendSalespersonCopyWhatsApp({
 
     return sendWhatsAppText({ to, message });
 }
+
+// -----------------------------------------------------------------------------
+// Order Book: new order alert for dispatchers
+// -----------------------------------------------------------------------------
+export async function sendDispatcherOrderWhatsApp({
+    to, dispatcherName, companyName, orderNo, poNumber, placedOn, salespersonName,
+    customer = {}, items, total, notes, link,
+}) {
+    const message = join([
+        bold("NEW ORDER TO DISPATCH"),
+        "",
+        `Hello ${clean(dispatcherName) || "there"},`,
+        "",
+        `A new order was just punched${salespersonName ? ` by ${bold(salespersonName)}` : ""}${companyName ? ` for ${bold(companyName)}` : ""}.`,
+        "",
+        field("Order Number", orderNo),
+        field("PO Number", poNumber),
+        field("Placed on", placedOn),
+        "",
+        RULE,
+        bold("CUSTOMER"),
+        field("Name", customer.name),
+        field("GSTIN", customer.gstin),
+        field("Address", customer.address),
+        field("Mobile", customer.phone),
+        field("Email", customer.email),
+        RULE,
+        bold("ITEMS"),
+        itemsBlock({ items }),
+        RULE,
+        `${bold("Order Total (incl. GST)")}: ${bold(money(total))}`,
+        clean(notes) ? "" : null,
+        clean(notes) ? field("Order Notes", notes) : null,
+        "",
+        link ? `Open order: ${clean(link)}` : null,
+        "",
+        sign(),
+    ]);
+    return sendWhatsAppText({ to, message });
+}

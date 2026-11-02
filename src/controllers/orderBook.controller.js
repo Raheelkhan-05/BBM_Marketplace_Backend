@@ -23,6 +23,7 @@ import { notifyOrderProcessed, notifyOrderPlaced } from "../services/orderBookNo
 import { productDetails } from "../services/orderBookProduct.service.js";
 import { fillCustomerContact } from "../services/sellerCustomerContact.service.js";
 import { applyOrderCustomPrices } from "../services/salesQuotePricing.service.js";
+import { notifyDispatchersOrderPlaced } from "../services/dispatcherNotify.service.js";
 
 const MAX_LINES = 20;
 const NO_SELLER = "Your company's seller account isn't approved yet, so products can't be added.";
@@ -362,6 +363,9 @@ export async function createOrder(req, res) {
 
         // Greet the customer: order received + order and billing details (email / WhatsApp). After the response path, never blocks it.
         notifyOrderPlaced(row).catch((e) => console.error("[order book] order-placed notify failed:", e?.message || e));
+        // Alert every active dispatcher (WhatsApp and/or email). Never blocks the response.
+        notifyDispatchersOrderPlaced(row, { salespersonName: s.actorName })
+            .catch((e) => console.error("[order book] dispatcher notify failed:", e?.message || e));
 
         res.json({ success: true, order: dtoOf(row), customPricing, message: "Order punched." });
     } catch (e) { oops(res, e); }

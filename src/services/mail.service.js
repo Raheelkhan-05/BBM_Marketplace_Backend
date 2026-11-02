@@ -405,3 +405,52 @@ export async function sendSalespersonCopyEmail({
   });
   return throwIfResendError(result);
 }
+
+// Order Book: instant alert to a dispatcher when a salesperson punches an order.
+export async function sendDispatcherOrderEmail({
+  to, dispatcherName, companyName, orderNo, poNumber, placedOn, salespersonName,
+  customer = {}, items, total, notes, link,
+}) {
+  if (!to) return;
+  const row = (l, v) => (v ? `<tr><td style="padding:3px 0;color:#64748b;vertical-align:top;width:34%;">${l}</td><td style="padding:3px 0;color:#0f172a;">${esc(v)}</td></tr>` : "");
+  const rows = (items || []).map((i) => `
+    <div style="margin:0 0 10px;padding:12px 14px;border:1px solid #e5eaee;border-radius:12px;">
+      <div style="font-size:14px;font-weight:700;color:#0f172a;">${esc(i.productName)}${i.brandName ? ` <span style="font-weight:400;color:#64748b;">· ${esc(i.brandName)}</span>` : ""}</div>
+      <div style="margin-top:6px;font-size:13px;color:#334155;">${esc(i.qtyText)}</div>
+      ${i.packText ? `<div style="margin-top:2px;font-size:12.5px;color:#64748b;">${esc(i.packText)}</div>` : ""}
+      <div style="margin-top:6px;font-size:13px;color:#334155;">Amount: <strong>${esc(inrMail(i.lineTotal))}</strong> <span style="color:#94a3b8;">(incl. GST)</span></div>
+    </div>`).join("");
+
+  const html = shell(
+    `New order to dispatch: ${esc(orderNo)}`,
+    `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
+       Hi ${esc(dispatcherName || "there")}, ${salespersonName ? `<strong>${esc(salespersonName)}</strong> just punched` : "a new order was just punched"}
+       ${companyName ? ` for <strong>${esc(companyName)}</strong>` : ""}. Please get it ready for dispatch.
+     </p>
+     <table role="presentation" width="100%" style="margin:0 0 16px;font-size:13px;">
+       ${row("Order number", orderNo)}${row("PO number", poNumber)}${row("Placed on", placedOn)}
+     </table>
+     <p style="margin:0 0 6px;font-size:13px;font-weight:700;color:#0f172a;">Customer</p>
+     <table role="presentation" width="100%" style="margin:0 0 16px;font-size:13px;">
+       ${row("Name", customer.name)}${row("GSTIN", customer.gstin)}${row("Address", customer.address)}${row("Mobile", customer.phone)}${row("Email", customer.email)}
+     </table>
+     <p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#0f172a;">Items</p>
+     ${rows}
+     <table role="presentation" width="100%" style="margin-top:6px;border-top:1px solid #e5eaee;">
+       <tr><td style="padding:10px 0 0;font-size:15px;font-weight:800;color:#0f172a;">Order total (incl. GST)</td>
+           <td align="right" style="padding:10px 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(inrMail(total))}</td></tr>
+     </table>
+     ${notes ? `<p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;"><strong>Order notes:</strong> ${esc(notes)}</p>` : ""}
+     ${link ? `<a href="${esc(link)}" style="display:inline-block;margin-top:14px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">Open order</a>` : ""}`,
+    "You're receiving this because you are listed as a dispatcher for this company on BBM Marketplace.",
+    { beta: false }
+  );
+  const clean = (v) => String(v || "").replace(/[\r\n]+/g, " ");
+  const result = await resend.emails.send({
+    from: FROM,
+    to,
+    subject: `New order to dispatch ${clean(orderNo)} - ${clean(customer.name || "customer")}`,
+    html,
+  });
+  return throwIfResendError(result);
+}
