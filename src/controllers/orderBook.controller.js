@@ -234,6 +234,27 @@ async function nameMap(rows) {
     return new Map((data || []).filter((p) => p.name).map((p) => [p.id, String(p.name).trim()]));
 }
 
+const GENERIC = new Set(["", "salesperson", "team member", "team", "system"]);
+const isReal = (n) => !!n && !GENERIC.has(String(n).trim().toLowerCase());
+
+// One user's real name from profiles (falls back to what was passed in, if that is a real name).
+async function realName(userId, fallback) {
+    if (userId) {
+        const { data } = await supabase.from("profiles").select("name").eq("id", userId).maybeSingle();
+        if (isReal(data?.name)) return String(data.name).trim().slice(0, 120);
+    }
+    return isReal(fallback) ? String(fallback).trim().slice(0, 120) : String(fallback || "").trim().slice(0, 120);
+}
+
+// Names for many actors at once (event rows).
+async function actorNames(events) {
+    const ids = [...new Set((events || []).map((e) => e.actor_id).filter(Boolean))];
+    if (!ids.length) return new Map();
+    const { data, error } = await supabase.from("profiles").select("id, name").in("id", ids);
+    if (error) { console.error("[order book] actor names failed:", error.message); return new Map(); }
+    return new Map((data || []).filter((p) => isReal(p.name)).map((p) => [p.id, String(p.name).trim()]));
+}
+
 async function listFor(req, res, scope) {
     try {
         res.set("Cache-Control", "no-store");
@@ -286,10 +307,17 @@ async function detailFor(req, res, scope) {
         if (ev.error) throw ev.error;
         const names = await nameMap([row]);
         const d = dtoOf(row, docs);
+        const who = await actorNames(ev.data);
         res.json({
             success: true,
             order: { ...d, salespersonName: names.get(row.salesperson_id) || d.salespersonName },
-            events: (ev.data || []).map(eventDto),
+            events: (ev.data || []).map((e) => {
+                const dto = eventDto(e);
+                const name = who.get(e.actor_id);
+                // the old text said "Order punched by Salesperson": put the real name in
+                const body = name && /^Order punched by /i.test(dto.body || "") ? `Order punched by ${name}` : dto.body;
+                return { ...dto, body, actorName: name || (isReal(dto.actorName) ? dto.actorName : null) };
+            }),
         });
     } catch (e) { oops(res, e); }
 }
@@ -450,6 +478,7 @@ const NOTE = { processed: "is now being processed", shipped: "has been shipped",
 // so two people clicking at once can never double-apply or skip a step.
 async function move(req, res, row, to, { patch = {}, eventBody }) {
     const t = teamScope(req);
+    t.actorName = await realName(t.actorId, t.actorName);
     const now = new Date().toISOString();
     const { data, error } = await supabase.from("order_book_orders")
         .update({ status: to, updated_at: now, last_activity_at: now, [`${to === "processed" ? "processed" : to}_at`]: now, ...patch })
@@ -484,6 +513,7 @@ export async function processOrder(req, res) {
         // The guarded UPDATE in move() means this fires once per order. (row.recipients tells it who to message.)
         if (ok) {
             const t = teamScope(req);
+            t.actorName = await realName(t.actorId, t.actorName);
             notifyOrderProcessed(row, { actorId: null, processedBy: t.actorName })
                 .catch((e) => console.error("[order book] customer notify failed:", e?.message || e));
         }
