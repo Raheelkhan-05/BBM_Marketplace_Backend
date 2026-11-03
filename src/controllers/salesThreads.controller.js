@@ -24,7 +24,8 @@ import { logActivity } from "../services/team.service.js";
 import { pingCustomersChanged } from "../services/salesSync.service.js";
 import { cached, getVer, bumpVer, hashKey } from "../services/cache.service.js";
 import { resolveGstin, addOne } from "./sellerCustomers.controller.js";
-import { fillCustomerContact } from "../services/sellerCustomerContact.service.js";
+import { saveContactsForCustomer } from "../services/sellerCustomerContact.service.js";
+import { parseContact, parseContactList } from "../services/customerContacts.service.js";
 import {
     BUCKET, GSTIN_RE, getSalesActor, str, safeSearch, cleanGstin, cleanPhone, cleanEmail, round4,
     saleUnits, priceLine, listingProblem, listingDescription, productUrl, clipPreview, ping,
@@ -45,6 +46,21 @@ const NO_EXPIRY = "9999-12-31T23:59:59.000Z";
 const validText = (iso) => (new Date(iso).getUTCFullYear() >= 9000 ? "further notice" : fmtDate(iso));
 const VALIDITY = [1, 3, 7, 15, 30];
 const CHANNELS = ["whatsapp", "email"];
+const CONTACTS_MAX = 10;
+const primaryOf = (list) => ({
+    phone: list.find((c) => c.phone)?.phone || null,
+    email: list.find((c) => c.email)?.email || null,
+});
+const rowContacts = (row) => (Array.isArray(row.customer_contacts) ? row.customer_contacts : [])
+    .map((c) => ({ name: c?.name || "", phone: c?.phone || "", email: c?.email || "" }));
+// Who a thread can be quoted to: its saved contacts, or the old single phone / email.
+const targetsOf = (row) => {
+    const l = rowContacts(row).filter((c) => c.phone || c.email);
+    if (l.length) return l;
+    return row.customer_phone || row.customer_email
+        ? [{ name: "", phone: row.customer_phone || "", email: row.customer_email || "" }] : [];
+};
+
 const TS_RE = /^\d{4}-\d{2}-\d{2}T[\d:.]+(Z|[+-]\d{2}(:?\d{2})?)$/;
 const STATUS_FILTERS = ["open", "won", "lost", "reminder", "cold"];
 const KIND_COLD = "cold_call";
@@ -101,13 +117,13 @@ async function canonicalCustomerName({ sellerId, ownerId, gstin }) {
 // Adds the quoted customer to the salesperson's customer list (once), with the contact used on the quotation.
 // A customer who is already in the list but has no phone / email saved gets the contact filled in (never overwritten),
 // so it is pre-filled next time. Never fails the quotation.
-async function ensureCustomer({ sellerId, companyId, actorId, teamId, thread }) {
+async function ensureCustomer({ sellerId, companyId, actorId, teamId, thread, contacts = [] }) {
     try {
         const out = await addOne(sellerId, companyId, thread.customer_gstin, "gst", {
             assigned_to: actorId, assigned_by: actorId, assigned_kind: "self", assigned_at: new Date().toISOString(),
-            contact_name: null, contact_phone: thread.customer_phone || null, contact_email: thread.customer_email || null,
+            contacts,
         });
-        if (out?.result === "added" || out?.result === "saved") {
+        if (out?.result === "added" || out?.result === "invited" || out?.result === "saved") {
             Promise.resolve(pingCustomersChanged(companyId, [actorId])).catch(() => { /* best effort */ });
             try {
                 await logActivity({
@@ -118,11 +134,8 @@ async function ensureCustomer({ sellerId, companyId, actorId, teamId, thread }) 
             } catch { /* best effort */ }
             return { status: "added", name: out.name || "" };
         }
-        // Already in the list: save any contact that was missing.
-        await fillCustomerContact({
-            sellerId, companyId, actorId, gstin: thread.customer_gstin,
-            phone: thread.customer_phone || "", email: thread.customer_email || "",
-        });
+        // Already in the list: add the contacts that aren't saved yet (never overwrites).
+        await saveContactsForCustomer({ sellerId, companyId, actorId, gstin: thread.customer_gstin, contacts });
         return { status: out?.result === "exists" ? "exists" : "skipped", name: "" };
     } catch (e) {
         console.error("[sales threads] add customer failed:", e?.message || e);
@@ -376,11 +389,21 @@ export async function createThread(req, res) {
         if (gstin && !GSTIN_RE.test(gstin)) return fail(res, 400, "Enter a valid 15-character GST number, or leave it empty.");
         if (!customerName && !gstin) return fail(res, 400, "Enter the customer's GST number or company name.");
 
-        const phoneRaw = str(b.customerPhone, 20), emailRaw = str(b.customerEmail, 200);
-        const phone = phoneRaw ? cleanPhone(phoneRaw) : "";
-        const email = emailRaw ? cleanEmail(emailRaw) : "";
-        if (phoneRaw && !phone) return fail(res, 400, "Enter a valid 10-digit mobile number.");
-        if (emailRaw && !email) return fail(res, 400, "Enter a valid email address.");
+        // Contacts are optional on an enquiry (a cold call often has none yet); each one needs a mobile number or an email.
+        let contacts = [];
+        if (Array.isArray(b.contacts) && b.contacts.length) {
+            const p = parseContactList(b.contacts, CONTACTS_MAX);
+            if (p.error) return fail(res, 400, p.error);
+            contacts = p.list;
+        } else {
+            const lp = str(b.customerPhone, 20), le = str(b.customerEmail, 200);
+            if (lp || le) {
+                const one = parseContact({ phone: lp, email: le });
+                if (one.error) return fail(res, 400, one.error);
+                contacts = [one];
+            }
+        }
+        const { phone, email } = primaryOf(contacts);
 
         let product = null, productName = null, quantity = null, unit = null, note = "";
         if (cold) {
@@ -410,7 +433,7 @@ export async function createThread(req, res) {
             accept_equivalent: false, images: [], supplier_locations: [],
             payment_terms: "flexible", consumption_type: "one_time",
             customer_name: customerName || null, customer_gstin: gstin || null,
-            customer_phone: phone || null, customer_email: email || null,
+            customer_phone: phone, customer_email: email, customer_contacts: contacts,
             created_by_actor_id: actorId, created_by_actor_name: actorName,
             last_activity_at: now, last_entry_preview: cold ? clipPreview(note, 0) : "Enquiry created",
             ...(cold ? { sales_kind: KIND_COLD } : {}),   // normal enquiries use the column default
@@ -500,15 +523,26 @@ export async function updateThread(req, res) {
             if (g && !GSTIN_RE.test(g)) return fail(res, 400, "Enter a valid 15-character GST number.");
             patch.customer_gstin = g || null;
         }
-        if ("customerPhone" in b) {
-            const raw = str(b.customerPhone, 20), p = raw ? cleanPhone(raw) : "";
-            if (raw && !p) return fail(res, 400, "Enter a valid 10-digit mobile number.");
-            patch.customer_phone = p || null;
-        }
-        if ("customerEmail" in b) {
-            const raw = str(b.customerEmail, 200), e = raw ? cleanEmail(raw) : "";
-            if (raw && !e) return fail(res, 400, "Enter a valid email address.");
-            patch.customer_email = e || null;
+        let newContacts = null;
+        if ("contacts" in b) {
+            const p = parseContactList(Array.isArray(b.contacts) ? b.contacts : [], CONTACTS_MAX);
+            if (p.error) return fail(res, 400, p.error);
+            newContacts = p.list;
+            const pr = primaryOf(newContacts);
+            patch.customer_contacts = newContacts;
+            patch.customer_phone = pr.phone;
+            patch.customer_email = pr.email;
+        } else {
+            if ("customerPhone" in b) {
+                const raw = str(b.customerPhone, 20), p = raw ? cleanPhone(raw) : "";
+                if (raw && !p) return fail(res, 400, "Enter a valid 10-digit mobile number.");
+                patch.customer_phone = p || null;
+            }
+            if ("customerEmail" in b) {
+                const raw = str(b.customerEmail, 200), e = raw ? cleanEmail(raw) : "";
+                if (raw && !e) return fail(res, 400, "Enter a valid email address.");
+                patch.customer_email = e || null;
+            }
         }
         if (!Object.keys(patch).length) return fail(res, 400, "Nothing to update.");
 
@@ -524,6 +558,11 @@ export async function updateThread(req, res) {
 
         const { data, error } = await supabase.from("rfq_enquiries").update(patch).eq("id", row.id).select("*").single();
         if (error) throw error;
+        // the customer is already in the list: keep their saved contacts in step (adds only, never overwrites)
+        if (newContacts?.length && data.customer_gstin && sellerId) {
+            Promise.resolve(saveContactsForCustomer({ sellerId, companyId: ownerId, actorId, gstin: data.customer_gstin, contacts: newContacts }))
+                .catch(() => { /* best effort */ });
+        }
         await notify(ownerId, actorId, row.id);
         res.json({ success: true, thread: dtoOf(data) });
     } catch (e) { oops(res, e); }
@@ -762,40 +801,50 @@ export async function listQuoteProducts(req, res) {
 // ---- delivery ------------------------------------------------------------------------------------------
 // Sends the quotation to the customer on the chosen channels, then (fire-and-forget) sends the salesperson their own
 // "your copy" record with the delivery result per channel. `resend` only changes the wording of that copy.
-async function deliver({ quote, thread, sellerName, actorId, actorName, actorEmail, channels, resend = false }) {
+async function deliver({ quote, thread, targets, sellerName, actorId, actorName, actorEmail, channels, resend = false, only = {} }) {
     const items = quote.items;
     const out = {};
-    const run = async (channel, fn) => {
-        try { out[channel] = await fn(); }
-        catch (e) { out[channel] = { status: "failed", error: errText(e), at: new Date().toISOString() }; }
+    const keyOf = { whatsapp: "phone", email: "email" };
+
+    // one channel, every contact that has the address for it. A retry goes only to the ones that failed before.
+    const run = async (channel, one) => {
+        const key = keyOf[channel];
+        const again = only[channel]?.failedTo;
+        const list = targets.filter((t) => t[key] && (!again?.length || again.includes(t[key])));
+        if (!list.length) return;
+        const at = new Date().toISOString();
+        const res = await Promise.all(list.map(async (t) => {
+            try { await one(t); return { ok: true }; }
+            catch (e) { return { ok: false, to: t[key], error: errText(e) }; }
+        }));
+        const bad = res.filter((r) => !r.ok);
+        out[channel] = bad.length
+            ? { status: "failed", error: bad[0].error, failedTo: bad.map((r) => r.to), sent: list.length - bad.length, total: list.length, at }
+            : { status: "sent", sent: list.length, total: list.length, at };
     };
+
     const tasks = [];
-    if (channels.includes("whatsapp")) tasks.push(run("whatsapp", async () => {
+    if (channels.includes("whatsapp")) tasks.push(run("whatsapp", async (t) => {
         const r = await sendSalesQuotationWhatsApp({
-            to: thread.customer_phone,
-            customerName: thread.customer_name || "there",
+            to: t.phone,
+            customerName: t.name || thread.customer_name || "there",
             sellerName, enquiryProduct: thread.product_name,
             itemsLine: whatsappItemsLine(items),
             total: inr(quote.total), validUntil: validText(quote.valid_until),
             closing: quote.note || "Please get in touch with us to confirm your order.",
         });
-        return r.success
-            ? { status: "sent", at: new Date().toISOString() }
-            : { status: "failed", error: r.skipped ? "WhatsApp isn't configured or the number is invalid." : errText(r.error), at: new Date().toISOString() };
+        if (!r.success) throw new Error(r.skipped ? "WhatsApp isn't configured or the number is invalid." : errText(r.error));
     }));
-    if (channels.includes("email")) tasks.push(run("email", async () => {
+    if (channels.includes("email")) tasks.push(run("email", async (t) => {
         await sendSalesQuotationEmail({
-            to: thread.customer_email, customerName: thread.customer_name || "there",
+            to: t.email, customerName: t.name || thread.customer_name || "there",
             sellerName, salespersonName: actorName, enquiryProduct: thread.product_name,
             items, subtotal: quote.subtotal, gstAmount: quote.gst_amount, total: quote.total,
             validUntil: validText(quote.valid_until), note: quote.note || "", replyTo: actorEmail || undefined,
         });
-        return { status: "sent", at: new Date().toISOString() };
     }));
     await Promise.all(tasks);
 
-    // Salesperson's copy: fire-and-forget so it never delays the response or breaks the quotation.
-    // It is queued after the customer's message, so the customer's WhatsApp always goes first.
     void (async () => {
         const me = await loadSalesperson(actorId);
         const salesperson = me
@@ -805,9 +854,8 @@ async function deliver({ quote, thread, sellerName, actorId, actorName, actorEma
             salesperson,
             title: resend ? "Quotation resent" : "Quotation sent",
             customerName: thread.customer_name,
-            // Only list the contact channels actually used for this send.
-            customerPhone: channels.includes("whatsapp") ? thread.customer_phone : "",
-            customerEmail: channels.includes("email") ? thread.customer_email : "",
+            customerPhone: channels.includes("whatsapp") ? targets.map((t) => t.phone).filter(Boolean).join(", ") : "",
+            customerEmail: channels.includes("email") ? targets.map((t) => t.email).filter(Boolean).join(", ") : "",
             facts: [
                 ["Enquiry", thread.product_name],
                 ["Valid until", validText(quote.valid_until)],
@@ -819,10 +867,7 @@ async function deliver({ quote, thread, sellerName, actorId, actorName, actorEma
                 amount: inr(i.totalIncl),
             })),
             total: inr(quote.total),
-            delivery: Object.entries(out).map(([ch, d]) => ({
-                channel: ch === "whatsapp" ? "WhatsApp" : "Email",
-                ok: d.status === "sent",
-            })),
+            delivery: Object.entries(out).map(([ch, d]) => ({ channel: ch === "whatsapp" ? "WhatsApp" : "Email", ok: d.status === "sent" })),
             note: Object.values(out).some((d) => d.status !== "sent")
                 ? "Some channels failed. Retry them from the enquiry thread."
                 : channels.includes("email")
@@ -863,9 +908,15 @@ export async function sendQuote(req, res) {
 
         const b = req.body || {};
         if (!loaded.customer_gstin) return fail(res, 400, "Add the customer's GST number before sending a quotation.");
-        const channels = cleanChannels(b.channels);
-        const contactErr = contactCheck(loaded, channels);
-        if (contactErr) return fail(res, 400, contactErr);
+        // Who gets it: the contacts ticked in the sheet (else the thread's saved contacts).
+        let targets;
+        if (Array.isArray(b.recipients) && b.recipients.length) {
+            const p = parseContactList(b.recipients, CONTACTS_MAX);
+            if (p.error) return fail(res, 400, p.error);
+            targets = p.list;
+        } else targets = targetsOf(loaded);
+        if (!targets.length) return fail(res, 400, "Choose at least one contact (a mobile number or an email) to send the quotation to.");
+        const channels = CHANNELS.filter((c) => targets.some((t) => (c === "whatsapp" ? t.phone : t.email)));
 
         const validityDays = VALIDITY.includes(Number(b.validityDays)) ? Number(b.validityDays) : 7;
         const raw = Array.isArray(b.items) ? b.items : [];
@@ -904,7 +955,8 @@ export async function sendQuote(req, res) {
         // Make sure the customer is in the customer list. addOne also resolves the official company name from the GST number,
         // which then replaces whatever was typed (so the quotation and the thread carry the reliable name).
         const companyId = req.sales?.companyId ?? ownerId;
-        const ensured = await ensureCustomer({ sellerId, companyId, actorId, teamId: req.sales?.teamId, thread: loaded });
+        const saveList = parseContactList([...rowContacts(loaded), ...targets]).list;
+        const ensured = await ensureCustomer({ sellerId, companyId, actorId, teamId: req.sales?.teamId, thread: loaded, contacts: saveList });
         let thread = loaded;   // a copy: the loaded row may come from the shared cache and must not be mutated
         if (ensured.name && ensured.name !== loaded.customer_name) {
             thread = { ...loaded, customer_name: ensured.name };
@@ -918,7 +970,7 @@ export async function sendQuote(req, res) {
         const { data: quote, error: qErr } = await supabase.from("sales_quotes").insert({
             enquiry_id: thread.id, seller_id: sellerId, actor_id: actorId, actor_name: actorName,
             customer_name: thread.customer_name, customer_gstin: thread.customer_gstin,
-            customer_phone: thread.customer_phone, customer_email: thread.customer_email,
+            customer_phone: primaryOf(targets).phone, customer_email: primaryOf(targets).email, recipients: targets,
             items, subtotal: Math.round(subtotal * 100) / 100, total: Math.round(total * 100) / 100,
             gst_amount: Math.round((total - subtotal) * 100) / 100,
             note: str(b.note, 500) || null, validity_days: validityDays, valid_until: validUntil, channels,
@@ -954,7 +1006,7 @@ export async function sendQuote(req, res) {
         }).select("*").single();
         if (eErr) throw eErr;
 
-        const delivery = await deliver({ quote, thread, sellerName: await sellerNameOf(sellerId), actorId, actorName, actorEmail, channels });
+        const delivery = await deliver({ quote, thread, targets, sellerName: await sellerNameOf(sellerId), actorId, actorName, actorEmail, channels });
         const { data: done } = await supabase.from("sales_quotes").update({ delivery }).eq("id", quote.id).select("*").single();
         await touch(thread.id, `Quotation sent · ${inr(quote.total)}`);
         await notify(ownerId, actorId, thread.id);
@@ -983,10 +1035,17 @@ export async function resendQuote(req, res) {
         if (new Date(quote.valid_until).getTime() <= Date.now()) return fail(res, 409, "This quotation has expired. Send a new one.");
 
         const channels = cleanChannels(req.body?.channels);
-        const contactErr = contactCheck(thread, channels);
-        if (contactErr) return fail(res, 400, contactErr);
+        if (!channels.length) return fail(res, 400, "Choose WhatsApp, email or both.");
+        const targets = Array.isArray(quote.recipients) && quote.recipients.length
+            ? quote.recipients.map((c) => ({ name: c?.name || "", phone: c?.phone || "", email: c?.email || "" }))
+            : targetsOf(thread);
+        const lacking = channels.find((c) => !targets.some((t) => (c === "whatsapp" ? t.phone : t.email)));
+        if (lacking) return fail(res, 400, lacking === "whatsapp" ? "No contact on this quotation has a mobile number." : "No contact on this quotation has an email address.");
 
-        const sent = await deliver({ quote, thread, sellerName: await sellerNameOf(sellerId), actorId, actorName, actorEmail, channels, resend: true });
+        const sent = await deliver({
+            quote, thread, targets, sellerName: await sellerNameOf(sellerId), actorId, actorName, actorEmail,
+            channels, resend: true, only: quote.delivery || {},
+        });
         const delivery = { ...(quote.delivery || {}), ...sent };
         const merged = [...new Set([...(quote.channels || []), ...channels])];
         const { data: upd, error: uErr } = await supabase.from("sales_quotes").update({ delivery, channels: merged }).eq("id", quote.id).select("*").single();

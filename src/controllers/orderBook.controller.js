@@ -2,13 +2,14 @@
 // ORDER BOOK: a standalone CRM log. A salesperson punches an order taken for a customer; the company's team
 // (admin / members) then moves it  placed -> processed -> shipped (LR + bill, both optional) -> completed.
 // It never touches the marketplace orders, wallet or stock. Prices on the order are logged as entered, but, exactly like a
-// quotation, the catalog prices also become the customer's custom price (by GST number): set at once when the customer is
-// on BBM, and applied automatically when they join with that GST number. The salesperson can switch this off per order.
+// quotation, the catalog prices also become the customer's custom price (by GST number): set at once when the customer
+// is on BBM, and applied automatically when they join with that GST number. The salesperson can switch this off per order.
 // Catalog products are ordered in whole packs or master packs (never single units).
-// The customer must have a mobile number or an email, and the buyer address is filled from the GST number (editable).
-// Contact details typed while punching an order are saved on the customer, so they are pre-filled next time.
+// RECIPIENTS: the salesperson chooses WHICH of the customer's contacts get the order updates (at least one, each with a
+// mobile number and/or an email). They are stored on the order (order_book_orders.recipients) and every one of them is
+// messaged when the order is placed and when it is processed. Contacts typed here are saved on the customer too.
+// The buyer address is filled from the GST number (editable) and is also saved on the customer when it has none.
 // An optional Purchase Order (PO) number can be added to an order; it is searchable in the Order Book.
-// When an order is marked processed, the customer is thanked by email / WhatsApp on behalf of the company.
 import multer from "multer";
 import { supabase, supabaseAdmin } from "../config/supabase.js";
 import { isUuid, RFQ_UNITS } from "../services/rfqValidation.js";
@@ -17,18 +18,20 @@ import { validateGSTIN, fetchGstinDetails } from "../services/gst.service.js";
 import { logActivity, getTeamContext } from "../services/team.service.js";
 import { pingCustomersChanged } from "../services/salesSync.service.js";
 import { notifyUser } from "../services/realtimeBroadcast.js";
-import { getSalesActor, str, safeSearch, cleanGstin, cleanPhone, cleanEmail, round2, GSTIN_RE } from "../services/salesThreads.service.js";
+import { getSalesActor, str, safeSearch, cleanGstin, round2, GSTIN_RE } from "../services/salesThreads.service.js";
 import { BUCKET, STATUSES, LIST_COLS, orderDto, eventDto, signDocs, broadcast } from "../services/orderBook.service.js";
 import { notifyOrderProcessed, notifyOrderPlaced } from "../services/orderBookNotify.service.js";
 import { productDetails } from "../services/orderBookProduct.service.js";
-import { fillCustomerContact } from "../services/sellerCustomerContact.service.js";
+import { saveContactsForCustomer } from "../services/sellerCustomerContact.service.js";
+import { parseContact, parseContactList } from "../services/customerContacts.service.js";
 import { applyOrderCustomPrices } from "../services/salesQuotePricing.service.js";
 import { notifyDispatchersOrderPlaced } from "../services/dispatcherNotify.service.js";
 import { loadSalesperson } from "../services/salespersonCopy.service.js";
 
 const MAX_LINES = 20;
+const MAX_RECIPIENTS = 10;
 const NO_SELLER = "Your company's seller account isn't approved yet, so products can't be added.";
-const NO_CONTACT = "Add the customer's mobile number or email (at least one) so they can receive their order updates.";
+const NO_CONTACT = "Choose at least one contact (a mobile number or an email) to send the order updates to.";
 const SUB_SELECT = "*, hs_generic_product_brands!inner(id, name, brand_name, image, images, description, manufacturer, model_no, specifications, deleted_at)";
 const ALLOWED_EXT = new Set(["jpg", "jpeg", "png", "webp", "gif", "heic", "pdf", "doc", "docx", "xls", "xlsx", "csv", "txt"]);
 const PINCODE_RE = /^\d{6}$/;
@@ -39,8 +42,12 @@ const fail = (res, status, message) => res.status(status).json({ success: false,
 const oops = (res, e) => { console.error("[order book]", e?.message || e); return fail(res, 500, "Something went wrong. Please try again."); };
 const flatSub = ({ hs_generic_product_brands, ...rest }) => ({ ...rest, brand: hs_generic_product_brands || null });
 
-// The shared orderDto plus the optional PO number (column order_book_orders.po_number).
-const dtoOf = (row, docs) => ({ ...orderDto(row, docs), poNumber: row?.po_number || null });
+// The shared orderDto plus the optional PO number and who the updates go to.
+const dtoOf = (row, docs) => ({
+    ...orderDto(row, docs),
+    poNumber: row?.po_number || null,
+    recipients: Array.isArray(row?.recipients) ? row.recipients : [],
+});
 
 /* ------------------------------ who is calling ------------------------------ */
 function salesScope(req) {
@@ -81,25 +88,25 @@ async function canonicalCustomerName({ sellerId, companyId, gstin }) {
     return "";
 }
 
-// Keeps the customer in the salesperson's customer list, WITH the contact details used on the order. Never fails the order.
-//  - new customer (GST number given): added with the contact.
-//  - customer already in the list (picked, or the same GST typed again): any EMPTY phone / email is filled in,
-//    so the contact is pre-filled the next time. Saved details are never overwritten.
-async function ensureCustomer({ s, customerId, gstin, phone, email }) {
+// Keeps the customer in the salesperson's customer list, WITH the contacts used on the order. Never fails the order.
+//  - new customer (GST number given): added with all the contacts and the address.
+//  - customer already in the list (picked, or the same GST typed again): contacts that are not saved yet are ADDED next to
+//    the existing ones (the same number / email is never saved twice), and an empty address is filled in.
+async function ensureCustomer({ s, customerId, gstin, contacts, address }) {
     try {
         let result = null;
         if (gstin) {
             const out = await addOne(s.sellerId, s.companyId, gstin, "gst", {
                 assigned_to: s.actorId, assigned_by: s.actorId, assigned_kind: "self", assigned_at: new Date().toISOString(),
-                contact_name: null, contact_phone: phone || null, contact_email: email || null,
+                contacts, addr: address,
             });
             result = out?.result || null;
-            if (result === "added" || result === "saved") {
+            if (result === "added" || result === "invited") {
                 Promise.resolve(pingCustomersChanged(s.companyId, [s.actorId])).catch(() => { /* best effort */ });
             }
         }
-        if (result !== "added" && result !== "saved") {
-            await fillCustomerContact({ sellerId: s.sellerId, companyId: s.companyId, actorId: s.actorId, customerId, gstin, phone, email });
+        if (result !== "added" && result !== "invited") {
+            await saveContactsForCustomer({ sellerId: s.sellerId, companyId: s.companyId, actorId: s.actorId, customerId, gstin, contacts, address });
         }
     } catch (e) { console.error("[order book] add customer failed:", e?.message || e); }
 }
@@ -292,11 +299,13 @@ export const listMine = (req, res) => listFor(req, res, salesScope(req));
 export const getMine = (req, res) => detailFor(req, res, salesScope(req));
 
 // POST /api/sales/order-book
-// { customerId?, customerGstin?, customerName?, customerPhone?, customerEmail?, customerAddress?, customerCity?, customerState?, customerPincode?,
+// { customerId?, customerGstin?, customerName?, customerAddress?, customerCity?, customerState?, customerPincode?,
+//   recipients: [{ name?, phone?, email? }]   the contacts who get the order updates (at least one),
+//   contacts?:   [{ name?, phone?, email? }]   more new contacts to save on the customer (no updates),
 //   poNumber?, setCustomPrices? (default true),
 //   items:[{productSubmissionId, basis:"per_pack"|"per_master_pack", quantity, unitPrice} | {productName, unit, quantity, unitPrice}], notes? }
-// The customer needs at least a mobile number or an email, so they can be told when the order is processed.
-// customerId is the picked customer's row id (so their contact can be saved even when they have no GST number).
+// The old customerPhone / customerEmail fields still work and become a single recipient.
+// customerId is the picked customer's row id (so contacts can be saved even when they have no GST number).
 // With a GST number, the catalog prices also become the customer's BBM prices (see applyOrderCustomPrices).
 export async function createOrder(req, res) {
     try {
@@ -310,11 +319,28 @@ export async function createOrder(req, res) {
         const gstin = cleanGstin(b.customerGstin);
         if (gstin && !GSTIN_RE.test(gstin)) return fail(res, 400, "Enter a valid 15-character GST number, or leave it empty.");
         if (!customerName && !gstin) return fail(res, 400, "Enter the customer's GST number or company name.");
-        const phoneRaw = str(b.customerPhone, 20), emailRaw = str(b.customerEmail, 200);
-        const phone = phoneRaw ? cleanPhone(phoneRaw) : "", email = emailRaw ? cleanEmail(emailRaw) : "";
-        if (phoneRaw && !phone) return fail(res, 400, "Enter a valid 10-digit mobile number.");
-        if (emailRaw && !email) return fail(res, 400, "Enter a valid email address.");
-        if (!phone && !email) return fail(res, 400, NO_CONTACT);
+
+        // Who gets the order updates.
+        let recipients = [];
+        if (Array.isArray(b.recipients) && b.recipients.length) {
+            const rp = parseContactList(b.recipients, MAX_RECIPIENTS);
+            if (rp.error) return fail(res, 400, rp.error);
+            recipients = rp.list;
+        } else if (str(b.customerPhone, 20) || str(b.customerEmail, 200)) {
+            const one = parseContact({ name: b.customerContactName, phone: b.customerPhone, email: b.customerEmail });
+            if (one.error) return fail(res, 400, one.error);
+            recipients = [one];
+        }
+        if (!recipients.length) return fail(res, 400, NO_CONTACT);
+        if (recipients.length > MAX_RECIPIENTS) return fail(res, 400, `You can send updates to up to ${MAX_RECIPIENTS} contacts.`);
+
+        // Everything to remember on the customer = the recipients + any other new contacts typed.
+        const more = parseContactList([...(Array.isArray(b.contacts) ? b.contacts : []), ...recipients]);
+        if (more.error) return fail(res, 400, more.error);
+        const toSave = more.list;
+
+        const phone = recipients.find((r) => r.phone)?.phone || "";
+        const email = recipients.find((r) => r.email)?.email || "";
 
         const customerId = isUuid(b.customerId) ? String(b.customerId) : "";
         const poNumber = str(b.poNumber, 60);
@@ -339,6 +365,7 @@ export async function createOrder(req, res) {
         const { data: row, error } = await supabase.from("order_book_orders").insert({
             company_id: s.companyId, seller_id: s.sellerId, salesperson_id: s.actorId, salesperson_name: s.actorName,
             customer_name: customerName, customer_gstin: gstin || null, customer_phone: phone || null, customer_email: email || null,
+            recipients,
             customer_address: address || null, customer_city: city || null, customer_state: stateName || null, customer_pincode: pincode || null,
             po_number: poNumber || null,
             items, total_amount: total, notes: str(b.notes, 1000) || null,
@@ -355,8 +382,8 @@ export async function createOrder(req, res) {
             order_id: row.id, actor_id: s.actorId, actor_name: s.actorName, kind: "created",
             body: `Order punched by ${s.actorName}`,
         });
-        // Not awaited by the response path's critical work, but started before it so the contact is saved right away.
-        ensureCustomer({ s, customerId, gstin, phone, email });
+        // Started before the slow steps below so the contacts and address are saved right away.
+        ensureCustomer({ s, customerId, gstin, contacts: toSave, address: { address, city, state: stateName, pincode } });
 
         try {
             await logActivity({
@@ -384,7 +411,7 @@ export async function createOrder(req, res) {
             body: `${s.actorName} punched an order for ${customerName}.`, link: `/sell/order-book/${row.id}`,
         }).catch(() => { /* best effort */ });
 
-        // Greet the customer: order received + order and billing details (email / WhatsApp). After the response path, never blocks it.
+        // Greet the chosen contacts: order received + order and billing details (email / WhatsApp). Never blocks the response.
         notifyOrderPlaced(row).catch((e) => console.error("[order book] order-placed notify failed:", e?.message || e));
         // Alert every active dispatcher (WhatsApp and/or email). Never blocks the response.
         notifyDispatchersOrderPlaced(row, { salespersonName: s.actorName })
@@ -453,9 +480,8 @@ export async function processOrder(req, res) {
         const row = await loadTeamRow(req, res); if (!row) return;
         if (row.status !== "placed") return fail(res, 409, "Only a placed order can be marked as processed.");
         const ok = await move(req, res, row, "processed", { eventBody: "Order marked as processed" });
-        // Thank the customer by email / WhatsApp. Runs after the response, so it never slows or breaks the step.
-        // The guarded UPDATE in move() means this fires once per order.
-        // controllers/orderBook.controller.js, processOrder
+        // Thank the chosen contacts by email / WhatsApp. Runs after the response, so it never slows or breaks the step.
+        // The guarded UPDATE in move() means this fires once per order. (row.recipients tells it who to message.)
         if (ok) {
             const t = teamScope(req);
             notifyOrderProcessed(row, { actorId: null, processedBy: t.actorName })

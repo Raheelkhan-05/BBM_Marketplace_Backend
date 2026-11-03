@@ -4,6 +4,7 @@ import { supabase, supabaseAdmin } from "../config/supabase.js";
 import { validateGSTIN, fetchGstinDetails } from "../services/gst.service.js";
 import { getTeamContext, logActivity } from "../services/team.service.js";
 import { pingCustomersChanged } from "../services/salesSync.service.js";
+import { loadContacts, contactDto, saveContacts, cleanAddress, addressText } from "../services/customerContacts.service.js";
 
 const MAX_BULK = 100;
 const isUuid = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
@@ -23,6 +24,7 @@ async function sellerUserIdOf(sellerId) {
     return data?.user_id || null;
 }
 
+// Returns { state, gstin, name, location, addr } - addr = { address, city, state, pincode } (full registered address).
 export async function resolveGstin(raw, sellerUserId) {
     const v = validateGSTIN(raw);
     const typed = String(raw || "").trim().toUpperCase();
@@ -31,7 +33,7 @@ export async function resolveGstin(raw, sellerUserId) {
 
     const { data: bp, error } = await supabaseAdmin
         .from("business_profiles")
-        .select("user_id, gstin, legal_name, trade_name, display_name, district, state, profiles!inner(id, role, deleted_at)")
+        .select("user_id, gstin, legal_name, trade_name, display_name, registered_address, district, state, pincode, profiles!inner(id, role, deleted_at)")
         .eq("gstin", gstin)
         .is("profiles.deleted_at", null)
         .eq("profiles.role", "user")
@@ -40,14 +42,19 @@ export async function resolveGstin(raw, sellerUserId) {
 
     if (bp) {
         if (bp.user_id === sellerUserId) return { state: "self", gstin, message: "This is your own business." };
-        return { state: "registered", gstin, userId: bp.user_id, name: nameOf(bp) || "Buyer", location: placeOf(bp) };
+        return {
+            state: "registered", gstin, userId: bp.user_id, name: nameOf(bp) || "Buyer", location: placeOf(bp),
+            addr: cleanAddress({ address: bp.registered_address, city: bp.district, state: bp.state, pincode: bp.pincode }),
+        };
     }
     const g = await fetchGstinDetails(gstin);
     if (!g?.mapped) return { state: "invalid", gstin, message: g?.reason || "We couldn't verify this GST number." };
+    const m = g.mapped;
     return {
         state: "unregistered", gstin,
-        name: g.mapped.trade_name || g.mapped.legal_name || gstin,
-        location: [g.mapped.district, g.mapped.state].filter(Boolean).join(", ") || null,
+        name: m.trade_name || m.legal_name || gstin,
+        location: [m.district, m.state].filter(Boolean).join(", ") || null,
+        addr: cleanAddress({ address: m.registered_address, city: m.district, state: m.state, pincode: m.pincode }),
     };
 }
 
@@ -67,8 +74,12 @@ async function pool(items, n, fn) {
     return out;
 }
 
-// `extra` = extra columns for the new row (assignment + contact when a salesperson adds).
+// `extra` = extra columns for the new row (assignment) plus, optionally:
+//   contacts : [{ name?, phone?, email? }]            - saved as the customer's contacts (first = primary)
+//   contact_name / contact_phone / contact_email      - old single-contact form, still accepted
+//   addr     : { address, city, state, pincode }      - overrides the address fetched from the GST number
 export async function addOne(sellerId, sellerUserId, rawGstin, source, extra = {}) {
+    const { contacts, contact_name, contact_phone, contact_email, addr: addrIn, ...rest } = extra;
     const r = await resolveGstin(rawGstin, sellerUserId);
     if (r.state === "invalid" || r.state === "self") return { gstin: r.gstin, result: r.state, message: r.message };
 
@@ -77,29 +88,65 @@ export async function addOne(sellerId, sellerUserId, rawGstin, source, extra = {
         return { gstin: r.gstin, name: r.name, result: "exists", assignedTo: existing.assigned_to || null, customer: { id: existing.id }, message: "Already in your customers." };
     }
 
+    const addr = { ...(r.addr || {}) };
+    const typed = cleanAddress(addrIn);
+    for (const k of ["address", "city", "state", "pincode"]) if (typed[k]) addr[k] = typed[k];
+
     const { data, error } = await supabase.from("seller_customers").insert({
         seller_id: sellerId,
         customer_user_id: r.state === "registered" ? r.userId : null,
         gstin: r.gstin, business_name: r.name, location: r.location, source,
-        ...extra,
+        address: addr.address || null, city: addr.city || null, state: addr.state || null, pincode: addr.pincode || null,
+        ...rest,
     }).select("id, business_name, gstin, customer_user_id").single();
     if (error) {
         if (error.code === "23505") return { gstin: r.gstin, name: r.name, result: "exists", message: "Already in your customers." };
         console.error("[customers] insert failed:", error.message);
         return { gstin: r.gstin, name: r.name, result: "error", message: "Couldn't save this customer." };
     }
+
+    const list = Array.isArray(contacts) ? contacts
+        : contact_phone || contact_email ? [{ name: contact_name || "", phone: contact_phone || "", email: contact_email || "" }] : [];
+    if (list.length) {
+        try { await saveContacts(sellerId, data.id, rest.assigned_by || rest.assigned_to || null, list); }
+        catch (e) { console.error("[customers] contacts save failed:", e?.message || e); }
+    }
+
     return {
-        gstin: r.gstin, name: r.name, location: r.location,
+        gstin: r.gstin, name: r.name, location: r.location, addr,
         userId: data.customer_user_id || null,
         result: r.state === "registered" ? "added" : "invited",
         customer: { id: data.id, name: data.business_name, gstin: data.gstin },
     };
 }
 
+// Customers saved before addresses existed: fetch the address in the background (a few per request, each tried once
+// per server run), save it, and tell the open pages to refresh. Never blocks or fails the response.
+const triedAddr = new Set();
+export function backfillAddresses({ sellerId, companyId, rows, pingIds = [], max = 4 }) {
+    const todo = (rows || []).filter((r) => r.gstin && !r.address && !triedAddr.has(r.id)).slice(0, max);
+    if (!todo.length) return;
+    if (triedAddr.size > 5000) triedAddr.clear();
+    todo.forEach((r) => triedAddr.add(r.id));
+    (async () => {
+        let saved = 0;
+        for (const r of todo) {
+            const g = await resolveGstin(r.gstin, companyId);
+            const a = g?.addr;
+            if (!a?.address) continue;
+            const patch = Object.fromEntries(Object.entries(a).filter(([, v]) => v));
+            const { error } = await supabase.from("seller_customers").update(patch).eq("id", r.id).eq("seller_id", sellerId).is("address", null);
+            if (!error) saved++;
+        }
+        if (saved) await pingCustomersChanged(companyId, pingIds);
+    })().catch((e) => console.error("[customers] address backfill failed:", e?.message || e));
+}
+
 // asg = { names: Map } only for admins. Everyone else never receives assignment data.
-function toDto(row, profile, stats, asg) {
+function toDto(row, profile, stats, asg, extra = {}) {
     const ordered = Number(stats?.orders_count || 0) > 0;
     const registered = !!row.customer_user_id;
+    const a = extra.addr || {};
     const dto = {
         id: row.id,
         userId: row.customer_user_id || null,
@@ -107,6 +154,8 @@ function toDto(row, profile, stats, asg) {
         name: row.business_name,
         gstin: row.gstin || null,
         location: row.location || null,
+        address: a.address || null, city: a.city || null, state: a.state || null, pincode: a.pincode || null,
+        addressLine: addressText({ ...a, location: row.location }) || null,
         source: row.source,
         invitedAt: row.invited_at,
         addedAt: row.created_at,
@@ -132,6 +181,7 @@ function toDto(row, profile, stats, asg) {
             kind: row.assigned_kind === "self" ? "self" : "admin",
             at: row.assigned_at || null,
         } : null;
+        dto.contacts = (extra.contacts || []).map(contactDto);
         if (row.contact_name || row.contact_phone || row.contact_email) {
             dto.savedContact = { name: row.contact_name || null, phone: row.contact_phone || null, email: row.contact_email || null };
         }
@@ -171,21 +221,28 @@ export async function listCustomers(req, res) {
         if (error) throw error;
         const rows = data || [];
 
+        const ids = rows.map((r) => r.id);
         const userIds = rows.map((r) => r.customer_user_id).filter(Boolean);
         const assigneeIds = isAdmin ? [...new Set(rows.map((r) => r.assigned_to).filter(Boolean))] : [];
-        const [profRes, statRes, asgRes] = await Promise.all([
+        const [profRes, statRes, asgRes, addrRes, contactMap] = await Promise.all([
             userIds.length ? supabase.from("profiles").select("id, name, phone, email").in("id", userIds) : Promise.resolve({ data: [] }),
             userIds.length ? supabase.rpc("seller_customer_stats", { p_seller_id: sellerId, p_buyer_ids: userIds }) : Promise.resolve({ data: [] }),
             assigneeIds.length ? supabaseAdmin.from("profiles").select("id, name, email, phone").in("id", assigneeIds) : Promise.resolve({ data: [] }),
+            ids.length ? supabase.from("seller_customers").select("id, gstin, address, city, state, pincode").in("id", ids) : Promise.resolve({ data: [] }),
+            isAdmin ? loadContacts(ids) : Promise.resolve(new Map()),
         ]);
         if (statRes.error) console.error("[customers] stats failed:", statRes.error.message);
         const profById = new Map((profRes.data || []).map((p) => [p.id, p]));
         const statById = new Map((statRes.data || []).map((s) => [s.buyer_id, s]));
+        const addrById = new Map((addrRes.data || []).map((a) => [a.id, a]));
         const asg = isAdmin ? { names: new Map((asgRes.data || []).map((p) => [p.id, p.name || p.email || p.phone])) } : null;
+
+        backfillAddresses({ sellerId, companyId: req.user.id, rows: addrRes.data || [], pingIds: [] });
 
         const body = {
             success: true,
-            items: rows.map((r) => toDto(r, profById.get(r.customer_user_id), statById.get(r.customer_user_id), asg)),
+            items: rows.map((r) => toDto(r, profById.get(r.customer_user_id), statById.get(r.customer_user_id), asg,
+                { addr: addrById.get(r.id), contacts: contactMap.get(r.id) })),
             total: count ?? rows.length,
             hasMore: offset + rows.length < (count ?? 0),
         };
@@ -276,7 +333,10 @@ export async function lookupCustomer(req, res) {
         if (r.state === "registered" || r.state === "unregistered") {
             existing = !!(await findExisting(req.sellerId, { gstin: r.gstin, userId: r.userId }));
         }
-        res.json({ success: true, state: r.state, gstin: r.gstin, name: r.name || null, location: r.location || null, existing, message: r.message || null });
+        res.json({
+            success: true, state: r.state, gstin: r.gstin, name: r.name || null, location: r.location || null,
+            addressLine: r.addr ? addressText({ ...r.addr, location: r.location }) || null : null, existing, message: r.message || null,
+        });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }

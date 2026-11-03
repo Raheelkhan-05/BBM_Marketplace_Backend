@@ -100,6 +100,8 @@ export function threadDto(row, extra = {}) {
         customerGstin: row.customer_gstin || "",
         customerPhone: row.customer_phone || "",
         customerEmail: row.customer_email || "",
+        contacts: (Array.isArray(row.customer_contacts) ? row.customer_contacts : [])
+            .map((c) => ({ name: c?.name || "", phone: c?.phone || "", email: c?.email || "" })),
         displayName: row.customer_name || (row.customer_gstin ? `GSTIN ${row.customer_gstin}` : "Customer"),
         productName: row.product_name || "",
         quantity: row.quantity == null ? null : Number(row.quantity),

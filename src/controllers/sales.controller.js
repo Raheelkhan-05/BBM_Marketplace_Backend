@@ -3,39 +3,29 @@
 import { supabase } from "../config/supabase.js";
 import { logActivity } from "../services/team.service.js";
 import { pingCustomersChanged } from "../services/salesSync.service.js";
-import { resolveGstin, findExisting, addOne } from "./sellerCustomers.controller.js";
+import { isUuid } from "../services/rfqValidation.js";
+import { resolveGstin, findExisting, addOne, backfillAddresses } from "./sellerCustomers.controller.js";
+import {
+    loadContacts, contactDto, parseContact, parseContactList, saveContact, updateContact, deleteContact, addressText, MAX_CONTACTS,
+} from "../services/customerContacts.service.js";
 
-const PHONE_RE = /^[6-9]\d{9}$/;
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const FILTERS = ["active", "invited"];
 const safeSearch = (q) => String(q || "").replace(/[%_,()\\*]/g, " ").trim().slice(0, 80);
-const cleanPhone = (v) => { let d = String(v || "").replace(/\D/g, ""); if (d.length > 10 && d.startsWith("91")) d = d.slice(2, 12); return d; };
 const NOT_READY = { success: true, sellerReady: false, items: [], total: 0, hasMore: false, counts: { all: 0, active: 0, invited: 0 } };
 
-function parseOptional(body) {
-    const name = String(body?.name || "").trim().slice(0, 80) || null;
-    const rawPhone = String(body?.phone || "").trim();
-    const rawEmail = String(body?.email || "").trim().toLowerCase();
-    let phone = null, email = null;
-    if (rawPhone) {
-        phone = cleanPhone(rawPhone);
-        if (!PHONE_RE.test(phone)) return { error: "Enter a valid 10-digit mobile number, or leave it empty." };
-    }
-    if (rawEmail) {
-        if (!EMAIL_RE.test(rawEmail)) return { error: "Enter a valid email address, or leave it empty." };
-        email = rawEmail;
-    }
-    return { name, phone, email };
-}
+const COLS = "id, customer_user_id, gstin, business_name, location, created_at, address, city, state, pincode";
 
-const COLS = "id, customer_user_id, gstin, business_name, location, created_at, contact_name, contact_phone, contact_email";
-const mine = (req) => supabase.from("seller_customers");
-
-function toDto(r, stat) {
+// Old single-contact fields (contactName / phone / email) = the PRIMARY contact, so older screens keep working.
+function toDto(r, stat, contacts = []) {
+    const list = contacts.map(contactDto);
+    const p = list[0] || null;
     return {
         id: r.id, userId: r.customer_user_id || null, status: r.customer_user_id ? "active" : "invited",
-        name: r.business_name, gstin: r.gstin || null, location: r.location || null, addedAt: r.created_at,
-        contactName: r.contact_name || null, phone: r.contact_phone || null, email: r.contact_email || null,
+        name: r.business_name, gstin: r.gstin || null, location: r.location || null,
+        address: r.address || null, city: r.city || null, state: r.state || null, pincode: r.pincode || null,
+        addressLine: addressText(r) || null,
+        addedAt: r.created_at,
+        contacts: list,
+        contactName: p?.name || null, phone: p?.phone || null, email: p?.email || null,
         ordersCount: Number(stat?.orders_count || 0), lastOrderAt: stat?.last_order_at || null,
     };
 }
@@ -53,27 +43,38 @@ const head = (sellerId, actorId) =>
 // GET /api/sales/customers?q=&filter=all|active|invited&limit=&offset=
 export async function listMyCustomers(req, res) {
     try {
-        const { sellerId, actorId } = req.sales;
+        const { sellerId, companyId, actorId } = req.sales;
         if (!sellerId) return res.json(NOT_READY);
         const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 12, 1), 100);
         const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
-        const filter = FILTERS.includes(req.query.filter) ? req.query.filter : "all";
+        const filter = ["active", "invited"].includes(req.query.filter) ? req.query.filter : "all";
         const q = safeSearch(req.query.q);
 
-        let query = mine(req).select(COLS, { count: "exact" }).eq("seller_id", sellerId).eq("assigned_to", actorId);
+        let query = supabase.from("seller_customers").select(COLS, { count: "exact" }).eq("seller_id", sellerId).eq("assigned_to", actorId);
         if (filter === "active") query = query.not("customer_user_id", "is", null);
         if (filter === "invited") query = query.is("customer_user_id", null);
-        if (q) query = query.or(`business_name.ilike.%${q}%,gstin.ilike.%${q}%,contact_name.ilike.%${q}%`);
+        if (q) {
+            // also match any of the customer's contacts (name, mobile, email)
+            const { data: hit } = await supabase.from("seller_customer_contacts").select("customer_id")
+                .eq("seller_id", sellerId).or(`name.ilike.%${q}%,phone.ilike.%${q}%,email.ilike.%${q}%`).limit(300);
+            const ids = [...new Set((hit || []).map((h) => h.customer_id))];
+            query = query.or(`business_name.ilike.%${q}%,gstin.ilike.%${q}%${ids.length ? `,id.in.(${ids.join(",")})` : ""}`);
+        }
         const { data, count, error } = await query
             .order("created_at", { ascending: false }).order("id", { ascending: true })
             .range(offset, offset + limit - 1);
         if (error) throw error;
         const rows = data || [];
 
-        const stats = await statsFor(sellerId, rows.map((r) => r.customer_user_id).filter(Boolean));
+        const [stats, contactMap] = await Promise.all([
+            statsFor(sellerId, rows.map((r) => r.customer_user_id).filter(Boolean)),
+            loadContacts(rows.map((r) => r.id)),
+        ]);
+        backfillAddresses({ sellerId, companyId, rows, pingIds: [actorId] });
+
         const body = {
             success: true, sellerReady: true,
-            items: rows.map((r) => toDto(r, stats.get(r.customer_user_id))),
+            items: rows.map((r) => toDto(r, stats.get(r.customer_user_id), contactMap.get(r.id))),
             total: count ?? rows.length, hasMore: offset + rows.length < (count ?? 0),
         };
         if (offset === 0) {
@@ -102,13 +103,17 @@ export async function getSummary(req, res) {
             supabase.from("seller_customers").select("customer_user_id").eq("seller_id", sellerId).eq("assigned_to", actorId).not("customer_user_id", "is", null).limit(1000),
             supabase.from("seller_customers").select(COLS).eq("seller_id", sellerId).eq("assigned_to", actorId).order("created_at", { ascending: false }).limit(5),
         ]);
-        const stats = await statsFor(sellerId, (ids.data || []).map((r) => r.customer_user_id));
+        const recentRows = recent.data || [];
+        const [stats, contactMap] = await Promise.all([
+            statsFor(sellerId, (ids.data || []).map((r) => r.customer_user_id)),
+            loadContacts(recentRows.map((r) => r.id)),
+        ]);
         let orders = 0; stats.forEach((s) => { orders += Number(s.orders_count || 0); });
 
         res.json({
             success: true, sellerReady: true,
             counts: { all: a.count || 0, active: b.count || 0, invited: c.count || 0, thisMonth: m.count || 0 },
-            orders, recent: (recent.data || []).map((r) => toDto(r, stats.get(r.customer_user_id))),
+            orders, recent: recentRows.map((r) => toDto(r, stats.get(r.customer_user_id), contactMap.get(r.id))),
         });
     } catch (e) {
         console.error("[sales] summary failed:", e?.message || e);
@@ -128,6 +133,7 @@ export async function lookupCustomer(req, res) {
         }
         res.json({
             success: true, state: r.state, gstin: r.gstin, name: r.name || null, location: r.location || null,
+            addressLine: r.addr ? addressText({ ...r.addr, location: r.location }) || null : null,
             existing: !!existing, existingMine: !!existing && existing.assigned_to === actorId, message: r.message || null,
         });
     } catch (e) {
@@ -136,18 +142,22 @@ export async function lookupCustomer(req, res) {
     }
 }
 
-// POST /api/sales/customers { gstin, name?, phone?, email? }
+const hasText = (c) => ["name", "phone", "email"].some((k) => String(c?.[k] || "").trim());
+
+// POST /api/sales/customers { gstin, contacts: [{ name?, phone?, email? }] }   (old form { name, phone, email } still works)
 export async function addCustomer(req, res) {
     try {
         const { sellerId, companyId, actorId, teamId } = req.sales;
         if (!sellerId) return res.status(409).json({ success: false, message: "Your company isn't set up to sell yet." });
-        const c = parseOptional(req.body);
-        if (c.error) return res.status(400).json({ success: false, message: c.error });
-        if (!c.phone && !c.email) return res.status(400).json({ success: false, message: "Enter a mobile number or an email address." });
+
+        const raw = Array.isArray(req.body?.contacts) ? req.body.contacts : [{ name: req.body?.name, phone: req.body?.phone, email: req.body?.email }];
+        const parsed = parseContactList(raw.filter(hasText));
+        if (parsed.error) return res.status(400).json({ success: false, message: parsed.error });
+        if (!parsed.list.length) return res.status(400).json({ success: false, message: "Add at least one contact with a mobile number or an email." });
 
         const out = await addOne(sellerId, companyId, req.body?.gstin, "gst", {
             assigned_to: actorId, assigned_by: actorId, assigned_kind: "self", assigned_at: new Date().toISOString(),
-            contact_name: c.name, contact_phone: c.phone, contact_email: c.email,
+            contacts: parsed.list,
         });
         if (["invalid", "self"].includes(out.result)) return res.status(400).json({ success: false, message: out.message });
         if (out.result === "error") return res.status(500).json({ success: false, message: out.message });
@@ -173,3 +183,70 @@ export async function addCustomer(req, res) {
         res.status(500).json({ success: false, message: "Couldn't add this customer. Try again." });
     }
 }
+
+// ---------------------------------------------------------------- contacts of one customer
+async function ownCustomer(req, res) {
+    const { sellerId, actorId } = req.sales || {};
+    if (!sellerId) { res.status(409).json({ success: false, message: "Your company isn't set up to sell yet." }); return null; }
+    const id = req.params.id;
+    if (!isUuid(id)) { res.status(404).json({ success: false, message: "Customer not found." }); return null; }
+    const { data, error } = await supabase.from("seller_customers").select("id")
+        .eq("id", id).eq("seller_id", sellerId).eq("assigned_to", actorId).maybeSingle();
+    if (error) throw error;
+    if (!data) { res.status(404).json({ success: false, message: "Customer not found." }); return null; }
+    return data;
+}
+
+const contactsOf = async (customerId) => ((await loadContacts([customerId])).get(customerId) || []).map(contactDto);
+const refreshed = (req) => Promise.resolve(pingCustomersChanged(req.sales.companyId, [req.sales.actorId])).catch(() => { /* best effort */ });
+
+// POST /api/sales/customers/:id/contacts { name?, phone?, email?, makePrimary? }
+export async function addCustomerContact(req, res) {
+    try {
+        const own = await ownCustomer(req, res); if (!own) return;
+        const p = parseContact(req.body);
+        if (p.error) return res.status(400).json({ success: false, message: p.error });
+        const out = await saveContact({ sellerId: req.sales.sellerId, customerId: own.id, actorId: req.sales.actorId, contact: p, makePrimary: req.body?.makePrimary === true });
+        if (out.error) return res.status(409).json({ success: false, message: out.error });
+        refreshed(req);
+        res.json({
+            success: true, contact: contactDto(out.contact), contacts: await contactsOf(own.id),
+            message: out.created ? "Contact added." : "This contact was already saved.",
+        });
+    } catch (e) {
+        console.error("[sales] add contact failed:", e?.message || e);
+        res.status(500).json({ success: false, message: "Couldn't save the contact. Try again." });
+    }
+}
+
+// PATCH /api/sales/customers/:id/contacts/:contactId { name?, phone?, email?, isPrimary? }
+export async function updateCustomerContact(req, res) {
+    try {
+        const own = await ownCustomer(req, res); if (!own) return;
+        if (!isUuid(req.params.contactId)) return res.status(404).json({ success: false, message: "Contact not found." });
+        const out = await updateContact({ sellerId: req.sales.sellerId, customerId: own.id, contactId: req.params.contactId, body: req.body || {} });
+        if (out.error) return res.status(out.status || 400).json({ success: false, message: out.error });
+        refreshed(req);
+        res.json({ success: true, contact: contactDto(out.contact), contacts: await contactsOf(own.id), message: "Contact saved." });
+    } catch (e) {
+        console.error("[sales] update contact failed:", e?.message || e);
+        res.status(500).json({ success: false, message: "Couldn't save the contact. Try again." });
+    }
+}
+
+// DELETE /api/sales/customers/:id/contacts/:contactId
+export async function deleteCustomerContact(req, res) {
+    try {
+        const own = await ownCustomer(req, res); if (!own) return;
+        if (!isUuid(req.params.contactId)) return res.status(404).json({ success: false, message: "Contact not found." });
+        const out = await deleteContact({ sellerId: req.sales.sellerId, customerId: own.id, contactId: req.params.contactId });
+        if (out.error) return res.status(out.status || 400).json({ success: false, message: out.error });
+        refreshed(req);
+        res.json({ success: true, contacts: await contactsOf(own.id), message: "Contact removed." });
+    } catch (e) {
+        console.error("[sales] delete contact failed:", e?.message || e);
+        res.status(500).json({ success: false, message: "Couldn't remove the contact. Try again." });
+    }
+}
+
+export { MAX_CONTACTS };
