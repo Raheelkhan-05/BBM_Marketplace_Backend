@@ -26,6 +26,7 @@ import { cached, getVer, bumpVer, hashKey } from "../services/cache.service.js";
 import { resolveGstin, addOne } from "./sellerCustomers.controller.js";
 import { saveContactsForCustomer } from "../services/sellerCustomerContact.service.js";
 import { parseContact, parseContactList } from "../services/customerContacts.service.js";
+import { cleanMentions, afterMessage } from "../services/salesChat.service.js";
 import {
     BUCKET, GSTIN_RE, getSalesActor, str, safeSearch, cleanGstin, cleanPhone, cleanEmail, round4,
     saleUnits, priceLine, listingProblem, listingDescription, productUrl, clipPreview, ping,
@@ -716,14 +717,20 @@ export async function addEntry(req, res) {
         if (attachments === null) return fail(res, 400, "Attachments are invalid.");
         if (!body && !attachments.length) return fail(res, 400, "Write an update or attach a file.");
 
+        const mentions = await cleanMentions(req.body?.mentions, row, actorId);
         const { data, error } = await supabase.from("sales_thread_entries")
-            .insert({ enquiry_id: row.id, author_id: actorId, author_name: actorName, kind: "note", body, attachments })
+            .insert({ enquiry_id: row.id, author_id: actorId, author_name: actorName, kind: "note", body, attachments, mentions })
             .select("*").single();
         if (error) throw error;
         await touch(row.id, clipPreview(body, attachments.length));
         await notify(ownerId, actorId, row.id);
         const [entry] = await hydrateEntries([data]);
         res.json({ success: true, entry });
+        afterMessage({
+            row, companyId: ownerId, entry, senderId: actorId, senderName: actorName,
+            preview: clipPreview(body, attachments.length), touch: false
+        })
+            .catch((e) => console.error("[sales threads] chat fan-out failed:", e?.message || e));
     } catch (e) { oops(res, e); }
 }
 

@@ -140,7 +140,8 @@ export function quoteDto(q) {
 
 export const entryDto = (e, quote = null) => ({
     id: e.id, kind: e.kind, body: e.body || "", attachments: e.attachments || [],
-    authorName: e.author_name || "", createdAt: e.created_at, quote,
+    authorId: e.author_id || null, authorName: e.author_name || "", mentions: e.mentions || [],
+    createdAt: e.created_at, quote,
 });
 
 // Adds a 1-hour signed URL to every attachment, and the quote card data to quote entries.

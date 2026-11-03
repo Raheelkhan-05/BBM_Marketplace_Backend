@@ -10,7 +10,7 @@ const BETA_NOTICE =
   "Please note: BBM Marketplace is currently in its beta phase. Occasional errors may occur and are being addressed. We appreciate your patience.";
 
 const DEFAULT_FOOTER = `You're receiving this because an account was created or updated on BBM
-            using this email address. If this wasn't you, you can ignore this email.`;
+                using this email address. If this wasn't you, you can ignore this email.`;
 
 function esc(v) {
   return String(v ?? "")
@@ -20,29 +20,29 @@ function esc(v) {
 
 function shell(title, bodyHtml, footer = DEFAULT_FOOTER, { beta = true } = {}) {
   return `
-  <div style="background:#f4f7f8;padding:32px 0;font-family:Arial,Helvetica,sans-serif;">
-    <table role="presentation" width="100%" style="max-width:480px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #eef1f2;">
-      <tr>
-        <td style="background:linear-gradient(135deg, ${BRAND_TEAL}, #7fb3bd);padding:20px 28px;">
-          <span style="color:#ffffff;font-size:16px;font-weight:800;letter-spacing:0.3px;">BBM</span>
-        </td>
-      </tr>
-      <tr>
-        <td style="padding:28px 28px 8px;">
-          <h1 style="margin:0 0 12px;font-size:20px;color:#0f172a;">${title}</h1>
-          ${bodyHtml}
-        </td>
-      </tr>
-      ${beta ? `<tr><td style="padding:8px 28px 0;"><p style="margin:0;font-size:12px;line-height:1.5;color:#9a3412;">${BETA_NOTICE}</p></td></tr>` : ""}
-      <tr>
-        <td style="padding:20px 28px 28px;">
-          <p style="margin:0;font-size:11.5px;color:#94a3b8;">
-            ${footer}
-          </p>
-        </td>
-      </tr>
-    </table>
-  </div>`;
+      <div style="background:#f4f7f8;padding:32px 0;font-family:Arial,Helvetica,sans-serif;">
+        <table role="presentation" width="100%" style="max-width:480px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #eef1f2;">
+          <tr>
+            <td style="background:linear-gradient(135deg, ${BRAND_TEAL}, #7fb3bd);padding:20px 28px;">
+              <span style="color:#ffffff;font-size:16px;font-weight:800;letter-spacing:0.3px;">BBM</span>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:28px 28px 8px;">
+              <h1 style="margin:0 0 12px;font-size:20px;color:#0f172a;">${title}</h1>
+              ${bodyHtml}
+            </td>
+          </tr>
+          ${beta ? `<tr><td style="padding:8px 28px 0;"><p style="margin:0;font-size:12px;line-height:1.5;color:#9a3412;">${BETA_NOTICE}</p></td></tr>` : ""}
+          <tr>
+            <td style="padding:20px 28px 28px;">
+              <p style="margin:0;font-size:11.5px;color:#94a3b8;">
+                ${footer}
+              </p>
+            </td>
+          </tr>
+        </table>
+      </div>`;
 }
 
 // Resend returns { data, error } rather than throwing on a send failure
@@ -61,12 +61,12 @@ export async function sendWelcomeEmail(toEmail, name) {
   const html = shell(
     `Welcome to BBM, ${name || "there"} 👋`,
     `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
-       Your account is ready. You can start sourcing materials right away —
-       and open a storefront to sell any time, using the same login.
-     </p>
-     <a href="https://bbm.business/home" style="display:inline-block;margin-top:6px;background:${BRAND_ORANGE};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
-       Go to marketplace
-     </a>`
+          Your account is ready. You can start sourcing materials right away —
+          and open a storefront to sell any time, using the same login.
+        </p>
+        <a href="https://bbm.business/home" style="display:inline-block;margin-top:6px;background:${BRAND_ORANGE};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
+          Go to marketplace
+        </a>`
   );
   const result = await resend.emails.send({
     from: FROM,
@@ -82,10 +82,10 @@ export async function sendBusinessPendingEmail(toEmail, businessName) {
   const html = shell(
     "We're verifying your business details",
     `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
-       Thanks for adding <strong>${businessName}</strong>. We're checking your
-       GSTIN against compliance records — this usually takes a few minutes,
-       occasionally longer. We'll email you the moment it's done.
-     </p>`
+          Thanks for adding <strong>${businessName}</strong>. We're checking your
+          GSTIN against compliance records — this usually takes a few minutes,
+          occasionally longer. We'll email you the moment it's done.
+        </p>`
   );
   const result = await resend.emails.send({
     from: FROM,
@@ -101,12 +101,12 @@ export async function sendBusinessVerifiedEmail(toEmail, businessName) {
   const html = shell(
     "You're verified to sell on BBM ✅",
     `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
-       <strong>${businessName}</strong> is verified. You can list products
-       and open your storefront whenever you're ready.
-     </p>
-     <a href="https://bbm.business/sell/dashboard" style="display:inline-block;margin-top:6px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
-       Open your shop
-     </a>`
+          <strong>${businessName}</strong> is verified. You can list products
+          and open your storefront whenever you're ready.
+        </p>
+        <a href="https://bbm.business/sell/dashboard" style="display:inline-block;margin-top:6px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
+          Open your shop
+        </a>`
   );
   const result = await resend.emails.send({
     from: FROM,
@@ -131,19 +131,19 @@ export async function sendTeamInviteEmail({ to, companyName, inviterName, link, 
   const html = shell(
     isSales ? `Join ${company} as a salesperson on BBM` : `Join ${company}'s team on BBM`,
     `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
-       ${inviter} invited you to join <strong>${company}</strong> as ${roleText}.
-       ${about}
-     </p>
-     <a href="${esc(link)}" style="display:inline-block;margin-top:6px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
-       ${isSales ? "Join as salesperson" : "Join the team"}
-     </a>
-     <p style="margin:16px 0 0;font-size:12.5px;line-height:1.6;color:#64748b;">
-       This link expires in ${esc(hours)} hours. Sign up with <strong>this email address</strong>; a different one won't work.
-     </p>
-     <p style="margin:10px 0 0;font-size:12.5px;line-height:1.6;color:#64748b;">
-       Used BBM before, or were part of another company's team? That's fine. Use the same email address and you'll be set up under this company.
-     </p>
-     <p style="margin:10px 0 0;font-size:11.5px;line-height:1.5;color:#94a3b8;word-break:break-all;">${esc(link)}</p>`,
+          ${inviter} invited you to join <strong>${company}</strong> as ${roleText}.
+          ${about}
+        </p>
+        <a href="${esc(link)}" style="display:inline-block;margin-top:6px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
+          ${isSales ? "Join as salesperson" : "Join the team"}
+        </a>
+        <p style="margin:16px 0 0;font-size:12.5px;line-height:1.6;color:#64748b;">
+          This link expires in ${esc(hours)} hours. Sign up with <strong>this email address</strong>; a different one won't work.
+        </p>
+        <p style="margin:10px 0 0;font-size:12.5px;line-height:1.6;color:#64748b;">
+          Used BBM before, or were part of another company's team? That's fine. Use the same email address and you'll be set up under this company.
+        </p>
+        <p style="margin:10px 0 0;font-size:11.5px;line-height:1.5;color:#94a3b8;word-break:break-all;">${esc(link)}</p>`,
     "You're receiving this because someone invited this email address to join their team on BBM. If you weren't expecting it, you can ignore this email and nothing will change."
   );
   const clean = (v, d) => String(v || d).replace(/[\r\n]+/g, " ");
@@ -167,9 +167,9 @@ export async function sendOtpEmail(email, otp) {
     html: shell(
       "Your verification code",
       `<p style="margin:0;font-size:14px;line-height:1.6;color:#475569;">
-         Your code is <strong style="font-size:18px;letter-spacing:2px;">${otp}</strong>.
-                  It expires in 5 minutes.
-       </p>`,
+            Your code is <strong style="font-size:18px;letter-spacing:2px;">${otp}</strong>.
+                      It expires in 5 minutes.
+          </p>`,
       DEFAULT_FOOTER,
       { beta: false }
     ),
@@ -182,10 +182,10 @@ export async function sendGstinReportUpdateEmail({ to, name, gstin, message }) {
   const html = shell(
     "Update on your GSTIN report",
     `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
-       Hi ${esc(name || "there")}, our team has looked into your report about GSTIN
-       <strong>${esc(gstin)}</strong>.
-     </p>
-     <p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#0f172a;white-space:pre-line;">${esc(message)}</p>`,
+          Hi ${esc(name || "there")}, our team has looked into your report about GSTIN
+          <strong>${esc(gstin)}</strong>.
+        </p>
+        <p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#0f172a;white-space:pre-line;">${esc(message)}</p>`,
     "You're receiving this because you reported a GSTIN issue on BBM. If this wasn't you, you can ignore this email."
   );
   const result = await resend.emails.send({ from: FROM, to, subject: "Update on your GSTIN report", html });
@@ -202,32 +202,32 @@ export async function sendSalesQuotationEmail({
 }) {
   if (!to) return;
   const rows = (items || []).map((i) => `
-    <div style="margin:0 0 12px;padding:12px 14px;border:1px solid #e5eaee;border-radius:12px;">
-      <div style="font-size:14px;font-weight:700;color:#0f172a;">${esc(i.productName)}${i.brandName ? ` <span style="font-weight:400;color:#64748b;">· ${esc(i.brandName)}</span>` : ""}</div>
-      ${i.description ? `<div style="margin-top:4px;font-size:12.5px;line-height:1.5;color:#64748b;">${esc(i.description)}</div>` : ""}
-      <div style="margin-top:8px;font-size:13px;color:#334155;">
-        ${esc(qtyMail(i.quantity))} ${esc(i.unit)} × ${esc(inrMail(i.unitPriceIncl, 4))} = <strong>${esc(inrMail(i.totalIncl))}</strong>
-        <span style="color:#94a3b8;">(incl. GST)</span>
-      </div>
-      <a href="${esc(i.url)}" style="display:inline-block;margin-top:8px;font-size:12.5px;font-weight:700;color:${BRAND_TEAL};text-decoration:none;">View product</a>
-    </div>`).join("");
+        <div style="margin:0 0 12px;padding:12px 14px;border:1px solid #e5eaee;border-radius:12px;">
+          <div style="font-size:14px;font-weight:700;color:#0f172a;">${esc(i.productName)}${i.brandName ? ` <span style="font-weight:400;color:#64748b;">· ${esc(i.brandName)}</span>` : ""}</div>
+          ${i.description ? `<div style="margin-top:4px;font-size:12.5px;line-height:1.5;color:#64748b;">${esc(i.description)}</div>` : ""}
+          <div style="margin-top:8px;font-size:13px;color:#334155;">
+            ${esc(qtyMail(i.quantity))} ${esc(i.unit)} × ${esc(inrMail(i.unitPriceIncl, 4))} = <strong>${esc(inrMail(i.totalIncl))}</strong>
+            <span style="color:#94a3b8;">(incl. GST)</span>
+          </div>
+          <a href="${esc(i.url)}" style="display:inline-block;margin-top:8px;font-size:12.5px;font-weight:700;color:${BRAND_TEAL};text-decoration:none;">View product</a>
+        </div>`).join("");
 
   const html = shell(
     `Quotation for ${esc(enquiryProduct)}`,
     `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
-       Hi ${esc(customerName || "there")}, ${esc(sellerName)} has shared a quotation for your enquiry
-       (${esc(enquiryProduct)})${salespersonName ? `, prepared by ${esc(salespersonName)}` : ""}.
-     </p>
-     ${rows}
-     <table role="presentation" width="100%" style="margin-top:6px;font-size:13px;color:#334155;">
-       <tr><td style="padding:3px 0;">Total before GST</td><td align="right">${esc(inrMail(subtotal))}</td></tr>
-       <tr><td style="padding:3px 0;">GST</td><td align="right">${esc(inrMail(gstAmount))}</td></tr>
-       <tr><td style="padding:6px 0 0;font-size:15px;font-weight:800;color:#0f172a;">Total (incl. GST)</td>
-           <td align="right" style="padding:6px 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(inrMail(total))}</td></tr>
-     </table>
-     <p style="margin:14px 0 0;font-size:12.5px;color:#64748b;">This quotation is valid until <strong>${esc(validUntil)}</strong>.</p>
-     ${note ? `<p style="margin:10px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;">${esc(note)}</p>` : ""}
-     <p style="margin:12px 0 0;font-size:12.5px;color:#64748b;">Reply to this email if you have any questions.</p>`,
+          Hi ${esc(customerName || "there")}, ${esc(sellerName)} has shared a quotation for your enquiry
+          (${esc(enquiryProduct)})${salespersonName ? `, prepared by ${esc(salespersonName)}` : ""}.
+        </p>
+        ${rows}
+        <table role="presentation" width="100%" style="margin-top:6px;font-size:13px;color:#334155;">
+          <tr><td style="padding:3px 0;">Total before GST</td><td align="right">${esc(inrMail(subtotal))}</td></tr>
+          <tr><td style="padding:3px 0;">GST</td><td align="right">${esc(inrMail(gstAmount))}</td></tr>
+          <tr><td style="padding:6px 0 0;font-size:15px;font-weight:800;color:#0f172a;">Total (incl. GST)</td>
+              <td align="right" style="padding:6px 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(inrMail(total))}</td></tr>
+        </table>
+        <p style="margin:14px 0 0;font-size:12.5px;color:#64748b;">This quotation is valid until <strong>${esc(validUntil)}</strong>.</p>
+        ${note ? `<p style="margin:10px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;">${esc(note)}</p>` : ""}
+        <p style="margin:12px 0 0;font-size:12.5px;color:#64748b;">Reply to this email if you have any questions.</p>`,
     "You're receiving this because a supplier prepared a quotation for your enquiry on BBM Marketplace. If this wasn't meant for you, you can ignore this email."
   );
   const clean = (v) => String(v || "").replace(/[\r\n]+/g, " ");
@@ -247,12 +247,12 @@ export async function sendOrderPlacedEmail({ to, customerName, companyName, orde
   if (!to) return;
   const company = esc(companyName || "our team");
   const rows = (items || []).map((i) => `
-    <div style="margin:0 0 10px;padding:12px 14px;border:1px solid #e5eaee;border-radius:12px;">
-      <div style="font-size:14px;font-weight:700;color:#0f172a;">${esc(i.productName)}${i.brandName ? ` <span style="font-weight:400;color:#64748b;">· ${esc(i.brandName)}</span>` : ""}</div>
-      <div style="margin-top:6px;font-size:13px;color:#334155;">${esc(i.qtyText)}</div>
-      ${i.packText ? `<div style="margin-top:2px;font-size:12.5px;color:#64748b;">${esc(i.packText)}</div>` : ""}
-      <div style="margin-top:6px;font-size:13px;color:#334155;">Amount: <strong>${esc(inrMail(i.lineTotal))}</strong> <span style="color:#94a3b8;">(incl. GST)</span></div>
-    </div>`).join("");
+        <div style="margin:0 0 10px;padding:12px 14px;border:1px solid #e5eaee;border-radius:12px;">
+          <div style="font-size:14px;font-weight:700;color:#0f172a;">${esc(i.productName)}${i.brandName ? ` <span style="font-weight:400;color:#64748b;">· ${esc(i.brandName)}</span>` : ""}</div>
+          <div style="margin-top:6px;font-size:13px;color:#334155;">${esc(i.qtyText)}</div>
+          ${i.packText ? `<div style="margin-top:2px;font-size:12.5px;color:#64748b;">${esc(i.packText)}</div>` : ""}
+          <div style="margin-top:6px;font-size:13px;color:#334155;">Amount: <strong>${esc(inrMail(i.lineTotal))}</strong> <span style="color:#94a3b8;">(incl. GST)</span></div>
+        </div>`).join("");
 
   const b = billing || {};
   const detail = (label, value) => (value ? `<tr><td style="padding:3px 0;color:#64748b;vertical-align:top;width:34%;">${label}</td><td style="padding:3px 0;color:#0f172a;">${esc(value)}</td></tr>` : "");
@@ -260,36 +260,36 @@ export async function sendOrderPlacedEmail({ to, customerName, companyName, orde
   const html = shell(
     `We've received your order, ${esc(customerName || "there")}`,
     `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
-       Hello ${esc(customerName || "there")}, thank you for choosing <strong>${company}</strong>.
-       We have received your details and recorded your order. Here is a summary for your reference.
-     </p>
-     <table role="presentation" width="100%" style="margin:0 0 16px;font-size:13px;color:#334155;">
-       <tr><td style="padding:3px 0;color:#64748b;">Order number</td><td align="right"><strong>${esc(orderNo)}</strong></td></tr>
-       ${placedOn ? `<tr><td style="padding:3px 0;color:#64748b;">Order date</td><td align="right">${esc(placedOn)}</td></tr>` : ""}
-       <tr><td style="padding:3px 0;color:#64748b;">Status</td><td align="right"><strong>Order received</strong></td></tr>
-     </table>
- 
-     <p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#0f172a;">Your order</p>
-     ${rows}
- 
-     <p style="margin:16px 0 8px;font-size:13px;font-weight:700;color:#0f172a;">Billing details</p>
-     <table role="presentation" width="100%" style="font-size:13px;">
-       ${detail("Billed to", b.name)}${detail("GSTIN", b.gstin)}${detail("Address", b.address)}${detail("Mobile", b.phone)}${detail("Email", b.email)}
-     </table>
-     <table role="presentation" width="100%" style="margin-top:10px;border-top:1px solid #e5eaee;font-size:13px;color:#334155;">
-       ${totals?.split ? `<tr><td style="padding:8px 0 3px;">Taxable value</td><td align="right" style="padding:8px 0 3px;">${esc(inrMail(totals.taxable))}</td></tr>
-       <tr><td style="padding:3px 0;">GST</td><td align="right">${esc(inrMail(totals.gst))}</td></tr>` : ""}
-       <tr><td style="padding:${totals?.split ? "6px" : "10px"} 0 0;font-size:15px;font-weight:800;color:#0f172a;">Order total (incl. GST)</td>
-           <td align="right" style="padding:${totals?.split ? "6px" : "10px"} 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(inrMail(totals?.total))}</td></tr>
-     </table>
-     ${notes ? `<p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;"><strong>Your notes:</strong> ${esc(notes)}</p>` : ""}
- 
-     <p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#475569;">
-       Our team will confirm and process your order shortly, and we will keep you updated at every step.
-       If anything above looks incorrect, please reply to this email and mention order <strong>${esc(orderNo)}</strong>.
-     </p>
-     ${shopUrl ? `<a href="${esc(shopUrl)}" style="display:inline-block;margin-top:14px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">Visit ${company}'s shop</a>` : ""}
-     <p style="margin:16px 0 0;font-size:13px;line-height:1.6;color:#475569;">Thank you once again for choosing ${company}.</p>`,
+          Hello ${esc(customerName || "there")}, thank you for choosing <strong>${company}</strong>.
+          We have received your details and recorded your order. Here is a summary for your reference.
+        </p>
+        <table role="presentation" width="100%" style="margin:0 0 16px;font-size:13px;color:#334155;">
+          <tr><td style="padding:3px 0;color:#64748b;">Order number</td><td align="right"><strong>${esc(orderNo)}</strong></td></tr>
+          ${placedOn ? `<tr><td style="padding:3px 0;color:#64748b;">Order date</td><td align="right">${esc(placedOn)}</td></tr>` : ""}
+          <tr><td style="padding:3px 0;color:#64748b;">Status</td><td align="right"><strong>Order received</strong></td></tr>
+        </table>
+    
+        <p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#0f172a;">Your order</p>
+        ${rows}
+    
+        <p style="margin:16px 0 8px;font-size:13px;font-weight:700;color:#0f172a;">Billing details</p>
+        <table role="presentation" width="100%" style="font-size:13px;">
+          ${detail("Billed to", b.name)}${detail("GSTIN", b.gstin)}${detail("Address", b.address)}${detail("Mobile", b.phone)}${detail("Email", b.email)}
+        </table>
+        <table role="presentation" width="100%" style="margin-top:10px;border-top:1px solid #e5eaee;font-size:13px;color:#334155;">
+          ${totals?.split ? `<tr><td style="padding:8px 0 3px;">Taxable value</td><td align="right" style="padding:8px 0 3px;">${esc(inrMail(totals.taxable))}</td></tr>
+          <tr><td style="padding:3px 0;">GST</td><td align="right">${esc(inrMail(totals.gst))}</td></tr>` : ""}
+          <tr><td style="padding:${totals?.split ? "6px" : "10px"} 0 0;font-size:15px;font-weight:800;color:#0f172a;">Order total (incl. GST)</td>
+              <td align="right" style="padding:${totals?.split ? "6px" : "10px"} 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(inrMail(totals?.total))}</td></tr>
+        </table>
+        ${notes ? `<p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;"><strong>Your notes:</strong> ${esc(notes)}</p>` : ""}
+    
+        <p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#475569;">
+          Our team will confirm and process your order shortly, and we will keep you updated at every step.
+          If anything above looks incorrect, please reply to this email and mention order <strong>${esc(orderNo)}</strong>.
+        </p>
+        ${shopUrl ? `<a href="${esc(shopUrl)}" style="display:inline-block;margin-top:14px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">Visit ${company}'s shop</a>` : ""}
+        <p style="margin:16px 0 0;font-size:13px;line-height:1.6;color:#475569;">Thank you once again for choosing ${company}.</p>`,
     `You're receiving this because ${company} placed an order for you through BBM Marketplace. If this wasn't meant for you, you can ignore this email.`
   );
   const clean = (v, d) => String(v || d).replace(/[\r\n]+/g, " ");
@@ -309,39 +309,39 @@ export async function sendOrderProcessedEmail({ to, customerName, companyName, o
   if (!to) return;
   const company = esc(companyName || "our team");
   const rows = (items || []).map((i) => `
-    <div style="margin:0 0 10px;padding:12px 14px;border:1px solid #e5eaee;border-radius:12px;">
-      <div style="font-size:14px;font-weight:700;color:#0f172a;">${esc(i.productName)}${i.brandName ? ` <span style="font-weight:400;color:#64748b;">· ${esc(i.brandName)}</span>` : ""}</div>
-      <div style="margin-top:6px;font-size:13px;color:#334155;">
-        ${esc(qtyMail(i.quantity))} ${esc(i.unit)} × ${esc(inrMail(i.unitPrice, 4))} = <strong>${esc(inrMail(i.lineTotal))}</strong>
-      </div>
-    </div>`).join("");
+        <div style="margin:0 0 10px;padding:12px 14px;border:1px solid #e5eaee;border-radius:12px;">
+          <div style="font-size:14px;font-weight:700;color:#0f172a;">${esc(i.productName)}${i.brandName ? ` <span style="font-weight:400;color:#64748b;">· ${esc(i.brandName)}</span>` : ""}</div>
+          <div style="margin-top:6px;font-size:13px;color:#334155;">
+            ${esc(qtyMail(i.quantity))} ${esc(i.unit)} × ${esc(inrMail(i.unitPrice, 4))} = <strong>${esc(inrMail(i.lineTotal))}</strong>
+          </div>
+        </div>`).join("");
 
   const html = shell(
     `Thank you for your purchase from ${company}`,
     `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
-       Hi ${esc(customerName || "there")}, thank you for your purchase from <strong>${company}</strong>.
-       We're happy to let you know that your order is confirmed and is now being processed.
-     </p>
-     <table role="presentation" width="100%" style="margin:0 0 14px;font-size:13px;color:#334155;">
-       <tr><td style="padding:3px 0;color:#64748b;">Order number</td><td align="right"><strong>${esc(orderNo)}</strong></td></tr>
-       ${placedOn ? `<tr><td style="padding:3px 0;color:#64748b;">Order date</td><td align="right">${esc(placedOn)}</td></tr>` : ""}
-       <tr><td style="padding:3px 0;color:#64748b;">Status</td><td align="right"><strong>Processing</strong></td></tr>
-     </table>
-     <p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#0f172a;">Your order</p>
-     ${rows}
-     <table role="presentation" width="100%" style="margin-top:6px;border-top:1px solid #e5eaee;">
-       <tr><td style="padding:10px 0 0;font-size:15px;font-weight:800;color:#0f172a;">Order total (incl. GST)</td>
-           <td align="right" style="padding:10px 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(inrMail(total))}</td></tr>
-     </table>
-     ${notes ? `<p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;"><strong>Your notes:</strong> ${esc(notes)}</p>` : ""}
-     <p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#475569;">
-       If you have any questions about this order, simply reply to this email or contact ${company} and mention order <strong>${esc(orderNo)}</strong>.
-     </p>
-     ${shopUrl ? `<a href="${esc(shopUrl)}" style="display:inline-block;margin-top:14px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
-       Visit ${company}'s shop
-     </a>
-     <p style="margin:10px 0 0;font-size:11.5px;line-height:1.5;color:#94a3b8;word-break:break-all;">${esc(shopUrl)}</p>` : ""}
-     <p style="margin:16px 0 0;font-size:13px;line-height:1.6;color:#475569;">Thank you once again for choosing ${company}.</p>`,
+          Hi ${esc(customerName || "there")}, thank you for your purchase from <strong>${company}</strong>.
+          We're happy to let you know that your order is confirmed and is now being processed.
+        </p>
+        <table role="presentation" width="100%" style="margin:0 0 14px;font-size:13px;color:#334155;">
+          <tr><td style="padding:3px 0;color:#64748b;">Order number</td><td align="right"><strong>${esc(orderNo)}</strong></td></tr>
+          ${placedOn ? `<tr><td style="padding:3px 0;color:#64748b;">Order date</td><td align="right">${esc(placedOn)}</td></tr>` : ""}
+          <tr><td style="padding:3px 0;color:#64748b;">Status</td><td align="right"><strong>Processing</strong></td></tr>
+        </table>
+        <p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#0f172a;">Your order</p>
+        ${rows}
+        <table role="presentation" width="100%" style="margin-top:6px;border-top:1px solid #e5eaee;">
+          <tr><td style="padding:10px 0 0;font-size:15px;font-weight:800;color:#0f172a;">Order total (incl. GST)</td>
+              <td align="right" style="padding:10px 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(inrMail(total))}</td></tr>
+        </table>
+        ${notes ? `<p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;"><strong>Your notes:</strong> ${esc(notes)}</p>` : ""}
+        <p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#475569;">
+          If you have any questions about this order, simply reply to this email or contact ${company} and mention order <strong>${esc(orderNo)}</strong>.
+        </p>
+        ${shopUrl ? `<a href="${esc(shopUrl)}" style="display:inline-block;margin-top:14px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">
+          Visit ${company}'s shop
+        </a>
+        <p style="margin:10px 0 0;font-size:11.5px;line-height:1.5;color:#94a3b8;word-break:break-all;">${esc(shopUrl)}</p>` : ""}
+        <p style="margin:16px 0 0;font-size:13px;line-height:1.6;color:#475569;">Thank you once again for choosing ${company}.</p>`,
     `You're receiving this because ${company} placed an order for you through BBM Marketplace. If this wasn't meant for you, you can ignore this email.`
   );
   const clean = (v, d) => String(v || d).replace(/[\r\n]+/g, " ");
@@ -365,34 +365,34 @@ export async function sendSalespersonCopyEmail({
 
   const deliveryRows = delivery.map((d) =>
     `<tr><td style="padding:3px 0;color:#64748b;">${esc(d.channel)}</td>
-         <td align="right" style="padding:3px 0;font-weight:700;color:${d.ok ? "#15803d" : "#b91c1c"};">${d.ok ? "Delivered" : "Failed"}</td></tr>`).join("");
+            <td align="right" style="padding:3px 0;font-weight:700;color:${d.ok ? "#15803d" : "#b91c1c"};">${d.ok ? "Delivered" : "Failed"}</td></tr>`).join("");
 
   const itemRows = items.map((i) => `
-    <tr>
-      <td style="padding:6px 0;border-top:1px solid #eef1f2;font-size:13px;color:#0f172a;">
-        ${esc(i.name)}${i.detail ? `<div style="font-size:12px;color:#64748b;">${esc(i.detail)}</div>` : ""}
-      </td>
-      <td align="right" style="padding:6px 0;border-top:1px solid #eef1f2;font-size:13px;color:#0f172a;white-space:nowrap;vertical-align:top;">${esc(i.amount || "")}</td>
-    </tr>`).join("");
+        <tr>
+          <td style="padding:6px 0;border-top:1px solid #eef1f2;font-size:13px;color:#0f172a;">
+            ${esc(i.name)}${i.detail ? `<div style="font-size:12px;color:#64748b;">${esc(i.detail)}</div>` : ""}
+          </td>
+          <td align="right" style="padding:6px 0;border-top:1px solid #eef1f2;font-size:13px;color:#0f172a;white-space:nowrap;vertical-align:top;">${esc(i.amount || "")}</td>
+        </tr>`).join("");
 
   const html = shell(
     `Your copy: ${esc(title)}`,
     `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
-       Hi ${esc(salespersonName || "there")}, this is a record of what was just sent to
-       <strong>${esc(customerName || "your customer")}</strong>. Only you receive this copy.
-     </p>
-     <table role="presentation" width="100%" style="font-size:13px;margin-bottom:12px;">
-       ${customerContact ? `<tr><td style="padding:3px 0;color:#64748b;width:38%;">Customer contact</td><td style="padding:3px 0;color:#0f172a;">${esc(customerContact)}</td></tr>` : ""}
-       ${factRows}
-     </table>
-     ${deliveryRows ? `<p style="margin:0 0 4px;font-size:13px;font-weight:700;color:#0f172a;">Delivery status</p>
-     <table role="presentation" width="100%" style="font-size:13px;margin-bottom:14px;">${deliveryRows}</table>` : ""}
-     ${itemRows ? `<p style="margin:0 0 4px;font-size:13px;font-weight:700;color:#0f172a;">What the customer received</p>
-     <table role="presentation" width="100%" style="margin-bottom:6px;">${itemRows}</table>` : ""}
-     ${total != null ? `<table role="presentation" width="100%" style="border-top:1px solid #e5eaee;">
-       <tr><td style="padding:8px 0 0;font-size:15px;font-weight:800;color:#0f172a;">Total (incl. GST)</td>
-           <td align="right" style="padding:8px 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(total)}</td></tr></table>` : ""}
-     ${note ? `<p style="margin:14px 0 0;padding:10px 12px;background:#f4f7f8;border-radius:10px;font-size:12.5px;line-height:1.6;color:#334155;"><strong>Next step:</strong> ${esc(note)}</p>` : ""}`,
+          Hi ${esc(salespersonName || "there")}, this is a record of what was just sent to
+          <strong>${esc(customerName || "your customer")}</strong>. Only you receive this copy.
+        </p>
+        <table role="presentation" width="100%" style="font-size:13px;margin-bottom:12px;">
+          ${customerContact ? `<tr><td style="padding:3px 0;color:#64748b;width:38%;">Customer contact</td><td style="padding:3px 0;color:#0f172a;">${esc(customerContact)}</td></tr>` : ""}
+          ${factRows}
+        </table>
+        ${deliveryRows ? `<p style="margin:0 0 4px;font-size:13px;font-weight:700;color:#0f172a;">Delivery status</p>
+        <table role="presentation" width="100%" style="font-size:13px;margin-bottom:14px;">${deliveryRows}</table>` : ""}
+        ${itemRows ? `<p style="margin:0 0 4px;font-size:13px;font-weight:700;color:#0f172a;">What the customer received</p>
+        <table role="presentation" width="100%" style="margin-bottom:6px;">${itemRows}</table>` : ""}
+        ${total != null ? `<table role="presentation" width="100%" style="border-top:1px solid #e5eaee;">
+          <tr><td style="padding:8px 0 0;font-size:15px;font-weight:800;color:#0f172a;">Total (incl. GST)</td>
+              <td align="right" style="padding:8px 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(total)}</td></tr></table>` : ""}
+        ${note ? `<p style="margin:14px 0 0;padding:10px 12px;background:#f4f7f8;border-radius:10px;font-size:12.5px;line-height:1.6;color:#334155;"><strong>Next step:</strong> ${esc(note)}</p>` : ""}`,
     "You're receiving this because you sent a message to a customer from BBM Marketplace. This copy was sent only to you.",
     { beta: false }
   );
@@ -414,34 +414,34 @@ export async function sendDispatcherOrderEmail({
   if (!to) return;
   const row = (l, v) => (v ? `<tr><td style="padding:3px 0;color:#64748b;vertical-align:top;width:34%;">${l}</td><td style="padding:3px 0;color:#0f172a;">${esc(v)}</td></tr>` : "");
   const rows = (items || []).map((i) => `
-    <div style="margin:0 0 10px;padding:12px 14px;border:1px solid #e5eaee;border-radius:12px;">
-      <div style="font-size:14px;font-weight:700;color:#0f172a;">${esc(i.productName)}${i.brandName ? ` <span style="font-weight:400;color:#64748b;">· ${esc(i.brandName)}</span>` : ""}</div>
-      <div style="margin-top:6px;font-size:13px;color:#334155;">${esc(i.qtyText)}</div>
-      ${i.packText ? `<div style="margin-top:2px;font-size:12.5px;color:#64748b;">${esc(i.packText)}</div>` : ""}
-      <div style="margin-top:6px;font-size:13px;color:#334155;">Amount: <strong>${esc(inrMail(i.lineTotal))}</strong> <span style="color:#94a3b8;">(incl. GST)</span></div>
-    </div>`).join("");
+        <div style="margin:0 0 10px;padding:12px 14px;border:1px solid #e5eaee;border-radius:12px;">
+          <div style="font-size:14px;font-weight:700;color:#0f172a;">${esc(i.productName)}${i.brandName ? ` <span style="font-weight:400;color:#64748b;">· ${esc(i.brandName)}</span>` : ""}</div>
+          <div style="margin-top:6px;font-size:13px;color:#334155;">${esc(i.qtyText)}</div>
+          ${i.packText ? `<div style="margin-top:2px;font-size:12.5px;color:#64748b;">${esc(i.packText)}</div>` : ""}
+          <div style="margin-top:6px;font-size:13px;color:#334155;">Amount: <strong>${esc(inrMail(i.lineTotal))}</strong> <span style="color:#94a3b8;">(incl. GST)</span></div>
+        </div>`).join("");
 
   const html = shell(
     `New order to dispatch: ${esc(orderNo)}`,
     `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
-       Hi ${esc(dispatcherName || "there")}, ${salespersonName ? `<strong>${esc(salespersonName)}</strong> just punched` : "a new order was just punched"}
-       ${companyName ? ` for <strong>${esc(companyName)}</strong>` : ""}. Please get it ready for dispatch.
-     </p>
-     <table role="presentation" width="100%" style="margin:0 0 16px;font-size:13px;">
-       ${row("Order number", orderNo)}${row("PO number", poNumber)}${row("Placed on", placedOn)}
-     </table>
-     <p style="margin:0 0 6px;font-size:13px;font-weight:700;color:#0f172a;">Customer</p>
-     <table role="presentation" width="100%" style="margin:0 0 16px;font-size:13px;">
-       ${row("Name", customer.name)}${row("GSTIN", customer.gstin)}${row("Address", customer.address)}${row("Mobile", customer.phone)}${row("Email", customer.email)}
-     </table>
-     <p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#0f172a;">Items</p>
-     ${rows}
-     <table role="presentation" width="100%" style="margin-top:6px;border-top:1px solid #e5eaee;">
-       <tr><td style="padding:10px 0 0;font-size:15px;font-weight:800;color:#0f172a;">Order total (incl. GST)</td>
-           <td align="right" style="padding:10px 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(inrMail(total))}</td></tr>
-     </table>
-     ${notes ? `<p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;"><strong>Order notes:</strong> ${esc(notes)}</p>` : ""}
-     ${link ? `<a href="${esc(link)}" style="display:inline-block;margin-top:14px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">Open order</a>` : ""}`,
+          Hi ${esc(dispatcherName || "there")}, ${salespersonName ? `<strong>${esc(salespersonName)}</strong> just punched` : "a new order was just punched"}
+          ${companyName ? ` for <strong>${esc(companyName)}</strong>` : ""}. Please get it ready for dispatch.
+        </p>
+        <table role="presentation" width="100%" style="margin:0 0 16px;font-size:13px;">
+          ${row("Order number", orderNo)}${row("PO number", poNumber)}${row("Placed on", placedOn)}
+        </table>
+        <p style="margin:0 0 6px;font-size:13px;font-weight:700;color:#0f172a;">Customer</p>
+        <table role="presentation" width="100%" style="margin:0 0 16px;font-size:13px;">
+          ${row("Name", customer.name)}${row("GSTIN", customer.gstin)}${row("Address", customer.address)}${row("Mobile", customer.phone)}${row("Email", customer.email)}
+        </table>
+        <p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#0f172a;">Items</p>
+        ${rows}
+        <table role="presentation" width="100%" style="margin-top:6px;border-top:1px solid #e5eaee;">
+          <tr><td style="padding:10px 0 0;font-size:15px;font-weight:800;color:#0f172a;">Order total (incl. GST)</td>
+              <td align="right" style="padding:10px 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(inrMail(total))}</td></tr>
+        </table>
+        ${notes ? `<p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;"><strong>Order notes:</strong> ${esc(notes)}</p>` : ""}
+        ${link ? `<a href="${esc(link)}" style="display:inline-block;margin-top:14px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">Open order</a>` : ""}`,
     "You're receiving this because you are listed as a dispatcher for this company on BBM Marketplace.",
     { beta: false }
   );

@@ -813,3 +813,20 @@ export async function sendDispatcherOrderWhatsApp({
     ]);
     return sendWhatsAppText({ to, message });
 }
+
+// Enquiry chat: kind = "new" (instant) | "reminder" (1-hour unread) | "added"
+export async function sendSalesChatWhatsApp({ to, name, kind, customer, product, from, preview, unread = 1, mentioned = false, link }) {
+    const head = kind === "added" ? "ADDED TO AN ENQUIRY CHAT" : kind === "reminder" ? "UNREAD MESSAGES" : "NEW MESSAGE";
+    const lead = kind === "added"
+        ? `${bold(from || "A teammate")} added you to the chat for the enquiry from ${bold(customer)}.`
+        : kind === "reminder"
+            ? `You have ${bold(unread === 1 ? "1 unread message" : `${unread} unread messages`)} in the enquiry chat for ${bold(customer)}${mentioned ? ", including one where you were tagged" : ""}.`
+            : `${bold(from || "A teammate")} sent a message in the enquiry chat for ${bold(customer)}.`;
+    const quote = clean(preview) ? `${kind === "reminder" && from ? `${clean(from)}: ` : ""}"${clean(preview).slice(0, 160)}"` : null;
+    const message = join([
+        bold(head), "", `Hello ${clean(name) || "there"},`, "", lead,
+        field("Product", product), quote, "",
+        link ? `Open chat: ${clean(link)}` : null, "", sign(),
+    ]);
+    return sendWhatsAppText({ to, message });
+}

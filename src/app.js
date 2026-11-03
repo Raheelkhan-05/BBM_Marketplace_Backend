@@ -46,6 +46,7 @@ import orderBookTeamRoutes from "./routes/orderBookTeam.routes.js";
 import salesMonitorRoutes from "./routes/salesMonitor.routes.js";
 import { apiAnalytics } from "./middleware/apiAnalytics.middleware.js";
 import { captureServerException } from "./services/analytics.service.js";
+import salesChatRoutes from "./routes/salesChat.routes.js";
 
 export function createApp() {
   const app = express();
@@ -158,6 +159,7 @@ export function createApp() {
   app.use("/api/transport-library", transportLibraryRoutes);
   app.use("/api/team", teamRoutes);
   app.use("/api/sales-monitor", salesMonitorRoutes);
+  app.use("/api/sales-chat", salesChatRoutes);
 
   app.use((err, req, res, next) => {
     console.error(err);

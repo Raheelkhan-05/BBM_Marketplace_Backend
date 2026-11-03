@@ -13,6 +13,9 @@ import { startPaymentScheduler } from "./services/paymentScheduler.service.js";
 import { startGroupBannerWatcher } from "./services/groupBanners.service.js";
 import { startAiBannerWorker } from "./services/aiBanners.service.js";
 import { shutdownAnalytics } from "./services/analytics.service.js";
+import { registerSalesChatSocket } from "./services/salesChat.service.js";
+import { startSalesChatReminderScheduler } from "./services/salesChatReminder.service.js";
+
 
 const PORT = process.env.PORT || 4000;
 const app = createApp();
@@ -58,6 +61,8 @@ async function start() {
   await attachRedisAdapter(io);
   setIO(io);
   registerChatSocket(io);
+  registerSalesChatSocket(io);
+
 
   httpServer.listen(PORT, () => {
     console.log(`[server] listening on http://localhost:${PORT}`);
@@ -72,6 +77,9 @@ startListingExpiryScheduler();
 startSettlementScheduler();
 // JioPay: re-checks open payments, repairs commissions, pushes queued refunds to the gateway.
 startPaymentScheduler();
+
+startSalesChatReminderScheduler();
+
 // Home page group banners: finds new product groups every 30 min and notifies admins.
 // Safe on several processes: new groups are claimed atomically before anyone is notified.
 startGroupBannerWatcher();
