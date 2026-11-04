@@ -29,7 +29,7 @@ export async function runSalesChatReminders() {
         if (error) { console.error("[sales chat reminder] claim failed:", error.message); return; }
         if (!data?.length) return;
 
-        const people = await namesOf(data.map((r) => r.n_user_id));
+        const people = await namesOf([...data.map((r) => r.n_user_id), ...data.map((r) => r.n_last_author_id)]);
         for (const r of data) {
             try {
                 const me = people.get(String(r.n_user_id));
@@ -37,7 +37,7 @@ export async function runSalesChatReminders() {
                 await sendSalesChatWhatsApp({
                     to: me.phone, name: firstName(me.name), kind: "reminder",
                     customer: r.n_customer || "a customer", product: r.n_product || "",
-                    from: r.n_last_author || "", preview: r.n_last_body || "",
+                    from: people.get(String(r.n_last_author_id))?.name || "", preview: r.n_last_body || "",
                     unread: r.n_unread || 1, mentioned: (r.n_mentions || 0) > 0,
                     link: reminderLink({ id: r.n_enquiry_id, created_by_actor_id: r.n_is_creator ? r.n_user_id : null }, r.n_user_id),
                 });

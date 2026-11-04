@@ -99,10 +99,11 @@ export async function cleanMentions(raw, row, senderId) {
 }
 
 export async function markRead(enquiryId, userId) {
-    const { data } = await db.from("sales_thread_participants")
-        .update({ last_read_at: new Date().toISOString() }).eq("enquiry_id", enquiryId).eq("user_id", userId).select("user_id");
-    if (data?.length) emitToUser(userId, "salesChat:read", { threadId: enquiryId });   // other tabs / badges
-    return !!data?.length;
+    // The database stamps the time (never this server's clock), so clock differences can't leave a message "unread".
+    const { data, error } = await db.rpc("mark_sales_chat_read", { p_enquiry: enquiryId, p_user: userId });
+    if (error) { console.error("[sales chat] mark read failed:", error.message); return false; }
+    if (data > 0) emitToUser(userId, "salesChat:read", { threadId: enquiryId });   // other tabs / badges: only when something changed
+    return data >= 0;
 }
 
 /* ------------------------------ realtime ------------------------------ */
@@ -202,8 +203,10 @@ export async function afterMessage({ row, companyId, entry, senderId, senderName
     const now = new Date().toISOString();
     senderId = String(senderId);
     const added = await ensureParticipants(row, [senderId], senderId);
+    // the stored author name can be a generic tag ("Salesperson"): always show the real name
+    senderName = (await namesOf([senderId])).get(senderId)?.name || senderName;
 
-    const jobs = [db.from("sales_thread_participants").update({ last_read_at: now }).eq("enquiry_id", row.id).eq("user_id", senderId)];
+    const jobs = [markRead(row.id, senderId)];
     if (touch) {
         jobs.push(db.from("rfq_enquiries").update({
             last_activity_at: now, last_entry_preview: `${firstName(senderName)}: ${preview}`.slice(0, 120),
