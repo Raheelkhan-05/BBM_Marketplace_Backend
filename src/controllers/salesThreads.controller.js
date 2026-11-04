@@ -463,7 +463,7 @@ export async function listThreads(req, res) {
     try {
         res.set("Cache-Control", "no-store");
 
-        const { actorId, ownerId } = getSalesActor(req);
+        const { actorId, ownerId, sellerId } = getSalesActor(req);
 
         const limit = Math.min(
             Math.max(parseInt(req.query.limit, 10) || 15, 1),
@@ -530,8 +530,22 @@ export async function listThreads(req, res) {
                 }
 
                 if (q) {
+                    // customers (by GST number) whose city matches the search
+                    let cityGst = "";
+                    if (sellerId) {
+                        const { data: hit, error: cErr } = await supabase
+                            .from("seller_customers")
+                            .select("gstin")
+                            .eq("seller_id", sellerId)
+                            .ilike("city", `%${q}%`)
+                            .not("gstin", "is", null)
+                            .limit(300);
+                        if (cErr) throw cErr;
+                        const g = [...new Set((hit || []).map((h) => h.gstin).filter((x) => GSTIN_RE.test(x)))];
+                        if (g.length) cityGst = `,customer_gstin.in.(${g.join(",")})`;
+                    }
                     query = query.or(
-                        `product_name.ilike.%${q}%,customer_name.ilike.%${q}%,customer_gstin.ilike.%${q}%`
+                        `product_name.ilike.%${q}%,customer_name.ilike.%${q}%,customer_gstin.ilike.%${q}%${cityGst}`
                     );
                 }
 
@@ -586,6 +600,18 @@ export async function listThreads(req, res) {
                 const rows = list.data || [];
                 const qCount = new Map();
 
+                const cityBy = new Map();
+                const gsts = [...new Set(rows.map((r) => r.customer_gstin).filter(Boolean))];
+                if (sellerId && gsts.length) {
+                    const { data: cs, error: csErr } = await supabase
+                        .from("seller_customers")
+                        .select("gstin, city")
+                        .eq("seller_id", sellerId)
+                        .in("gstin", gsts);
+                    if (csErr) throw csErr;
+                    for (const c of cs || []) if (c.city) cityBy.set(c.gstin, c.city);
+                }
+
                 if (rows.length) {
                     const { data: qs, error: qErr } = await supabase
                         .from("sales_quotes")
@@ -602,11 +628,10 @@ export async function listThreads(req, res) {
                     }
                 }
 
-                const items = rows.map((r) =>
-                    dtoOf(r, {
-                        quotesCount: qCount.get(r.id) || 0,
-                    })
-                );
+                const items = rows.map((r) => ({
+                    ...dtoOf(r, { quotesCount: qCount.get(r.id) || 0 }),
+                    city: cityBy.get(r.customer_gstin) || null,
+                }));
 
                 const out = {
                     success: true,
