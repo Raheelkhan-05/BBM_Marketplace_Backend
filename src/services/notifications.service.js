@@ -1,6 +1,7 @@
 import { supabase } from "../config/supabase.js";
 import { resend } from "../config/mailer.js";
 import { getIO } from "../socket/io.js";
+import { bumpVer, sellerListScope } from "./cache.service.js";
 
 const FROM_ADDRESS = process.env.SMTP_FROM;
 
@@ -64,6 +65,7 @@ export async function notifyAdmins({ type, title, body, link, emailSubject, emai
 
 export async function notifySellerSubmissionsChanged(userId) {
     if (!userId) return;
+    await bumpVer(sellerListScope(userId));
     try { getIO().to(`user:${userId}`).emit("submissions_changed", {}); }
     catch (err) { console.error("[notifications] submissions_changed emit failed:", err.message); }
 }

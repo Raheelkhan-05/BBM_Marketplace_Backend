@@ -16,7 +16,7 @@
 //   So a bulk price change writes ONLY base_price (GST-exclusive, per sale unit) and lets
 //   the trigger derive `price`. Percent-based custom buyer prices are computed as
 //   price * (1 - discount%), so they follow the new price automatically.
-import { supabase } from "../config/supabase.js";
+import { supabase, supabaseAdmin } from "../config/supabase.js";
 import { publishListingChange } from "../services/listingRealtime.service.js";
 import { resolveCompanyIds } from "../services/team.service.js";
 import { isListingExpired } from "../../shared/listingValidity.js";
@@ -43,6 +43,17 @@ function cleanIds(raw) {
 async function loadOwned(sellerId, ids, columns) {
     const { data, error } = await supabase.from(SUBMISSIONS).select(columns).eq("seller_id", sellerId).in("id", ids);
     return { rows: data || [], error };
+}
+
+// Realtime publishing runs AFTER the response, a few listings at a time, so a 200-listing
+// action neither delays the seller nor fires 200 queries at once.
+function publishLater(ids, opts) {
+    const list = [...ids];
+    setImmediate(async () => {
+        for (let i = 0; i < list.length; i += 5) {
+            await Promise.allSettled(list.slice(i, i + 5).map((id) => publishListingChange(id, opts)));
+        }
+    });
 }
 
 function chunk(arr, n) {
@@ -96,22 +107,30 @@ export async function bulkChangePrice(req, res) {
         toWrite.push({ id, next });
     }
 
-    const updated = [];
-    for (const part of chunk(toWrite, WRITE_CONCURRENCY)) {
-        const results = await Promise.all(part.map(async (w) => {
-            const { data, error: e } = await supabase.from(SUBMISSIONS)
-                .update({ base_price: w.next })
-                .eq("id", w.id).eq("seller_id", sellerId)
-                .select("id, price, base_price").maybeSingle();
-            return { w, data, error: e };
-        }));
-        for (const r of results) {
-            if (r.error || !r.data) { skipped.push({ id: r.w.id, reason: "Couldn't be saved. Try again." }); continue; }
-            updated.push(r.data);
-            void publishListingChange(r.data.id);
+    let updated = [];
+    if (toWrite.length) {
+        const { data, error: rpcErr } = await supabaseAdmin.rpc("bulk_scale_base_price", {
+            p_seller: sellerId, p_ids: toWrite.map((w) => w.id), p_factor: Number(factor.toFixed(6)),
+        });
+        if (!rpcErr) {
+            updated = (data || []).map((r) => ({ id: r.out_id, price: r.out_price, base_price: r.out_base_price }));
+        } else {
+            // bulk_scale_base_price isn't installed (or failed): fall back to one update per listing
+            for (const part of chunk(toWrite, WRITE_CONCURRENCY)) {
+                const results = await Promise.all(part.map(async (w) => {
+                    const { data: d, error: e } = await supabase.from(SUBMISSIONS)
+                        .update({ base_price: w.next }).eq("id", w.id).eq("seller_id", sellerId)
+                        .select("id, price, base_price").maybeSingle();
+                    return { d, e };
+                }));
+                for (const r of results) if (!r.e && r.d) updated.push(r.d);
+            }
         }
+        const got = new Set(updated.map((u) => String(u.id)));
+        for (const w of toWrite) if (!got.has(w.id)) skipped.push({ id: w.id, reason: "Couldn't be saved. Try again." });
     }
 
+    publishLater(updated.map((u) => u.id));
     res.json({
         success: true, updated, skipped,
         message: `Updated ${updated.length} listing${updated.length === 1 ? "" : "s"}.`,
@@ -155,7 +174,7 @@ export async function bulkSetActive(req, res) {
             .select("id, is_active");
         if (e) return res.status(500).json({ success: false, message: e.message });
         updated = data || [];
-        updated.forEach((u) => void publishListingChange(u.id));
+        publishLater(updated.map((u) => u.id));
         const got = new Set(updated.map((u) => String(u.id)));
         okIds.filter((id) => !got.has(id)).forEach((id) => skipped.push({ id, reason: "Couldn't be saved. Try again." }));
     }
@@ -286,7 +305,7 @@ export async function bulkVisibility(req, res) {
         }
     }
 
-    validIds.forEach((id) => void publishListingChange(id, buyerIdsForRealtime.length ? { buyerIds: buyerIdsForRealtime } : undefined));
+    publishLater(validIds, buyerIdsForRealtime.length ? { buyerIds: buyerIdsForRealtime } : undefined);
 
     const n = validIds.length;
     res.json({

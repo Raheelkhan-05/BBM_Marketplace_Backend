@@ -8,6 +8,7 @@ import {
 } from "../controllers/bulkListings.controller.js";
 
 const router = Router();
+
 router.use(requireAuth, requireApprovedSeller);
 
 router.get("/summary", bulkSummary);

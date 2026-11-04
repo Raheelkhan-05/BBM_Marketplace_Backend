@@ -35,8 +35,12 @@ import {
 } from "../controllers/sellerListingTemplates.controller.js";
 import { searchBrandNames, findBrandItemMatch } from "../controllers/sellerBrands.controller.js";
 import { listPickerBrands, listPickerItems } from "../controllers/sellerCatalogPicker.controller.js";
+import { listAllMySubmissions } from "../controllers/sellerCatalogListAll.controller.js";
+import { bumpOnWrite, sellerListScope } from "../services/cache.service.js";
+
 
 const router = Router();
+router.use(bumpOnWrite((req) => req.sellerId && sellerListScope(req.sellerId)));
 
 router.get("/access-status", getSellerAccessStatus);
 // router.get("/categories", listApprovedCategories);
@@ -47,6 +51,9 @@ router.get("/commission-info", getCommissionInfo);
 // router.post("/categories", createSellerCategory);
 // router.post("/subcategories", createSellerSubcategory);
 // router.post("/generic-products", createSellerGenericProduct);
+
+
+router.get("/submissions/all", requireAuth, requireApprovedSeller, listAllMySubmissions);   // must be ABOVE "/submissions/:id"
 
 router.post("/submissions", requireAuth, requireApprovedSeller, createSubmission);
 router.get("/submissions", requireAuth, requireApprovedSeller, listMySubmissions);
