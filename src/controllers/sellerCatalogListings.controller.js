@@ -223,7 +223,10 @@ const SUBMISSION_LIST_COLUMNS = `
     pack_size, units_per_master_pack, marketing_commission_percent, marketing_services, marketing_legacy_percent,
     stock_type, stock_quantity, production_lead_time_days, lead_time, visibility_mode,
     dispatch_district, dispatch_state, return_policy_key, warranty_key,
-    hs_generic_product_brands!inner ( id, name, brand_name, brand_image, image, images, deleted_at )
+    hs_generic_product_brands!inner (
+        id, name, brand_name, brand_image, image, images, deleted_at, model_no,
+        hs_generic_products ( id, name, hs_subcategories ( id, name, hs_categories ( id, name ) ) )
+    )
 `;
 
 const SUBMISSION_DETAIL_COLUMNS = `*, hs_generic_product_brands ( id, name, brand_name, image, images, brand_not_applicable, deleted_at )`;
@@ -890,10 +893,20 @@ export async function listMySubmissions(req, res) {
     const { data, error, count } = await query;
     if (error) return res.status(500).json({ success: false, message: error.message });
 
-    const items = (data || []).map(({ hs_generic_product_brands, ...rest }) => ({
-        ...rest,
-        brand: hs_generic_product_brands || null,
-    }));
+    const one = (x) => (Array.isArray(x) ? x[0] : x) || null;
+    const items = (data || []).map(({ hs_generic_product_brands, ...rest }) => {
+        const { hs_generic_products, ...brand } = hs_generic_product_brands || {};
+        const gp = one(hs_generic_products);
+        const sub = one(gp?.hs_subcategories);
+        const cat = one(sub?.hs_categories);
+        return {
+            ...rest,
+            brand: hs_generic_product_brands ? brand : null,
+            generic_product_id: gp?.id ?? null, generic_product_name: gp?.name ?? null,
+            subcategory_id: sub?.id ?? null, subcategory_name: sub?.name ?? null,
+            category_id: cat?.id ?? null, category_name: cat?.name ?? null,
+        };
+    });
 
     res.json({
         success: true,

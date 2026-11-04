@@ -25,6 +25,7 @@ import {
     getListingAccess, setVisibilityMode, addVisibilityBuyer,
     removeVisibilityBuyer, searchEligibleBuyersForSeller,
 } from "../controllers/sellerListingVisibility.controller.js";
+import { bulkChangePrice, bulkSetActive, bulkVisibility } from "../controllers/sellerCatalogBulk.controller.js";
 import {
     listTemplates,
     listDefaultTemplates,
@@ -75,5 +76,10 @@ router.get("/brand-item-match", findBrandItemMatch);
 
 router.get("/picker/brands", requireAuth, requireApprovedSeller, listPickerBrands);
 router.get("/picker/items", requireAuth, requireApprovedSeller, listPickerItems);
+
+
+router.patch("/bulk/price", requireAuth, requireApprovedSeller, bulkChangePrice);
+router.patch("/bulk/active", requireAuth, requireApprovedSeller, bulkSetActive);
+router.patch("/bulk/visibility", requireAuth, requireApprovedSeller, bulkVisibility);
 
 export default router;
