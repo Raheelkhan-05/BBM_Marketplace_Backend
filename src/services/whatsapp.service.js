@@ -591,11 +591,11 @@ export async function sendOrderPlacedWhatsApp({
 
         totalsBlock,
 
-        clean(notes) ? "" : null,
+        // clean(notes) ? "" : null,
 
-        clean(notes)
-            ? field("Order Notes", notes)
-            : null,
+        // clean(notes)
+        //     ? field("Order Notes", notes)
+        //     : null,
 
         "",
 
