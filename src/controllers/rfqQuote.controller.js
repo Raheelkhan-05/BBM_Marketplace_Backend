@@ -199,7 +199,7 @@ export async function submitQuote(req, res) {
         if (!isUuid(b.submissionId)) return bad("Choose a product to quote with.");
         if (!(price > 0) || price > 1e7) return bad("Enter a valid price.");
         if (!BASES.includes(b.priceBasis)) return bad("Choose whether the price is per unit, pack or master pack.");
-        if (typeof b.gstInclusive !== "boolean") return bad("Tell us whether your price includes GST.");
+        if (typeof b.gstInclusive !== "boolean") return bad("Tell us whether your price with GST.");
         if (!validityMeta(b.validity)) return bad("Choose how long the quote is valid.");
 
         const { data: raw, error: lErr } = await supabase

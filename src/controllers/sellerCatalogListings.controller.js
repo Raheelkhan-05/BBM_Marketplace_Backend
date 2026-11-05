@@ -333,7 +333,7 @@ function validateListingPayload(body) {
     if (!(Number(body.basePrice) > 0)) missing.push("Base price");
 
     if (!PRICE_BASES.includes(body.priceBasis)) missing.push("Price basis (per unit / pack / master pack)");
-    if (typeof body.gstInclusive !== "boolean") missing.push("Whether price includes GST");
+    if (typeof body.gstInclusive !== "boolean") missing.push("Whether price with GST");
     if (typeof body.freightIncluded !== "boolean") missing.push("Whether freight is included");
 
     if (!Array.isArray(body.marketingServices)) {
