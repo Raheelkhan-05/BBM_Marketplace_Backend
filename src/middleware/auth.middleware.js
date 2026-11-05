@@ -6,7 +6,9 @@ import { getTeamContext } from "../services/team.service.js";
 const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET;
 
 // A salesperson may only reach these. Everything else is refused, whatever the UI does.
-const SALES_ALLOWED = [/^\/api\/auth\/me$/, /^\/api\/sales(\/|$)/, /^\/api\/geo(\/|$)/];
+// /api/sales-chat is the enquiry group chat (read tracking, people, messages, files): the controller itself only
+// lets participants of a thread in.
+const SALES_ALLOWED = [/^\/api\/auth\/me$/, /^\/api\/sales(\/|$)/, /^\/api\/sales-chat(\/|$)/, /^\/api\/geo(\/|$)/];
 // Read-only (GET) access to the team roster, same view a regular member gets.
 const SALES_READONLY = [/^\/api\/team$/];
 

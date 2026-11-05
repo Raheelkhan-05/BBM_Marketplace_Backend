@@ -94,7 +94,7 @@ const targetsOf = (row) => {
 
 const TS_RE = /^\d{4}-\d{2}-\d{2}T[\d:.]+(Z|[+-]\d{2}(:?\d{2})?)$/;
 
-const STATUS_FILTERS = ["open", "won", "lost", "reminder", "cold"];
+const STATUS_FILTERS = ["open", "won", "lost", "reminder", "cold", "unread"];
 const KIND_COLD = "cold_call";
 
 const NOTE_MAX = 4000;
@@ -459,74 +459,63 @@ async function touch(
 
 // ---- GET /sales/threads -------------------------------------------------------------------------------
 
+const NIL_UUID = "00000000-0000-0000-0000-000000000000";
+const UNREAD_IDS_MAX = 500;
+
+// { enquiryId -> { unread, mentions } } for threads the signed-in salesperson owns. Never cached:
+// it changes with every message and every read, per person.
+async function unreadFor(actorId, ownerId) {
+    const { data, error } = await supabase.rpc("sales_enquiry_unread", { p_user: actorId, p_owner: ownerId });
+    if (error) {
+        console.error("[sales threads] unread lookup failed:", error.message);
+        return new Map();
+    }
+    return new Map((data || []).map((r) => [r.n_enquiry_id, { unread: r.n_unread || 0, mentions: r.n_mentions || 0 }]));
+}
+
 export async function listThreads(req, res) {
     try {
         res.set("Cache-Control", "no-store");
 
         const { actorId, ownerId, sellerId } = getSalesActor(req);
 
-        const limit = Math.min(
-            Math.max(parseInt(req.query.limit, 10) || 15, 1),
-            100
-        );
-
-        const offset = Math.max(
-            parseInt(req.query.offset, 10) || 0,
-            0
-        );
-
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 15, 1), 100);
+        const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
         const q = safeSearch(req.query.q);
+        const status = STATUS_FILTERS.includes(req.query.status) ? req.query.status : "";
 
-        const status = STATUS_FILTERS.includes(req.query.status)
-            ? req.query.status
-            : "";
+        // Live, per-person unread (outside the cache).
+        const unread = await unreadFor(actorId, ownerId);
+        const unreadIds = status === "unread"
+            ? [...unread.keys()].slice(0, UNREAD_IDS_MAX).sort()
+            : [];
 
         const ver = await getVer(`sa:${actorId}`);
 
         const body = await cached(
-            `stl:${actorId}:${ver}:${hashKey([q, status, limit, offset])}`,
+            `stl:${actorId}:${ver}:${hashKey([q, status, limit, offset, unreadIds.join(",")])}`,
             45,
             async () => {
                 const scoped = (qb) =>
-                    qb
-                        .eq("source", "sales")
-                        .eq("created_by_actor_id", actorId)
-                        .eq("buyer_id", ownerId);
+                    qb.eq("source", "sales").eq("created_by_actor_id", actorId).eq("buyer_id", ownerId);
 
                 const count = () =>
-                    scoped(
-                        supabase
-                            .from("rfq_enquiries")
-                            .select("id", {
-                                count: "exact",
-                                head: true,
-                            })
-                    );
+                    scoped(supabase.from("rfq_enquiries").select("id", { count: "exact", head: true }));
 
-                let query = scoped(
-                    supabase
-                        .from("rfq_enquiries")
-                        .select("*", {
-                            count: "exact",
-                        })
-                );
+                let query = scoped(supabase.from("rfq_enquiries").select("*", { count: "exact" }));
 
                 if (status === "open") {
                     query = query.neq("status", "closed");
                 } else if (status === "won") {
-                    query = query
-                        .eq("status", "closed")
-                        .eq("sales_outcome", "won");
+                    query = query.eq("status", "closed").eq("sales_outcome", "won");
                 } else if (status === "lost") {
-                    query = query
-                        .eq("status", "closed")
-                        .eq("sales_outcome", "lost");
+                    query = query.eq("status", "closed").eq("sales_outcome", "lost");
                 } else if (status === "reminder") {
-                    query = query
-                        .not("reminder_at", "is", null)
-                        .neq("status", "closed");
+                    query = query.not("reminder_at", "is", null).neq("status", "closed");
                 } else if (status === "cold") {
                     query = query.eq("sales_kind", KIND_COLD);
+                } else if (status === "unread") {
+                    query = query.in("id", unreadIds.length ? unreadIds : [NIL_UUID]);
                 }
 
                 if (q) {
@@ -551,47 +540,21 @@ export async function listThreads(req, res) {
 
                 query = (
                     status === "reminder"
-                        ? query.order("reminder_at", {
-                            ascending: true,
-                        })
-                        : query.order("last_activity_at", {
-                            ascending: false,
-                        })
+                        ? query.order("reminder_at", { ascending: true })
+                        : query.order("last_activity_at", { ascending: false })
                 )
-                    .order("id", {
-                        ascending: true,
-                    })
+                    .order("id", { ascending: true })
                     .range(offset, offset + limit - 1);
 
                 const first = offset === 0;
 
-                const [
-                    list,
-                    all,
-                    open,
-                    won,
-                    lost,
-                    rem,
-                    cold,
-                ] = await Promise.all([
+                const [list, all, open, won, lost, rem, cold] = await Promise.all([
                     query,
                     first ? count() : null,
                     first ? count().neq("status", "closed") : null,
-                    first
-                        ? count()
-                            .eq("status", "closed")
-                            .eq("sales_outcome", "won")
-                        : null,
-                    first
-                        ? count()
-                            .eq("status", "closed")
-                            .eq("sales_outcome", "lost")
-                        : null,
-                    first
-                        ? count()
-                            .neq("status", "closed")
-                            .not("reminder_at", "is", null)
-                        : null,
+                    first ? count().eq("status", "closed").eq("sales_outcome", "won") : null,
+                    first ? count().eq("status", "closed").eq("sales_outcome", "lost") : null,
+                    first ? count().neq("status", "closed").not("reminder_at", "is", null) : null,
                     first ? count().eq("sales_kind", KIND_COLD) : null,
                 ]);
 
@@ -617,15 +580,8 @@ export async function listThreads(req, res) {
                         .from("sales_quotes")
                         .select("enquiry_id")
                         .in("enquiry_id", rows.map((r) => r.id));
-
                     if (qErr) throw qErr;
-
-                    for (const x of qs || []) {
-                        qCount.set(
-                            x.enquiry_id,
-                            (qCount.get(x.enquiry_id) || 0) + 1
-                        );
-                    }
+                    for (const x of qs || []) qCount.set(x.enquiry_id, (qCount.get(x.enquiry_id) || 0) + 1);
                 }
 
                 const items = rows.map((r) => ({
@@ -655,7 +611,29 @@ export async function listThreads(req, res) {
             }
         );
 
-        res.json(body);
+        // Overlay the live unread numbers on the (possibly cached) body, without mutating the cached object.
+        const out = {
+            ...body,
+            items: body.items.map((it) => ({ ...it, ...(unread.get(it.id) || { unread: 0, mentions: 0 }) })),
+        };
+        if (body.counts) out.counts = { ...body.counts, unread: unread.size };
+
+        res.json(out);
+    } catch (e) {
+        oops(res, e);
+    }
+}
+
+// ---- GET /sales/threads/unread-count ------------------------------------------------------------------
+// Tiny, uncached summary for the red dot on the RFQs tab: how many of MY enquiries have messages I haven't read.
+export async function unreadSummary(req, res) {
+    try {
+        res.set("Cache-Control", "no-store");
+        const { actorId, ownerId } = getSalesActor(req);
+        const map = await unreadFor(actorId, ownerId);
+        let unread = 0, mentions = 0;
+        for (const v of map.values()) { unread += v.unread; mentions += v.mentions; }
+        res.json({ success: true, threads: map.size, unread, mentions });
     } catch (e) {
         oops(res, e);
     }

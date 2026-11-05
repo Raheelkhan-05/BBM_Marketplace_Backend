@@ -4,7 +4,7 @@ import { Router } from "express";
 import { authWriteLimiter } from "../middleware/rateLimiter.js";
 import {
     listThreads, createThread, getThread, updateThread, setThreadStatus, setReminder, setThreadProduct,
-    signAttachment, addEntry, listQuoteProducts, listCatalogProducts, sendQuote, resendQuote,
+    signAttachment, addEntry, listQuoteProducts, listCatalogProducts, sendQuote, resendQuote, unreadSummary,
 } from "../controllers/salesThreads.controller.js";
 
 const router = Router();
@@ -12,8 +12,9 @@ const router = Router();
 router.get("/", listThreads);
 router.post("/", authWriteLimiter, createThread);
 
-// Must stay above "/:id" so "products" is never read as a thread id.
+// These must stay above "/:id" so they are never read as a thread id.
 router.get("/products", listCatalogProducts);
+router.get("/unread-count", unreadSummary);
 
 router.get("/:id", getThread);
 router.patch("/:id", authWriteLimiter, updateThread);
