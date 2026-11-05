@@ -112,7 +112,7 @@ export async function payReturn(req, res) {
 
     const src = { ...(req.query || {}), ...(req.body || {}) };
     const ref = String(src.merchantTxnNo || "");
-    if (!isValidRef(ref)) return res.redirect(303, `${cfg.frontendUrl}/orders`);
+    if (!isValidRef(ref)) return res.redirect(303, `${cfg.frontendUrl}/buy/orders`);
 
     await logReturnEvent(ref, src);
     return res.redirect(303, `${cfg.frontendUrl}/payment/return?ref=${encodeURIComponent(ref)}`);

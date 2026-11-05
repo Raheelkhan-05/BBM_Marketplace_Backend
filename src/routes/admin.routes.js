@@ -57,6 +57,13 @@ import {
 
 import { aiOverview, aiEnqueue, aiCancel } from "../controllers/aiBanners.controller.js";
 
+// NEW — Image Studio: white-background product images (bulk, atomic apply, undo).
+import {
+  listProducts as studioListProducts, planBatch as studioPlan, processAsset as studioProcessAsset,
+  failAsset as studioFailAsset, retryItem as studioRetry, applyItems as studioApply,
+  revertItem as studioRevert, discardBatch as studioDiscard, proxyImage as studioProxy, cutoutUpload,
+} from "../controllers/imageStudio.controller.js";
+
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
 
 
@@ -150,5 +157,18 @@ router.delete("/entity-banners/:type/:id/:shape", requireAuth, requireAdmin, aut
 router.get("/ai-banners", requireAuth, requireAdmin, aiOverview);
 router.post("/ai-banners/jobs", requireAuth, requireAdmin, authWriteLimiter, aiEnqueue);
 router.post("/ai-banners/cancel", requireAuth, requireAdmin, authWriteLimiter, aiCancel);
+
+// NEW — Image Studio (white-background product images).
+// The per-image process route is hit once per image during a batch, so it is deliberately
+// NOT behind authWriteLimiter (that would throttle a 100-product batch).
+router.get("/image-studio/products", requireAuth, requireAdmin, studioListProducts);
+router.get("/image-studio/proxy", requireAuth, requireAdmin, studioProxy);
+router.post("/image-studio/plan", requireAuth, requireAdmin, authWriteLimiter, studioPlan);
+router.post("/image-studio/assets/:assetId/process", requireAuth, requireAdmin, cutoutUpload, studioProcessAsset);
+router.post("/image-studio/assets/:assetId/fail", requireAuth, requireAdmin, studioFailAsset);
+router.post("/image-studio/items/:itemId/retry", requireAuth, requireAdmin, studioRetry);
+router.post("/image-studio/items/:itemId/revert", requireAuth, requireAdmin, authWriteLimiter, studioRevert);
+router.post("/image-studio/apply", requireAuth, requireAdmin, authWriteLimiter, studioApply);
+router.delete("/image-studio/batches/:batchId", requireAuth, requireAdmin, studioDiscard);
 
 export default router;
