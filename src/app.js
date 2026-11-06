@@ -47,6 +47,7 @@ import salesMonitorRoutes from "./routes/salesMonitor.routes.js";
 import { apiAnalytics } from "./middleware/apiAnalytics.middleware.js";
 import { captureServerException } from "./services/analytics.service.js";
 import salesChatRoutes from "./routes/salesChat.routes.js";
+import partnerRoutes from "./routes/partner.routes.js";
 
 export function createApp() {
   const app = express();
@@ -103,7 +104,7 @@ export function createApp() {
   );
 
   app.use(express.json({ limit: "6mb" }));
-
+  app.use("/api/partner", partnerRoutes);
   // Admin "act as seller" sessions only. Normal tokens pass straight through (no signature check, no cost).
   // Must stay BEFORE every /api router below, so a restricted session can never reach an unlisted route.
   app.use("/api", impersonationGuard);

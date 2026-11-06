@@ -1,3 +1,5 @@
+// app.use("/api/catalog-search", catalogSearchRoutes);
+
 import { Router } from "express";
 import {
     searchCategoriesV2,

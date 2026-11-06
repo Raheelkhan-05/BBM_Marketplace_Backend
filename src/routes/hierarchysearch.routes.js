@@ -1,3 +1,5 @@
+// app.use("/api/search", hierarchySearchRoutes);
+
 import { Router } from "express";
 import {
     searchCategories,

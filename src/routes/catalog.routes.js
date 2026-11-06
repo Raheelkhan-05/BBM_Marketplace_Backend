@@ -4,6 +4,8 @@
 // as your existing "public read categories/products/subcategories" RLS
 // policies already assume.
 
+//app.use("/api/catalog", catalogRoutes);
+
 import { Router } from "express";
 import { optionalAuth } from "../middleware/optionalAuth.middleware.js";
 import { optionalSellerProfile } from "../middleware/optionalSellerProfile.middleware.js";

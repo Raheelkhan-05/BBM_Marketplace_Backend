@@ -1,4 +1,5 @@
 // routes/rfq.routes.js
+// app.use("/api/rfq", rfqRoutes);
 import { Router } from "express";
 import { requireAuth, optionalAuth } from "../middleware/auth.middleware.js";
 import { requireApprovedSeller } from "../middleware/requireApprovedSeller.js";
