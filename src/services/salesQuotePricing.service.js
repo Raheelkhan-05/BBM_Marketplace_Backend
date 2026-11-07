@@ -13,6 +13,7 @@ import { CATALOG_REMOVED_REJECTION_REASON } from "../controllers/sellerCatalogLi
 import {
     priceFromLevel, resolveEffectiveBasePrice, violatesMinUnitPrice, MIN_UNIT_PRICE,
 } from "../../shared/customPricing.js";
+import { promotePendingVisibilityForBuyer } from "./gstAccess.service.js";
 import { saleUnits, round4, listingProblem, cleanGstin, GSTIN_RE } from "./salesThreads.service.js";
 import { cached } from "./cache.service.js";
 
@@ -212,6 +213,7 @@ export async function applyOrderCustomPrices({ sellerId, ownerId, actorId, gstin
 // listings. Called from auth.controller.completeProfile after the GSTIN is saved:
 //     void applyPendingCustomPricesForBuyer({ userId, gstin });
 export async function applyPendingCustomPricesForBuyer({ userId, gstin }) {
+    await promotePendingVisibilityForBuyer({ userId, gstin });
     const done = { applied: 0, sellers: 0 };
     try {
         const g = cleanGstin(gstin);

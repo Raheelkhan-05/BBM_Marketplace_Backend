@@ -5,6 +5,7 @@ import { channelTokenFor } from "../services/channelToken.js";
 import { sendWelcomeEmail, sendBusinessVerifiedEmail } from "../services/mail.service.js";
 import { getTeamContext } from "../services/team.service.js";
 import { applyPendingCustomPricesForBuyer } from "../services/salesQuotePricing.service.js";
+import { promotePendingVisibilityForBuyer } from "../services/gstAccess.service.js";
 
 // Team members never register a company of their own; the admin's company is theirs.
 async function blockTeamMember(req, res) {
@@ -240,6 +241,11 @@ export async function completeProfile(req, res) {
     console.error("[complete-profile] business upsert failed:", bizErr.message);
     return res.status(500).json({ success: false, message: "Couldn't save your company details. Try again." });
   }
+
+  // Access a seller granted to this GST number before the buyer joined becomes real access now
+  // (idempotent, background, never blocks signup).
+  void promotePendingVisibilityForBuyer({ userId: req.user.id, gstin: gstCheck.gstin })
+    .catch((e) => console.error("[complete-profile] promoting remembered access failed:", e?.message || e));
 
   // Prices a salesperson quoted / punched for this GST number before the buyer joined become their custom prices now
   // (background, idempotent, never blocks or fails signup). Only for an Active GST registration, like the "verified" email.

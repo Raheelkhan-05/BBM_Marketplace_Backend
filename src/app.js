@@ -48,6 +48,7 @@ import { apiAnalytics } from "./middleware/apiAnalytics.middleware.js";
 import { captureServerException } from "./services/analytics.service.js";
 import salesChatRoutes from "./routes/salesChat.routes.js";
 import partnerRoutes from "./routes/partner.routes.js";
+import gstAccessRoutes from "./routes/gstAccess.routes.js";
 
 export function createApp() {
   const app = express();
@@ -122,6 +123,7 @@ export function createApp() {
   app.use("/api/auth", authRoutes);
   app.use("/api/seo", seoRoutes);
   app.use("/api/sales", salesRoutes);
+  app.use("/api/seller/gst-access", gstAccessRoutes);
   app.use("/api/seller/customers", sellerCustomersRoutes);
   app.use("/api/seller/catalog", sellerCatalogListingsRouter);
   app.use("/api/seller/bulk", bulkListingsRoutes);

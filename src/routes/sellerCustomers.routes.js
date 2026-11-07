@@ -1,3 +1,5 @@
+// app.use("/api/seller/customers", sellerCustomersRoutes);
+
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.middleware.js";
 import { requireApprovedSeller } from "../middleware/requireApprovedSeller.js";

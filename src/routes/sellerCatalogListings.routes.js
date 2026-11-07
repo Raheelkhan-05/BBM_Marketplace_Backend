@@ -5,6 +5,7 @@
 // the routes for access-status/categories/subcategories/generic-products/
 // submissions/listings). Adds the new commission-info, submission-detail,
 // and templates ("groups") endpoints.
+//app.use("/api/seller/catalog", sellerCatalogListingsRouter);
 
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.middleware.js";

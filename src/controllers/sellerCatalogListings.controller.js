@@ -94,6 +94,7 @@ import {
     getCommissionPercent, computeMarketplaceFigures,
     normalizeEnteredPrice,
 } from "../services/pricing.service.js";
+import { savePendingFromDraft } from "../services/gstAccess.service.js";
 import { SUBMISSION_LIST_COLUMNS, shapeListRow } from "./sellerCatalogListAll.controller.js";
 import { resolveCompanyIds } from "../services/team.service.js";
 import { resolveMarketingFields } from "../services/marketing.service.js";
@@ -120,8 +121,15 @@ const GROUP_FIELD_MAP = {
 // getListingAccess() in sellerListingVisibility.controller.js reads back
 // from, so a listing created with a draft looks identical to one edited
 // through the live BuyerAccessPricing flow afterward.
-async function applyBuyerAccessDraft(submissionId, sellerId, draft, defaultPrice) {
-    if (!draft || !Array.isArray(draft.buyers) || !draft.buyers.length) return;
+async function applyBuyerAccessDraft(submissionId, sellerId, draftIn, defaultPrice) {
+    if (!draftIn || !Array.isArray(draftIn.buyers) || !draftIn.buyers.length) return;
+
+    // buyers added by GST number carry buyerId "gst:<GSTIN>"
+    const isGstEntry = (b) => !!b.gstin && String(b.buyerId || "").startsWith("gst:");
+    const gstBuyers = draftIn.buyers.filter(isGstEntry);
+    if (gstBuyers.length) await savePendingFromDraft({ sellerId, submissionId, buyers: gstBuyers });
+    const draft = { ...draftIn, buyers: draftIn.buyers.filter((b) => !isGstEntry(b)) };
+    if (!draft.buyers.length) return;
 
     const map = await resolveCompanyIds(draft.buyers.map((b) => b.buyerId));
     const byCompany = new Map();                       // dedupe: two teammates -> one company
