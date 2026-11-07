@@ -3,7 +3,6 @@ import { supabase } from "../config/supabase.js";
 import { sanitizeEnquiry, toDto, isUuid, RFQ_STATUSES } from "../services/rfqValidation.js";
 import { notifyAdminsNewRfq } from "../services/rfqNotify.js";
 import { attachQuotes, countQuotesForBuyer } from "../services/rfqQuotes.service.js";
-import { attachSalesQuotes } from "../services/salesThreads.service.js";
 
 const MAX_BULK = 50;       // keep within express.json's default 100kb body limit, or raise that limit for this route
 const MAX_PENDING = 100;   // per-user cap on enquiries waiting for review
@@ -37,7 +36,7 @@ async function pendingCount(userId) {
 
 // GET /api/rfq?scope=all|mine&q=&status=&limit=&offset=
 // Own rows carry `quotes` + `quotesCount`; other people's live rows carry `myQuote` (this seller's own quote, if any).
-// scope=mine also returns `quotesTotal` (live quotes across all of the buyer's enquiries).
+// Internal sales enquiries (source = 'sales') belong to the Sales workspace and are never listed here.
 export async function listEnquiries(req, res) {
     try {
         res.set("Cache-Control", "no-store");
@@ -48,7 +47,10 @@ export async function listEnquiries(req, res) {
 
         let query = supabase.from("rfq_enquiries").select("*", { count: "exact" });
         if (scope === "mine") {
-            query = query.eq("buyer_id", req.user.id).order("created_at", { ascending: false });
+            query = query
+                .eq("buyer_id", req.user.id)
+                .or("source.is.null,source.neq.sales") // hide internal sales enquiries (keeps rows with no source)
+                .order("created_at", { ascending: false });
             if (RFQ_STATUSES.includes(req.query.status)) query = query.eq("status", req.query.status);
         } else {
             query = query
@@ -80,10 +82,6 @@ export async function listEnquiries(req, res) {
         const body = { success: true, items, total: count ?? items.length, hasMore: offset + items.length < (count ?? 0) };
         if (quotesError) body.quotesError = quotesError; // visible in DevTools instead of silently empty
 
-        if (scope === "mine") {
-            try { items = await attachSalesQuotes(items); }
-            catch (e) { console.error("[rfq] attachSalesQuotes failed:", e.message); }
-        }
         res.json(body);
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
