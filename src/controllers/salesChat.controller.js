@@ -5,11 +5,13 @@ import { randomUUID } from "node:crypto";
 import { supabaseAdmin as db } from "../config/supabase.js";
 import { getTeamContext } from "../services/team.service.js";
 import { isUuid } from "../services/rfqValidation.js";
-import { BUCKET, str, threadDto, hydrateEntries, clipPreview } from "../services/salesThreads.service.js";
+import {
+    BUCKET, str, threadDto, hydrateEntries, clipPreview,
+    entryPreview, validReplyTo,
+} from "../services/salesThreads.service.js";
 import {
     namesOf, participantsOf, ensureParticipants, cleanMentions, afterMessage, markRead,
     audienceOf, emitParticipantsChanged, notifyAdded, firstName,
-    entryPreview, validReplyTo,
 } from "../services/salesChat.service.js";
 import { emitToUser } from "../services/realtimeBroadcast.js";
 
