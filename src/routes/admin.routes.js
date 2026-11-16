@@ -24,6 +24,8 @@ import { listPendingPaymentProofs, verifyPayment, rejectPayment } from "../contr
 import { notifyUser, notifySellerProfileChanged } from "../services/notifications.service.js";
 import adminDbRoutes from "./adminDb.routes.js";
 import { downloadFullCatalogTemplate, bulkUploadFullCatalog } from "../controllers/adminCatalogFullBulk.controller.js";
+// NEW — full-hierarchy catalog bulk upload with review screen (drafts, check, submit).
+import adminCatalogDraftsRoutes from "./adminCatalogDrafts.routes.js";
 import productCommissionRoutes from "./productCommission.routes.js";
 import {
   adminListDisputes, adminGetDispute, adminStartReview, adminPostMessage,
@@ -132,6 +134,10 @@ router.get("/rfq/:id", requireAuth, requireAdmin, adminGetEnquiry);
 router.patch("/rfq/:id", requireAuth, requireAdmin, authWriteLimiter, adminUpdateEnquiry);
 router.post("/rfq/:id/approve", requireAuth, requireAdmin, authWriteLimiter, adminApproveEnquiry);
 router.post("/rfq/:id/reject", requireAuth, requireAdmin, authWriteLimiter, adminRejectEnquiry);
+
+// NEW — full-hierarchy bulk upload with review: /catalog-bulk/meta, /check and /drafts/*.
+// Mounted before the older /catalog-bulk routes below (their paths do not overlap).
+router.use("/catalog-bulk", adminCatalogDraftsRoutes);
 
 router.get("/catalog-bulk/excel-template", requireAuth, requireAdmin, downloadFullCatalogTemplate);
 router.post("/catalog-bulk/excel-upload", requireAuth, requireAdmin, upload.single("file"), bulkUploadFullCatalog);
