@@ -354,6 +354,85 @@ export async function sendOrderProcessedEmail({ to, customerName, companyName, o
   return throwIfResendError(result);
 }
 
+// Order Book: sent to the customer when the team ships, completes or cancels their order.
+//   kind: "shipped" | "completed" | "cancelled"
+// `items` use the same shape as sendOrderPlacedEmail: { productName, brandName, qtyText, packText, lineTotal }.
+const ORDER_STATUS_EMAIL = {
+  shipped: {
+    status: "Shipped",
+    title: () => "Your order has been shipped",
+    lead: (company) => `Good news! Your order from <strong>${company}</strong> has been shipped and is on its way to you.`,
+    closing: "If you have any questions about the delivery, simply reply to this email and mention your order number.",
+    subject: (orderNo, company) => `Your order ${orderNo} has been shipped - ${company}`,
+  },
+  completed: {
+    status: "Completed",
+    title: () => "Your order is complete",
+    lead: (company) => `Your order from <strong>${company}</strong> has been completed. We hope everything reached you in good order.`,
+    closing: "If anything is not as expected, please reply to this email and mention your order number so we can help.",
+    subject: (orderNo, company) => `Your order ${orderNo} is complete - ${company}`,
+  },
+  cancelled: {
+    status: "Cancelled",
+    title: () => "Your order has been cancelled",
+    lead: (company) => `We're sorry to let you know that your order with <strong>${company}</strong> has been cancelled.`,
+    closing: "If you were not expecting this or have any questions, please reply to this email and mention your order number.",
+    subject: (orderNo, company) => `Your order ${orderNo} has been cancelled - ${company}`,
+  },
+};
+
+export async function sendOrderStatusEmail({
+  kind, to, customerName, companyName, orderNo, placedOn, items, total, lrNumber, lrNotes, reason, notes, shopUrl,
+}) {
+  if (!to) return;
+  const copy = ORDER_STATUS_EMAIL[kind];
+  if (!copy) throw new Error(`Unknown order status email: ${kind}`);
+
+  const company = esc(companyName || "our team");
+  const rows = (items || []).map((i) => `
+        <div style="margin:0 0 10px;padding:12px 14px;border:1px solid #e5eaee;border-radius:12px;">
+          <div style="font-size:14px;font-weight:700;color:#0f172a;">${esc(i.productName)}${i.brandName ? ` <span style="font-weight:400;color:#64748b;">· ${esc(i.brandName)}</span>` : ""}</div>
+          <div style="margin-top:6px;font-size:13px;color:#334155;">${esc(i.qtyText)}</div>
+          ${i.packText ? `<div style="margin-top:2px;font-size:12.5px;color:#64748b;">${esc(i.packText)}</div>` : ""}
+          <div style="margin-top:6px;font-size:13px;color:#334155;">Amount: <strong>${esc(inrMail(i.lineTotal))}</strong> <span style="color:#94a3b8;">(incl. GST)</span></div>
+        </div>`).join("");
+
+  const extra = (label, value) => (value ? `<tr><td style="padding:3px 0;color:#64748b;vertical-align:top;">${label}</td><td align="right" style="padding:3px 0;color:#0f172a;">${esc(value)}</td></tr>` : "");
+
+  const html = shell(
+    esc(copy.title()),
+    `<p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#475569;">
+          Hi ${esc(customerName || "there")}, ${copy.lead(company)}
+        </p>
+        <table role="presentation" width="100%" style="margin:0 0 14px;font-size:13px;color:#334155;">
+          <tr><td style="padding:3px 0;color:#64748b;">Order number</td><td align="right"><strong>${esc(orderNo)}</strong></td></tr>
+          ${placedOn ? `<tr><td style="padding:3px 0;color:#64748b;">Order date</td><td align="right">${esc(placedOn)}</td></tr>` : ""}
+          <tr><td style="padding:3px 0;color:#64748b;">Status</td><td align="right"><strong>${esc(copy.status)}</strong></td></tr>
+          ${kind === "shipped" ? `${extra("LR number", lrNumber)}${extra("Shipping notes", lrNotes)}` : ""}
+          ${kind === "cancelled" ? extra("Reason", reason) : ""}
+        </table>
+        <p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#0f172a;">Your order</p>
+        ${rows}
+        <table role="presentation" width="100%" style="margin-top:6px;border-top:1px solid #e5eaee;">
+          <tr><td style="padding:10px 0 0;font-size:15px;font-weight:800;color:#0f172a;">Order total (incl. GST)</td>
+              <td align="right" style="padding:10px 0 0;font-size:15px;font-weight:800;color:#0f172a;">${esc(inrMail(total))}</td></tr>
+        </table>
+        ${notes ? `<p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#334155;white-space:pre-line;"><strong>Your notes:</strong> ${esc(notes)}</p>` : ""}
+        <p style="margin:14px 0 0;font-size:13px;line-height:1.6;color:#475569;">${esc(copy.closing)}</p>
+        ${shopUrl ? `<a href="${esc(shopUrl)}" style="display:inline-block;margin-top:14px;background:${BRAND_TEAL};color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:11px 22px;border-radius:10px;">Visit ${company}'s shop</a>` : ""}
+        <p style="margin:16px 0 0;font-size:13px;line-height:1.6;color:#475569;">Thank you for choosing ${company}.</p>`,
+    `You're receiving this because ${company} placed an order for you through BBM Marketplace. If this wasn't meant for you, you can ignore this email.`
+  );
+  const clean = (v, d) => String(v || d).replace(/[\r\n]+/g, " ");
+  const result = await resend.emails.send({
+    from: FROM,
+    to,
+    subject: copy.subject(clean(orderNo, ""), clean(companyName, "our team")),
+    html,
+  });
+  return throwIfResendError(result);
+}
+
 // Salesperson's own copy of a customer notification (a record, not a replay).
 export async function sendSalespersonCopyEmail({
   to, salespersonName, title, customerName, customerContact,

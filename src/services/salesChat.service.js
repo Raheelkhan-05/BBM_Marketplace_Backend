@@ -1,19 +1,22 @@
 // src/services/salesChat.service.js
-// Group chat on a sales enquiry: who is in it, who must be told, realtime fan-out, instant WhatsApp, typing.
+// Group chat on a sales enquiry: who is in it, who must be told, realtime fan-out, WhatsApp helpers, typing.
 //
 // Model: a message is a normal sales_thread_entries "note" row. The salesperson's own entries have
 // author_id = rfq_enquiries.created_by_actor_id; everyone else's are the chat. Participants live in
-// sales_thread_participants (last_read_at drives unread counts and the 1-hour reminder).
+// sales_thread_participants (last_read_at drives unread counts and the WhatsApp nudges).
 // Company admins can always open any thread; they become participants when they post or are added.
+//
+// WHATSAPP NUDGES are NOT sent from here any more. services/salesChatReminder.service.js sends them:
+//   - "new message"  ~1 minute after a post, only if the person still hasn't read it (one per unread streak)
+//   - "unread"       1 hour after, if it is still unread, with the grouped count
+// This file only sends the one-off "you were added to the chat" WhatsApp (notifyAdded).
 import { supabaseAdmin as db } from "../config/supabase.js";
-import { getIO } from "../socket/io.js";
 import { emitToUser } from "./realtimeBroadcast.js";
 import { bumpVer } from "./cache.service.js";
 import { isUuid } from "./rfqValidation.js";
 import { APP_URL, ping } from "./salesThreads.service.js";
 import { sendSalesChatWhatsApp } from "./whatsapp.service.js";
 
-const PUSH_GAP_MS = (Number(process.env.SALES_CHAT_PUSH_GAP_MIN) || 30) * 60_000;   // instant WhatsApp: at most one per person per thread per 30 min
 const GENERIC = new Set(["", "salesperson", "sales person", "sales", "user", "unnamed", "unknown", "team member"]);
 export const realName = (v) => { const s = String(v || "").trim(); return s && !GENERIC.has(s.toLowerCase()) ? s : ""; };
 export const firstName = (n) => String(n || "Someone").trim().split(/\s+/)[0];
@@ -159,38 +162,19 @@ export function registerSalesChatSocket(io) {
 const linkFor = (row, uid) => (String(uid) === String(row.created_by_actor_id)
     ? `${APP_URL}/sales/enquiries/${row.id}` : `${APP_URL}/home?enquiry=${row.id}`);
 
-async function isOnline(uid) {
-    try { return (await getIO().in(`user:${uid}`).fetchSockets()).length > 0; } catch { return false; }
-}
-
-// First message to someone who is offline: one WhatsApp, then silence for PUSH_GAP_MS (the 1-hour reminder covers the rest).
-async function pushInstant({ row, recipients, senderName, preview }) {
-    const cutoff = new Date(Date.now() - PUSH_GAP_MS).toISOString();
-    for (const uid of recipients) {
-        try {
-            if (await isOnline(uid)) continue;
-            const { data } = await db.from("sales_thread_participants").update({ last_pushed_at: new Date().toISOString() })
-                .eq("enquiry_id", row.id).eq("user_id", uid)
-                .or(`last_pushed_at.is.null,last_pushed_at.lt.${cutoff}`).select("user_id");
-            if (!data?.length) continue;
-            const me = (await namesOf([uid])).get(uid);
-            if (!me?.phone) continue;
-            await sendSalesChatWhatsApp({
-                to: me.phone, name: firstName(me.name), kind: "new", customer: row.customer_name || "a customer",
-                product: row.product_name || "", from: senderName, preview, link: linkFor(row, uid),
-            });
-        } catch (e) { console.error("[sales chat] instant WhatsApp failed:", e?.message || e); }
-    }
-}
-
+// One-off message when someone is added to the chat. Sent through the retrying WhatsApp queue; the result is logged.
 export async function notifyAdded({ row, userId, byName }) {
     try {
         const me = (await namesOf([userId])).get(userId);
-        if (!me?.phone) return;
-        await sendSalesChatWhatsApp({
+        if (!me?.phone) {
+            console.warn(`[sales chat] SKIPPED added-notice enquiry=${row.id} user=${userId}: no mobile number on file`);
+            return;
+        }
+        const r = await sendSalesChatWhatsApp({
             to: me.phone, name: firstName(me.name), kind: "added", customer: row.customer_name || "a customer",
             product: row.product_name || "", from: byName, link: linkFor(row, userId),
         });
+        if (!r?.success) console.error(`[sales chat] FAILED added-notice enquiry=${row.id} user=${userId}: ${r?.error || "unknown error"}`);
     } catch (e) { console.error("[sales chat] added WhatsApp failed:", e?.message || e); }
 }
 
@@ -199,6 +183,8 @@ export const reminderLink = linkFor;
 /* ------------------------------ after a message is saved ------------------------------ */
 // touch:true  -> also bumps last_activity / preview (used for teammates' messages; the salesperson's own
 //                addEntry already does that through its own touch()).
+// No WhatsApp is sent here: the scheduler (salesChatReminder.service.js) announces the message about a minute later
+// if the person still hasn't read it, and reminds again after an hour.
 export async function afterMessage({ row, companyId, entry, senderId, senderName, preview, touch = true }) {
     const now = new Date().toISOString();
     senderId = String(senderId);
@@ -220,7 +206,4 @@ export async function afterMessage({ row, companyId, entry, senderId, senderName
     const audience = await audienceOf(row, companyId);
     const payload = { threadId: row.id, entry, senderId, senderName, preview };
     for (const uid of audience) if (uid !== senderId) emitToUser(uid, "salesChat:message", payload);
-
-    const recipients = (await participantIds(row.id)).filter((i) => i !== senderId);
-    pushInstant({ row, recipients, senderName, preview }).catch(() => { /* logged inside */ });
 }

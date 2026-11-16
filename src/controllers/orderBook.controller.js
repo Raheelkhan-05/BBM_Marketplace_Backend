@@ -7,7 +7,8 @@
 // Catalog products are ordered in whole packs or master packs (never single units).
 // RECIPIENTS: the salesperson chooses WHICH of the customer's contacts get the order updates (at least one, each with a
 // mobile number and/or an email). They are stored on the order (order_book_orders.recipients) and every one of them is
-// messaged when the order is placed and when it is processed. Contacts typed here are saved on the customer too.
+// messaged (email + WhatsApp) when the order is placed and on EVERY status change: processed, shipped, completed, cancelled.
+// Contacts typed here are saved on the customer too.
 // The buyer address is filled from the GST number (editable) and is also saved on the customer when it has none.
 // An optional Purchase Order (PO) number can be added to an order; it is searchable in the Order Book.
 import multer from "multer";
@@ -20,7 +21,7 @@ import { pingCustomersChanged } from "../services/salesSync.service.js";
 import { notifyUser } from "../services/realtimeBroadcast.js";
 import { getSalesActor, str, safeSearch, cleanGstin, round2, GSTIN_RE } from "../services/salesThreads.service.js";
 import { BUCKET, STATUSES, LIST_COLS, orderDto, eventDto, signDocs, broadcast } from "../services/orderBook.service.js";
-import { notifyOrderProcessed, notifyOrderPlaced } from "../services/orderBookNotify.service.js";
+import { notifyOrderPlaced, notifyOrderStatus } from "../services/orderBookNotify.service.js";
 import { productDetails } from "../services/orderBookProduct.service.js";
 import { saveContactsForCustomer } from "../services/sellerCustomerContact.service.js";
 import { parseContact, parseContactList } from "../services/customerContacts.service.js";
@@ -476,15 +477,18 @@ const NOTE = { processed: "is now being processed", shipped: "has been shipped",
 
 // One guarded step. The UPDATE only matches while the order is still in `row.status`,
 // so two people clicking at once can never double-apply or skip a step.
+// On success it answers the request, then (after the response, so it never slows the step) tells the customer's chosen
+// contacts by email / WhatsApp for EVERY status: processed, shipped, completed, cancelled. Because of the guarded UPDATE
+// the customer is notified exactly once per change. Returns the updated row, or null when nothing was changed.
 async function move(req, res, row, to, { patch = {}, eventBody }) {
     const t = teamScope(req);
     t.actorName = await realName(t.actorId, t.actorName);
     const now = new Date().toISOString();
     const { data, error } = await supabase.from("order_book_orders")
-        .update({ status: to, updated_at: now, last_activity_at: now, [`${to === "processed" ? "processed" : to}_at`]: now, ...patch })
+        .update({ status: to, updated_at: now, last_activity_at: now, [`${to}_at`]: now, ...patch })
         .eq("id", row.id).eq("company_id", t.companyId).eq("status", row.status).select("*").maybeSingle();
     if (error) throw error;
-    if (!data) { fail(res, 409, "Someone just updated this order. Refresh to see the latest status."); return false; }
+    if (!data) { fail(res, 409, "Someone just updated this order. Refresh to see the latest status."); return null; }
 
     await supabase.from("order_book_events").insert({ order_id: row.id, actor_id: t.actorId, actor_name: t.actorName, kind: to, body: eventBody });
     try {
@@ -501,22 +505,20 @@ async function move(req, res, row, to, { patch = {}, eventBody }) {
     }).catch(() => { /* best effort */ });
 
     res.json({ success: true, order: dtoOf(data) });
-    return true;
+
+    // Customer + salesperson-copy notifications. `data` is the row AFTER the change, so it carries the LR number,
+    // shipping notes and cancel reason. Never blocks or breaks the step; failures are logged by the notify service.
+    notifyOrderStatus(data, to, { processedBy: t.actorName })
+        .catch((e) => console.error(`[order book] ${row.order_no} ${to} notify failed:`, e?.message || e));
+
+    return data;
 }
 
 export async function processOrder(req, res) {
     try {
         const row = await loadTeamRow(req, res); if (!row) return;
         if (row.status !== "placed") return fail(res, 409, "Only a placed order can be marked as processed.");
-        const ok = await move(req, res, row, "processed", { eventBody: "Order marked as processed" });
-        // Thank the chosen contacts by email / WhatsApp. Runs after the response, so it never slows or breaks the step.
-        // The guarded UPDATE in move() means this fires once per order. (row.recipients tells it who to message.)
-        if (ok) {
-            const t = teamScope(req);
-            t.actorName = await realName(t.actorId, t.actorName);
-            notifyOrderProcessed(row, { actorId: null, processedBy: t.actorName })
-                .catch((e) => console.error("[order book] customer notify failed:", e?.message || e));
-        }
+        await move(req, res, row, "processed", { eventBody: "Order marked as processed" });
     } catch (e) { oops(res, e); }
 }
 
@@ -573,11 +575,11 @@ export async function shipOrder(req, res) {
         const lrPath = lrFile ? await put(lrFile, "lr") : null;
         const billPath = billFile ? await put(billFile, "bill") : null;
 
-        const ok = await move(req, res, row, "shipped", {
+        const updated = await move(req, res, row, "shipped", {
             patch: { lr_number: lrNumber || null, lr_notes: lrNotes || null, lr_proof_path: lrPath, bill_path: billPath },
             eventBody: lrNumber ? `Order shipped · LR ${lrNumber}` : "Order shipped",
         });
-        if (!ok && uploaded.length) supabase.storage.from(BUCKET).remove(uploaded).catch(() => { /* best effort */ });
+        if (!updated && uploaded.length) supabase.storage.from(BUCKET).remove(uploaded).catch(() => { /* best effort */ });
     } catch (e) {
         if (uploaded.length) supabase.storage.from(BUCKET).remove(uploaded).catch(() => { /* best effort */ });
         oops(res, e);
