@@ -7,6 +7,7 @@ import { cached } from "../services/cache.service.js";
 import {
     listThreads, createThread, getThread, updateThread, setThreadStatus, setReminder, setThreadProduct,
     signAttachment, addEntry, listQuoteProducts, listCatalogProducts, sendQuote, resendQuote, unreadSummary,
+    setThreadHeat,
 } from "../controllers/salesThreads.controller.js";
 
 const router = Router();
@@ -43,6 +44,7 @@ router.patch("/:id", authWriteLimiter, updateThread);
 router.patch("/:id/status", authWriteLimiter, setThreadStatus);
 router.patch("/:id/reminder", authWriteLimiter, setReminder);
 router.patch("/:id/product", authWriteLimiter, setThreadProduct);   // adds the product to a cold call (once)
+router.patch("/:id/heat", authWriteLimiter, setThreadHeat);
 
 router.post("/:id/attachments/sign", authWriteLimiter, signAttachment);
 router.post("/:id/entries", authWriteLimiter, addEntry);

@@ -34,6 +34,7 @@ import {
     BUCKET, GSTIN_RE, getSalesActor, str, safeSearch, cleanGstin, cleanPhone, cleanEmail, round4,
     saleUnits, priceLine, listingProblem, listingDescription, productUrl, clipPreview, ping,
     threadDto, entryDto, quoteDto, hydrateEntries, inr, fmtDate, whatsappItemsLine,
+    HEATS, entryPreview, validReplyTo,
 } from "../services/salesThreads.service.js";
 
 import {
@@ -50,6 +51,7 @@ const ALLOWED_EXT = new Set([
     "jpg", "jpeg", "png", "webp", "gif", "heic",
     "pdf", "doc", "docx", "xls", "xlsx",
     "csv", "txt", "ppt", "pptx",
+    "webm", "ogg", "m4a", "mp3", "wav", "aac",
 ]);
 
 // Quotations never expire for now.
@@ -483,6 +485,8 @@ export async function listThreads(req, res) {
         const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
         const q = safeSearch(req.query.q);
         const status = STATUS_FILTERS.includes(req.query.status) ? req.query.status : "";
+        const heat = [...HEATS, "none"].includes(req.query.heat) ? req.query.heat : "";
+
 
         // Live, per-person unread (outside the cache).
         const unread = await unreadFor(actorId, ownerId);
@@ -493,7 +497,7 @@ export async function listThreads(req, res) {
         const ver = await getVer(`sa:${actorId}`);
 
         const body = await cached(
-            `stl:${actorId}:${ver}:${hashKey([q, status, limit, offset, unreadIds.join(",")])}`,
+            `stl:${actorId}:${ver}:${hashKey([q, status, heat, limit, offset, unreadIds.join(",")])}`,
             45,
             async () => {
                 const scoped = (qb) =>
@@ -517,6 +521,10 @@ export async function listThreads(req, res) {
                 } else if (status === "unread") {
                     query = query.in("id", unreadIds.length ? unreadIds : [NIL_UUID]);
                 }
+
+                if (heat === "none") query = query.is("sales_heat", null);
+                else if (heat) query = query.eq("sales_heat", heat);
+
 
                 if (q) {
                     // customers (by GST number) whose city matches the search
@@ -548,7 +556,7 @@ export async function listThreads(req, res) {
 
                 const first = offset === 0;
 
-                const [list, all, open, won, lost, rem, cold] = await Promise.all([
+                const [list, all, open, won, lost, rem, cold, heatRes] = await Promise.all([
                     query,
                     first ? count() : null,
                     first ? count().neq("status", "closed") : null,
@@ -556,6 +564,10 @@ export async function listThreads(req, res) {
                     first ? count().eq("status", "closed").eq("sales_outcome", "lost") : null,
                     first ? count().neq("status", "closed").not("reminder_at", "is", null) : null,
                     first ? count().eq("sales_kind", KIND_COLD) : null,
+                    first ? supabase.rpc("sales_heat_counts", {
+                        p_actor: actorId, p_owner: ownerId,
+                        p_status: ["open", "won", "lost", "reminder", "cold"].includes(status) ? status : "",
+                    }) : null,
                 ]);
 
                 if (list.error) throw list.error;
@@ -605,6 +617,10 @@ export async function listThreads(req, res) {
                         reminder: rem?.count || 0,
                         cold: cold?.count || 0,
                     };
+                    const hc = { hot: 0, warm: 0, cold: 0, dead: 0, none: 0 };
+                    if (heatRes?.error) console.error("[sales threads] heat counts failed:", heatRes.error.message);
+                    for (const r of heatRes?.data || []) if (r.n_heat in hc) hc[r.n_heat] = Number(r.n_count) || 0;
+                    out.heatCounts = hc;
                 }
 
                 return out;
@@ -1671,6 +1687,37 @@ export async function setThreadStatus(req, res) {
     }
 }
 
+// ---- PATCH /sales/threads/:id/heat ---------------------------------------------------------------------
+export async function setThreadHeat(req, res) {
+    try {
+        const { actorId, actorName, ownerId } = getSalesActor(req);
+        const row = await loadOwnThread(req, res);
+        if (!row) return;
+
+        const raw = req.body?.heat;
+        const next = raw === null || raw === "" || raw === undefined ? null : String(raw);
+        if (next !== null && !HEATS.includes(next)) return fail(res, 400, "Invalid heat.");
+        if ((row.sales_heat || null) === next) return res.json({ success: true, thread: dtoOf(row) });
+
+        // A label only: deliberately does NOT touch last_activity_at, so the list order doesn't jump.
+        const { data, error } = await supabase
+            .from("rfq_enquiries")
+            .update({
+                sales_heat: next,
+                sales_heat_at: next ? new Date().toISOString() : null,
+                last_updated_by_actor_id: actorId,
+                last_updated_by_actor_name: actorName,
+            })
+            .eq("id", row.id).select("*").single();
+        if (error) throw error;
+
+        await notify(ownerId, actorId, row.id);
+        res.json({ success: true, thread: dtoOf(data) });
+    } catch (e) {
+        oops(res, e);
+    }
+}
+
 // ---- PATCH /sales/threads/:id/reminder ---------------------------------------------------------------
 
 export async function setReminder(req, res) {
@@ -1906,10 +1953,8 @@ function cleanAttachments(list, enquiryId) {
             path,
             name: str(a.name, 150) || "file",
             type: str(a.type, 100),
-            size: Math.max(
-                0,
-                Math.min(Number(a.size) || 0, MAX_BYTES)
-            ),
+            size: Math.max(0, Math.min(Number(a.size) || 0, MAX_BYTES)),
+            ...(Number(a.duration) > 0 ? { duration: Math.min(Math.round(Number(a.duration)), 900) } : {}),
         });
     }
 
@@ -1956,59 +2001,28 @@ export async function addEntry(req, res) {
             );
         }
 
-        const mentions = await cleanMentions(
-            req.body?.mentions,
-            row,
-            actorId
-        );
+        const mentions = await cleanMentions(req.body?.mentions, row, actorId);
+        const replyTo = await validReplyTo(req.body?.replyTo, row.id);
+        const preview = entryPreview(body, attachments);
 
         const { data, error } = await supabase
             .from("sales_thread_entries")
             .insert({
-                enquiry_id: row.id,
-                author_id: actorId,
-                author_name: actorName,
-                kind: "note",
-                body,
-                attachments,
-                mentions,
+                enquiry_id: row.id, author_id: actorId, author_name: actorName,
+                kind: "note", body, attachments, mentions, reply_to_id: replyTo,
             })
-            .select("*")
-            .single();
-
+            .select("*").single();
         if (error) throw error;
 
-        // Update latest activity and latest updater.
-        await touch(
-            row.id,
-            clipPreview(body, attachments.length),
-            actorId,
-            actorName
-        );
-
+        await touch(row.id, preview, actorId, actorName);
         await notify(ownerId, actorId, row.id);
 
         const [entry] = await hydrateEntries([data]);
-
-        res.json({
-            success: true,
-            entry,
-        });
+        res.json({ success: true, entry });
 
         afterMessage({
-            row,
-            companyId: ownerId,
-            entry,
-            senderId: actorId,
-            senderName: actorName,
-            preview: clipPreview(body, attachments.length),
-            touch: false,
-        }).catch((e) => {
-            console.error(
-                "[sales threads] chat fan-out failed:",
-                e?.message || e
-            );
-        });
+            row, companyId: ownerId, entry, senderId: actorId, senderName: actorName, preview, touch: false,
+        }).catch((e) => console.error("[sales threads] chat fan-out failed:", e?.message || e));
     } catch (e) {
         oops(res, e);
     }

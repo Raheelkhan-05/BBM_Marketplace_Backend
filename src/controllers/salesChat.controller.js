@@ -9,11 +9,12 @@ import { BUCKET, str, threadDto, hydrateEntries, clipPreview } from "../services
 import {
     namesOf, participantsOf, ensureParticipants, cleanMentions, afterMessage, markRead,
     audienceOf, emitParticipantsChanged, notifyAdded, firstName,
+    entryPreview, validReplyTo,
 } from "../services/salesChat.service.js";
 import { emitToUser } from "../services/realtimeBroadcast.js";
 
 const PAGE = 30, PAGE_MAX = 50, MAX_FILES = 10, MAX_BYTES = 15 * 1024 * 1024, BODY_MAX = 4000;
-const ALLOWED_EXT = new Set(["jpg", "jpeg", "png", "webp", "gif", "heic", "pdf", "doc", "docx", "xls", "xlsx", "csv", "txt", "ppt", "pptx"]);
+const ALLOWED_EXT = new Set(["jpg", "jpeg", "png", "webp", "gif", "heic", "pdf", "doc", "docx", "xls", "xlsx", "csv", "txt", "ppt", "pptx", "webm", "ogg", "m4a", "mp3", "wav", "aac"]);
 
 const fail = (res, status, message) => res.status(status).json({ success: false, message });
 const oops = (res, e, where) => { console.error(`[sales chat] ${where}:`, e?.message || e); return fail(res, 500, "Something went wrong. Please try again."); };
@@ -95,7 +96,8 @@ function cleanAttachments(list, enquiryId) {
     for (const f of list) {
         const path = typeof f?.path === "string" ? f.path : "";
         if (!path.startsWith(`${enquiryId}/`) || path.includes("..") || path.length > 200) return null;
-        out.push({ path, name: str(f.name, 150) || "file", type: str(f.type, 100), size: Math.max(0, Math.min(Number(f.size) || 0, MAX_BYTES)) });
+        out.push({ path, name: str(f.name, 150) || "file", type: str(f.type, 100), size: Math.max(0, Math.min(Number(f.size) || 0, MAX_BYTES)), ...(Number(a.duration) > 0 ? { duration: Math.min(Math.round(Number(a.duration)), 900) } : {}) });
+
     }
     return out;
 }
@@ -114,15 +116,16 @@ export async function postMessage(req, res) {
 
         const name = (await namesOf([actorId])).get(actorId)?.name || "Teammate";
         const mentions = await cleanMentions(req.body?.mentions, row, actorId);
+        const replyTo = await validReplyTo(req.body?.replyTo, row.id);
         const { data, error } = await db.from("sales_thread_entries")
-            .insert({ enquiry_id: row.id, author_id: actorId, author_name: name, kind: "note", body, attachments, mentions })
+            .insert({ enquiry_id: row.id, author_id: actorId, author_name: name, kind: "note", body, attachments, mentions, reply_to_id: replyTo })
             .select("*").single();
         if (error) throw error;
 
         const [entry] = await hydrateEntries([data]);
         await afterMessage({
             row, companyId: ctx.companyId, entry, senderId: actorId, senderName: name,
-            preview: clipPreview(body, attachments.length), touch: true,
+            preview: entryPreview(body, attachments), touch: true,
         });
         res.json({ success: true, entry });
     } catch (e) { oops(res, e, "postMessage"); }

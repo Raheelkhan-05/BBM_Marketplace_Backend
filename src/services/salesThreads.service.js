@@ -2,6 +2,7 @@
 // Shared helpers for sales threads: validation, DTOs, price maths, message text, signed file URLs.
 import { supabase } from "../config/supabase.js";
 import { emitRfqQuotesChanged } from "./rfqRealtime.js";
+import { isUuid } from "./rfqValidation.js";
 
 export const BUCKET = "sales-attachments";
 export const GSTIN_RE = /^\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
@@ -50,6 +51,40 @@ export const clipPreview = (text, files = 0) => {
     if (t) return t;
     return files ? `${files} file${files === 1 ? "" : "s"} attached` : "";
 };
+
+export const HEATS = ["hot", "warm", "cold", "dead"];
+
+// "🎤 Voice note" for a lone audio attachment, otherwise the usual preview.
+export const entryPreview = (text, attachments = []) => {
+    const t = String(text || "").replace(/\s+/g, " ").trim();
+    if (!t && attachments.length === 1 && /^audio\//i.test(attachments[0]?.type || "")) return "🎤 Voice note";
+    return clipPreview(text, attachments.length);
+};
+
+// The replied-to message must be a real (non-system) entry of the SAME enquiry.
+export async function validReplyTo(raw, enquiryId) {
+    if (!isUuid(raw)) return null;
+    const { data } = await supabase.from("sales_thread_entries").select("id")
+        .eq("id", raw).eq("enquiry_id", enquiryId).neq("kind", "system").maybeSingle();
+    return data?.id || null;
+}
+
+export function replySnippet(r) {
+    const att = Array.isArray(r.attachments) ? r.attachments : [];
+    const text = String(r.body || "").replace(/\s+/g, " ").trim().slice(0, 140);
+    let kind = "text", label = text;
+    if (r.kind === "quote") { kind = "quote"; label = text || "Quotation"; }
+    else if (!text && att.length) {
+        const ty = att[0].type || "";
+        if (/^audio\//i.test(ty)) { kind = "audio"; label = "Voice note"; }
+        else if (/^image\//i.test(ty)) { kind = "image"; label = att.length > 1 ? `${att.length} photos` : "Photo"; }
+        else { kind = "file"; label = att[0].name || "File"; }
+    }
+    return {
+        id: r.id, authorId: r.author_id || null, authorName: r.author_name || "", kind, text: label,
+        duration: kind === "audio" ? Number(att[0].duration) || null : null,
+    };
+}
 
 // Best effort live refresh of the Sales page and the Save page (same socket event the RFQ pages already use).
 export function ping(userIds, payload) {
@@ -108,6 +143,7 @@ export function threadDto(row, extra = {}) {
         unit: row.unit || "",
         hasProduct,
         kind: row.sales_kind || "enquiry",
+        heat: row.sales_heat || null,
         specifications: row.specifications || "",
         status: row.status === "closed" ? "closed" : "open",
         createdAt: row.created_at,
@@ -138,29 +174,34 @@ export function quoteDto(q) {
     };
 }
 
-export const entryDto = (e, quote = null) => ({
+export const entryDto = (e, quote = null, reply = null) => ({
     id: e.id, kind: e.kind, body: e.body || "", attachments: e.attachments || [],
     authorId: e.author_id || null, authorName: e.author_name || "", mentions: e.mentions || [],
-    createdAt: e.created_at, quote,
+    createdAt: e.created_at, quote, replyToId: e.reply_to_id || null, replyTo: reply,
 });
 
-// Adds a 1-hour signed URL to every attachment, and the quote card data to quote entries.
 export async function hydrateEntries(rows) {
     if (!rows.length) return [];
     const quoteIds = [...new Set(rows.map((r) => r.quote_id).filter(Boolean))];
+    const replyIds = [...new Set(rows.map((r) => r.reply_to_id).filter(Boolean))];
     const paths = [...new Set(rows.flatMap((r) => (r.attachments || []).map((a) => a.path)).filter(Boolean))];
 
-    const [qRes, uRes] = await Promise.all([
+    const [qRes, uRes, rRes] = await Promise.all([
         quoteIds.length ? supabase.from("sales_quotes").select("*").in("id", quoteIds) : { data: [] },
         paths.length ? supabase.storage.from(BUCKET).createSignedUrls(paths, 3600) : { data: [] },
+        replyIds.length
+            ? supabase.from("sales_thread_entries").select("id, author_id, author_name, kind, body, attachments").in("id", replyIds)
+            : { data: [] },
     ]);
     if (qRes.error) throw qRes.error;
     const quotes = new Map((qRes.data || []).map((q) => [q.id, quoteDto(q)]));
     const urls = new Map((uRes.data || []).map((u) => [u.path, u.signedUrl]));
+    const replies = new Map((rRes.data || []).map((r) => [r.id, replySnippet(r)]));   // a failed lookup just hides the quote
 
     return rows.map((r) => entryDto(
         { ...r, attachments: (r.attachments || []).map((a) => ({ ...a, url: urls.get(a.path) || null })) },
         r.quote_id ? quotes.get(r.quote_id) || null : null,
+        r.reply_to_id ? replies.get(r.reply_to_id) || null : null,
     ));
 }
 
