@@ -5,23 +5,33 @@ import { checkOrderWindow, checkLocationServiceable } from "../../shared/orderCo
 import { notifyAdmins, notifyAdminPaymentsChanged } from "../services/notifications.service.js";
 import { captureServer } from "../services/analytics.service.js";
 
-// Fetches just enough from seller_product_submissions to validate a
-// requested quantity against available stock. Shared by addCartItem,
-// updateCartItem, and checkoutCart so all three use the exact same rule.
+const VALID_BASES = ["per_unit", "per_pack", "per_master_pack"];
+
+// Just enough of the listing to validate a quantity against stock.
+// Shared by addCartItem, updateCartItem and checkoutCart so all three use the same rule.
 async function loadStockInfo(submissionId) {
     const { data, error } = await supabase
         .from("seller_product_submissions")
-        .select("id, stock_type, stock_quantity, pack_size, units_per_master_pack, brand_item_name:generic_product_brand_id")
+        .select("id, stock_type, stock_quantity, pack_size, units_per_master_pack")
         .eq("id", submissionId)
         .maybeSingle();
     if (error || !data) return null;
     return data;
 }
 
-// Returns an error message if the requested sale-unit quantity exceeds
-// what this seller actually has in stock. Only applies to ready_stock
-// listings with a known stock_quantity — made_to_order listings and
-// listings with no stock cap set are unaffected (nothing to exceed).
+// The buyer's existing cart line for one listing (or null).
+async function loadCartLine(buyerId, submissionId) {
+    const { data } = await supabase
+        .from("cart_items")
+        .select("quantity, purchase_basis")
+        .eq("buyer_id", buyerId)
+        .eq("seller_product_submission_id", submissionId)
+        .maybeSingle();
+    return data || null;
+}
+
+// Error message when the requested sale-unit quantity exceeds what the seller has in stock.
+// Only applies to ready_stock listings with a known stock_quantity.
 function checkStockLimit(submission, purchaseQty, purchaseBasis) {
     if (!submission) return null;
     if (submission.stock_type !== "ready_stock" || submission.stock_quantity == null) return null;
@@ -31,12 +41,9 @@ function checkStockLimit(submission, purchaseQty, purchaseBasis) {
     if (saleQty <= available) return null;
 
     const unitLabel = saleUnitLabel(submission.units_per_master_pack);
-    if (available <= 0) {
-        return `This item is currently out of stock with this seller.`;
-    }
+    if (available <= 0) return "This item is currently out of stock with this seller.";
     return `Only ${available} ${unitLabel}${available === 1 ? "" : "s"} available from this seller. Please reduce the quantity.`;
 }
-
 
 export async function getCart(req, res) {
     const { data, error } = await supabase.rpc("cart_list", { p_buyer_id: req.user.id });
@@ -71,10 +78,7 @@ export async function getCart(req, res) {
             item.seller_dispatch_state = (seller?.dispatch_same_as_registered === false ? seller?.dispatch_state : seller?.state) || seller?.state || null;
             item.seller_transport_options = Array.isArray(seller?.transport_options) ? seller.transport_options : [];
 
-            // NEW — real "ships from" for the detail modal's seller-terms
-            // panel, resolved the same way BuyNowModal's dispatchOrigin is
-            // (registered location unless the seller set a distinct
-            // dispatch location).
+            // "Ships from" for the seller-terms panel, resolved like BuyNowModal's dispatchOrigin.
             const dispatchCity = seller?.dispatch_same_as_registered === false ? seller?.dispatch_district : seller?.city;
             const dispatchState = seller?.dispatch_same_as_registered === false ? seller?.dispatch_state : seller?.state;
             item.dispatch_origin = [dispatchCity, dispatchState].filter(Boolean).join(", ") || null;
@@ -86,30 +90,45 @@ export async function getCart(req, res) {
 
 export async function addCartItem(req, res) {
     const { submissionId, quantity, purchaseBasis } = req.body || {};
+    const basis = VALID_BASES.includes(purchaseBasis) ? purchaseBasis : "per_pack";
+    const qty = Number(quantity);
+
+    if (!submissionId) return res.status(400).json({ success: false, code: "LISTING_NOT_AVAILABLE", message: "Missing listing." });
+    if (!(qty > 0)) return res.status(400).json({ success: false, code: "INVALID_QUANTITY", message: "Please enter a valid quantity." });
 
     const submission = await loadStockInfo(submissionId);
-    const stockError = checkStockLimit(submission, Number(quantity), purchaseBasis || "per_pack");
+    const existing = await loadCartLine(req.user.id, submissionId);
+
+    // cart_add_item ADDS to an existing line and overwrites its basis, so a line in a different
+    // basis would end up with a wrong total. Refuse instead of silently corrupting it.
+    if (existing && existing.purchase_basis !== basis) {
+        return res.status(409).json({
+            success: false, code: "BASIS_MISMATCH",
+            message: "This item is already in your cart in a different pack size. Update it from the cart.",
+        });
+    }
+
+    // Stock must hold for what the line will contain AFTER this add (existing + new), not just this call.
+    const combinedQty = (existing ? Number(existing.quantity) : 0) + qty;
+    const stockError = checkStockLimit(submission, combinedQty, basis);
     if (stockError) {
         return res.status(400).json({ success: false, code: "EXCEEDS_AVAILABLE_STOCK", message: stockError });
     }
 
-    // Any cart edit means the buyer's intent has changed — a previously
-    // "awaiting_payment" snapshot no longer reflects what they actually
-    // want to buy. Cancel it so checkout recomputes fresh instead of
-    // silently resuming a stale total (see place_cart_order's
-    // PENDING_GROUP_EXISTS branch, which otherwise just resumes whatever
-    // was locked in before this edit).
+    // A cart edit changes the buyer's intent, so a previously locked "awaiting_payment" snapshot is stale.
     await supabase.rpc("cancel_pending_order_group_if_exists", { p_buyer_id: req.user.id });
 
     const { error } = await supabase.rpc("cart_add_item", {
         p_buyer_id: req.user.id, p_submission_id: submissionId,
-        p_quantity: quantity, p_purchase_basis: purchaseBasis || "per_pack",
+        p_quantity: qty, p_purchase_basis: basis,
     });
     if (error) {
         const map = { CANNOT_CART_OWN_LISTING: 400, LISTING_NOT_AVAILABLE: 404, INVALID_QUANTITY: 400, BELOW_MOQ: 400, EXCEEDS_AVAILABLE_STOCK: 400 };
         const message = error.message === "BELOW_MOQ" ? "Quantity is below the seller's minimum order quantity."
             : error.message === "EXCEEDS_AVAILABLE_STOCK" ? "That quantity isn't available from this seller."
-                : "Couldn't add to cart.";
+                : error.message === "CANNOT_CART_OWN_LISTING" ? "You can't add your own listing to the cart."
+                    : error.message === "LISTING_NOT_AVAILABLE" ? "This listing is no longer available."
+                        : "Couldn't add to cart.";
         return res.status(map[error.message] || 500).json({ success: false, code: error.message, message });
     }
     res.json({ success: true });
@@ -118,10 +137,15 @@ export async function addCartItem(req, res) {
 export async function updateCartItem(req, res) {
     const { submissionId } = req.params;
     const { quantity, purchaseBasis } = req.body || {};
+    const qty = Number(quantity);
 
-    if (Number(quantity) > 0) {
+    if (qty > 0) {
         const submission = await loadStockInfo(submissionId);
-        const stockError = checkStockLimit(submission, Number(quantity), purchaseBasis || submission?.purchase_basis || "per_pack");
+        const line = await loadCartLine(req.user.id, submissionId);
+        // Use the basis the quantity is actually expressed in: the one being set now,
+        // otherwise the cart line's own (never a blind default).
+        const basis = VALID_BASES.includes(purchaseBasis) ? purchaseBasis : (line?.purchase_basis || "per_pack");
+        const stockError = checkStockLimit(submission, qty, basis);
         if (stockError) {
             return res.status(400).json({ success: false, code: "EXCEEDS_AVAILABLE_STOCK", message: stockError });
         }
@@ -131,13 +155,14 @@ export async function updateCartItem(req, res) {
 
     const { error } = await supabase.rpc("cart_set_quantity", {
         p_buyer_id: req.user.id, p_submission_id: submissionId,
-        p_quantity: quantity, p_purchase_basis: purchaseBasis || null,
+        p_quantity: qty, p_purchase_basis: VALID_BASES.includes(purchaseBasis) ? purchaseBasis : null,
     });
     if (error) {
         const map = { BELOW_MOQ: 400, CART_ITEM_NOT_FOUND: 404, EXCEEDS_AVAILABLE_STOCK: 400 };
         const message = error.message === "BELOW_MOQ" ? "Quantity is below the seller's minimum order quantity."
             : error.message === "EXCEEDS_AVAILABLE_STOCK" ? "That quantity isn't available from this seller."
-                : "Couldn't update cart.";
+                : error.message === "CART_ITEM_NOT_FOUND" ? "That item is no longer in your cart."
+                    : "Couldn't update cart.";
         return res.status(map[error.message] || 500).json({ success: false, code: error.message, message });
     }
     res.json({ success: true });
@@ -160,8 +185,7 @@ export async function checkoutCart(req, res) {
     if (cartError) return res.status(500).json({ success: false, message: "Couldn't load your cart. Please try again." });
     const fullCart = allCartItems || [];
 
-    // ---- Which lines are being bought? ----
-    // `submissionIds` omitted  -> whole cart (old behaviour, keeps older clients working).
+    // `submissionIds` omitted  -> whole cart (keeps older clients working).
     // `submissionIds` provided -> only those lines; everything else stays in the cart.
     let cartItems = fullCart;
     let partial = false;
@@ -212,10 +236,8 @@ export async function checkoutCart(req, res) {
         }
     }
 
-    // Delivery serviceability per selected item.
-    // NOTE: the old code also loaded seller order-window columns here but never used them (empty block),
-    // so that dead query was dropped. The window is still shown as a warning in the UI; enforce it
-    // here with checkOrderWindow() if you want it to hard-block.
+    // Delivery serviceability per selected item. (The order window is shown as a warning in the UI;
+    // enforce it here with checkOrderWindow() if you ever want it to hard-block.)
     const { data: address } = await supabase.from("buyer_addresses").select("state, city").eq("id", shippingAddressId).maybeSingle();
     for (const item of cartItems) {
         const locationCheck = checkLocationServiceable(submissionById.get(item.submission_id)?.dispatching_locations, address);
@@ -228,7 +250,7 @@ export async function checkoutCart(req, res) {
         }
     }
 
-    // Per-seller transport preferences (only for sellers that are actually in this order).
+    // Per-seller transport preferences (only for sellers actually in this order).
     // A buyer can only lock in a route option that seller has approved.
     let transportBySeller = {};
     const relevantPrefs = Array.isArray(transportPreferences)
@@ -260,15 +282,14 @@ export async function checkoutCart(req, res) {
         }
     }
 
-    // The selection may differ from whatever was locked in by a previous attempt, so drop any stale
-    // pending group and build a fresh one from exactly what's selected now.
+    // The selection may differ from a previous attempt: drop any stale pending group, rebuild from the selection.
     await supabase.rpc("cancel_pending_order_group_if_exists", { p_buyer_id: req.user.id });
 
     const rpcArgs = {
         p_buyer_id: req.user.id, p_shipping_address_id: shippingAddressId, p_buyer_notes: notes || null,
         p_transport_preferences: transportBySeller,
     };
-    // Only sent for partial checkouts, so full-cart checkout keeps working with the current SQL function.
+    // Only sent for partial checkouts, so a full-cart checkout works with the current SQL function.
     if (partial) rpcArgs.p_submission_ids = cartItems.map((i) => i.submission_id);
 
     const { data, error } = await supabase.rpc("place_cart_order", rpcArgs).single();
