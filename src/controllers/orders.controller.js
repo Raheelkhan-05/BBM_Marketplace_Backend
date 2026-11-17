@@ -487,123 +487,76 @@ export async function placeOrder(req, res) {
     }
     const safeOrderType = orderType === "sample" ? "sample" : orderType === "credit" ? "credit" : "standard";
 
-    const { data: sellerRow } = await supabase.from("seller_product_submissions").select("seller_id").eq("id", submissionId).maybeSingle();
-    if (sellerRow) {
-        const blockMsg = await assertSellerAcceptingOrders(sellerRow.seller_id);
-        if (blockMsg) return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: blockMsg });
+    const [{ data: sub }, { data: address }] = await Promise.all([
+        supabase.from("seller_product_submissions").select(`
+        seller_id, dispatching_locations, expires_at, expired_at,
+        stock_type, stock_quantity, pack_size, units_per_master_pack,
+        production_lead_time_days, dispatch_time_days, lead_time,
+        seller:seller_profiles!seller_product_submissions_seller_id_fkey (
+            transport_options, working_days, order_acceptance_start, order_acceptance_end, holidays,
+            pincode, state, dispatch_pincode, dispatch_state, dispatch_same_as_registered
+        )`).eq("id", submissionId).maybeSingle(),
+        supabase.from("buyer_addresses").select("pincode, state, city").eq("id", shippingAddressId).maybeSingle(),
+    ]);
+    if (!sub) return res.status(404).json({ success: false, code: "LISTING_NOT_FOUND", message: ERROR_MAP.LISTING_NOT_FOUND.message });
+
+    if (isListingExpired(sub)) {
+        return res.status(400).json({ success: false, code: "LISTING_EXPIRED", message: "This listing is no longer available. The seller's validity period for it has ended." });
     }
 
-    // NEW — a buyer can only "request" a channel the seller actually offers.
     let safeTransportMode = null;
     if (transportMode) {
         if (!TRANSPORT_OPTIONS.some((t) => t.key === transportMode)) {
             return res.status(400).json({ success: false, message: "Unrecognised transport method." });
         }
-        const { data: sellerProfile } = await supabase
-            .from("seller_profiles").select("transport_options")
-            .eq("id", sellerRow?.seller_id)
-            .maybeSingle();
-        const allowed = Array.isArray(sellerProfile?.transport_options) ? sellerProfile.transport_options : [];
+        const allowed = Array.isArray(sub.seller?.transport_options) ? sub.seller.transport_options : [];
         if (!allowed.includes(transportMode)) {
             return res.status(400).json({ success: false, message: "That transport method isn't offered by this seller." });
         }
         safeTransportMode = transportMode;
     }
 
-    const { data: constraintRow } = await supabase
-        .from("seller_product_submissions")
-        .select("dispatching_locations, expires_at, expired_at")
-        .eq("id", submissionId)
-        .maybeSingle();
-
-    if (isListingExpired(constraintRow)) {
-        return res.status(400).json({ success: false, code: "LISTING_EXPIRED", message: "This listing is no longer available. The seller's validity period for it has ended." });
-    }
-
-    if (constraintRow) {
-        const { data: address } = await supabase.from("buyer_addresses").select("state, city").eq("id", shippingAddressId).maybeSingle();
-        const locationCheck = checkLocationServiceable(constraintRow.dispatching_locations, address);
-        // const locationCheck = checkLocationServiceable(dispatchingLocations, { state: geo.state, city: geo.district });
-        // console.log("[deliverability check]", { pincode, resolvedState: geo.state, resolvedDistrict: geo.district, result: locationCheck });
-        if (!locationCheck.serviceable) {
-            return res.status(400).json({ success: false, code: locationCheck.reason, message: locationCheck.message });
-        }
+    const locationCheck = checkLocationServiceable(sub.dispatching_locations, address);
+    if (!locationCheck.serviceable) {
+        return res.status(400).json({ success: false, code: locationCheck.reason, message: locationCheck.message });
     }
 
     if (safeOrderType !== "sample") {
-        const { data: submission } = await supabase
-            .from("seller_product_submissions")
-            .select("stock_type, stock_quantity, pack_size, units_per_master_pack")
-            .eq("id", submissionId)
-            .maybeSingle();
-
-        if (submission) {
-            if (submission.stock_type === "ready_stock" && Number(submission.stock_quantity) <= 0) {
-                return res.status(400).json({ success: false, code: "OUT_OF_STOCK", message: "This item is currently out of stock." });
-            }
-
-            const saleQty = purchaseQtyToSaleUnitQty(qty, purchaseBasis, submission.pack_size, submission.units_per_master_pack);
-            const { exceedsStock, availableStock } = checkStockLimit(submission, saleQty);
-            if (exceedsStock) {
-                const label = saleUnitLabel(submission.units_per_master_pack);
-                return res.status(400).json({
-                    success: false, code: "EXCEEDS_AVAILABLE_STOCK",
-                    message: `You can order at most ${availableStock} ${label}${Number(availableStock) === 1 ? "" : "s"} from this seller.`,
-                });
-            }
+        if (sub.stock_type === "ready_stock" && Number(sub.stock_quantity) <= 0) {
+            return res.status(400).json({ success: false, code: "OUT_OF_STOCK", message: "This item is currently out of stock." });
         }
-    }
-
-    let estDeliveryDateISO = null;
-    let estDeliveryDateMaxISO = null;
-    let acceptanceDelayDaysUsed = 0;
-    {
-        const acceptanceWindow = await getAcceptanceWindow(submissionId);
-        acceptanceDelayDaysUsed = acceptanceWindow.delayDays;
-
-        const { data: submissionForDelivery } = await supabase
-            .from("seller_product_submissions")
-            .select(`
-                stock_type, production_lead_time_days, dispatch_time_days, lead_time,
-                seller:seller_profiles!seller_product_submissions_seller_id_fkey (
-                    pincode, state, dispatch_pincode, dispatch_state, dispatch_same_as_registered
-                )
-            `)
-            .eq("id", submissionId)
-            .maybeSingle();
-
-        const { data: shippingAddress } = await supabase
-            .from("buyer_addresses")
-            .select("pincode, state")
-            .eq("id", shippingAddressId)
-            .maybeSingle();
-
-        if (submissionForDelivery && shippingAddress) {
-            try {
-                const dispatchLocation = resolveSellerDispatchLocation(submissionForDelivery.seller);
-                // console.log("[placeOrder] delivery estimate inputs", {
-                //     submissionId,
-                //     shippingAddressId,
-                //     dispatchPincode: dispatchLocation.pincode,
-                //     dispatchState: dispatchLocation.state,
-                //     buyerPincode: shippingAddress.pincode,
-                //     buyerState: shippingAddress.state,
-                // });
-                const delivery = await estimateDeliveryDate(submissionForDelivery, dispatchLocation.pincode, dispatchLocation.state, shippingAddress.pincode, shippingAddress.state, acceptanceDelayDaysUsed);
-                estDeliveryDateISO = delivery.dateMin.toISOString().slice(0, 10);
-                estDeliveryDateMaxISO = delivery.dateMax.toISOString().slice(0, 10);
-            } catch (err) {
-                console.error("estimateDeliveryDate failed during placeOrder:", err?.message || err);
-            }
-        } else {
-            console.warn("[placeOrder] skipped delivery estimate — missing submission or shippingAddress row", {
-                submissionId,
-                shippingAddressId,
-                submissionForDeliveryFound: !!submissionForDelivery,
-                shippingAddressFound: !!shippingAddress,
+        const saleQty = purchaseQtyToSaleUnitQty(qty, purchaseBasis, sub.pack_size, sub.units_per_master_pack);
+        const { exceedsStock, availableStock } = checkStockLimit(sub, saleQty);
+        if (exceedsStock) {
+            const label = saleUnitLabel(sub.units_per_master_pack);
+            return res.status(400).json({
+                success: false, code: "EXCEEDS_AVAILABLE_STOCK",
+                message: `You can order at most ${availableStock} ${label}${Number(availableStock) === 1 ? "" : "s"} from this seller.`,
             });
         }
     }
+
+    // Wallet check and delivery estimate are independent, so run them together.
+    let estDeliveryDateISO = null, estDeliveryDateMaxISO = null;
+    const estimate = async () => {
+        if (!address) return;
+        try {
+            const win = checkOrderWindow({
+                workingDays: sub.seller?.working_days,
+                orderAcceptanceStart: sub.seller?.order_acceptance_start,
+                orderAcceptanceEnd: sub.seller?.order_acceptance_end,
+                holidays: sub.seller?.holidays,
+            });
+            const loc = resolveSellerDispatchLocation(sub.seller);
+            const d = await estimateDeliveryDate(sub, loc.pincode, loc.state, address.pincode, address.state, win.delayDays);
+            estDeliveryDateISO = d.dateMin.toISOString().slice(0, 10);
+            estDeliveryDateMaxISO = d.dateMax.toISOString().slice(0, 10);
+        } catch (err) {
+            console.error("estimateDeliveryDate failed during placeOrder:", err?.message || err);
+        }
+    };
+    const [blockMsg] = await Promise.all([assertSellerAcceptingOrders(sub.seller_id), estimate()]);
+    if (blockMsg) return res.status(403).json({ success: false, code: "SELLER_BLOCKED", message: blockMsg });
 
     const { data, error } = await supabase.rpc("place_order", {
         p_buyer_id: buyerId,
@@ -645,18 +598,16 @@ export async function placeOrder(req, res) {
     });
 
     {
-        const { data: buyerProfile } = await supabase
-            .from("profiles").select("name, phone").eq("id", buyerId).maybeSingle();
+        const { data: buyerProfile } = await supabase.from("profiles").select("name, phone").eq("id", buyerId).maybeSingle();
         if (buyerProfile?.phone) {
-            await sendOrderUpdateWhatsApp({
-                to: buyerProfile.phone,
-                name: buyerProfile.name,
+            void sendOrderUpdateWhatsApp({
+                to: buyerProfile.phone, name: buyerProfile.name,
                 headline: `Your order #${row.order_number} has been placed successfully.`,
                 detail: row.order_status === "awaiting_payment"
                     ? "Please complete your payment to confirm this order."
                     : `Estimated delivery: ${row.estimated_delivery_date || "will be shared soon"}.`,
                 footer: "Track your order anytime in the app.",
-            });
+            }).catch((e) => console.error("[placeOrder] whatsapp failed:", e?.message || e));
         }
     }
 

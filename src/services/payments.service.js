@@ -90,7 +90,7 @@ async function targetStillUnpaid(purpose, targetId) {
 // completed, and rebuilds its gateway URL from what we stored (redirect_uri + tranCtx).
 // No call to JioPay is made. Returns null when there is nothing to resume.
 // 3) findResumableAttempt: accept expectedPaise and only resume a session for exactly that amount
-async function findResumableAttempt({ purpose, userId, targetId, expectedPaise = null }) {
+async function findResumableAttempt({ purpose, userId, targetId, expectedPaise = null, alreadyVerifiedUnpaid = false }) {
     if (purpose !== "order" && purpose !== "order_group") return null;
 
     const targetCol = purpose === "order" ? "order_id" : "order_group_id";
@@ -111,7 +111,8 @@ async function findResumableAttempt({ purpose, userId, targetId, expectedPaise =
         return null;
     }
     if (!a) return null;
-    if (!(await targetStillUnpaid(purpose, targetId))) return null;
+    if (!alreadyVerifiedUnpaid && !(await targetStillUnpaid(purpose, targetId))) return null;
+
 
     try {
         const target = new URL(String(a.redirect_uri));
@@ -175,12 +176,20 @@ async function repriceForPayment({ purpose, userId, targetId, expectedTotal }) {
 export async function createCheckout({ purpose, userId, targetId, amountPaise = null, expectedTotal = null }) {
     assertJiopayConfigured();
 
+    // Starts now and runs alongside everything below. The async wrapper makes sure the query
+    // actually fires (Supabase builders only run when awaited).
+    const profilePromise = (async () =>
+        supabase.from("profiles").select("name, email, phone").eq("id", userId).maybeSingle())();
+
     let expectedPaise = null;
     if (purpose === "order" || purpose === "order_group") {
         expectedPaise = await repriceForPayment({ purpose, userId, targetId, expectedTotal });
     }
 
-    const resumable = await findResumableAttempt({ purpose, userId, targetId, expectedPaise });
+    const resumable = await findResumableAttempt({
+        purpose, userId, targetId, expectedPaise,
+        alreadyVerifiedUnpaid: purpose === "order" || purpose === "order_group",
+    });
     if (resumable) return resumable;
 
     if (isGatewayBlocked()) {
@@ -216,7 +225,7 @@ export async function createCheckout({ purpose, userId, targetId, amountPaise = 
             { previousTotal: expectedPaise / 100, currentTotal: paise / 100, direction: paise > expectedPaise ? "up" : "down" });
     }
 
-    const { data: profile } = await supabase.from("profiles").select("name, email, phone").eq("id", userId).maybeSingle();
+    const { data: profile } = await profilePromise;
 
     let init;
     try {
@@ -257,9 +266,13 @@ export async function createCheckout({ purpose, userId, targetId, amountPaise = 
         throw new PaymentError(502, "The payment gateway isn't reachable right now. Please try again in a moment.", "GATEWAY_UNAVAILABLE");
     }
 
-    await supabase.from("payment_attempts")
+    // REPLACE the awaited update after initiateSale with:
+    void supabase.from("payment_attempts")
         .update({ status: "initiated", tran_ctx: init.tranCtx, redirect_uri: init.redirectUri })
-        .eq("id", attemptId).eq("status", "created"); // never regress a status a fast webhook already advanced
+        .eq("id", attemptId).eq("status", "created") // never regress a status a fast webhook already advanced
+        .then(({ error: upErr }) => {
+            if (upErr) console.error("[payments] couldn't store gateway session:", ref, upErr.message);
+        });
 
     return { ref, redirectUrl: init.redirectUrl, amountPaise: paise };
 }
