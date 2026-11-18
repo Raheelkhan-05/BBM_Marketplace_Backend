@@ -10,7 +10,7 @@ import {
 import { enqueueImages, listJobs, ackImages, cancelImages } from "../controllers/adminCatalogImages.controller.js";
 import { startCatalogImageWorker } from "../services/catalogImageQueue.service.js";
 
-// The AI image worker starts when the server boots (this file is imported at startup).
+// The catalog image worker starts when the server boots (this file is imported at startup).
 startCatalogImageWorker();
 
 const router = express.Router();
@@ -28,7 +28,8 @@ router.delete("/drafts", guard, clearDrafts);
 router.patch("/drafts/:id", guard, updateDraft);
 router.delete("/drafts/:id", guard, deleteDraft);
 
-// AI product images (background queue)
+// Catalog product images: real product photos found on the web, made by a background queue.
+// The paths keep the old "ai-images" name so the front end does not need any change.
 router.post("/ai-images/enqueue", guard, enqueueImages);
 router.get("/ai-images/jobs", guard, listJobs);
 router.post("/ai-images/ack", guard, ackImages);

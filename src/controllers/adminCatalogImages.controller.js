@@ -1,12 +1,13 @@
 // controllers/adminCatalogImages.controller.js
-// Admin-only endpoints for AI product images on unfinished bulk-upload products.
+// Admin-only endpoints for catalog product images on unfinished bulk-upload products.
+// The images are real product photos found on the web (not AI-generated), made by the background queue.
 import { supabase } from "../config/supabase.js";
 import { startCatalogImageWorker, kickCatalogImageWorker } from "../services/catalogImageQueue.service.js";
 
 const JOBS = "admin_catalog_image_jobs";
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_IDS = 300;
-const MAX_ACTIVE = 600; // per admin, a guard against runaway spend
+const MAX_ACTIVE = 600; // per admin, a guard against runaway search / vision usage
 
 const fail = (res, e, label) => {
     console.error(`[adminCatalogImages] ${label}:`, e?.stack || e?.message || e);
@@ -20,9 +21,17 @@ function parseIds(raw, max) {
 }
 
 // POST /ai-images/enqueue { ids, useReference }
+// useReference: the product's own uploaded photo is used to verify the web photos (and as a last resort if it is already clean)
 export async function enqueueImages(req, res) {
     const p = parseIds(req.body?.ids, MAX_IDS);
     if (p.error) return res.status(400).json({ success: false, message: p.error });
+
+    // fail once, clearly, instead of failing every job separately
+    if (!process.env.SERPER_API_KEY || !process.env.OPENAI_API_KEY) {
+        console.error("[adminCatalogImages] missing env:", !process.env.SERPER_API_KEY ? "SERPER_API_KEY " : "", !process.env.OPENAI_API_KEY ? "OPENAI_API_KEY" : "");
+        return res.status(503).json({ success: false, message: "Product photo search is not set up on the server. Please contact the developer." });
+    }
+
     try {
         const uid = req.user.id;
         const { count, error: cErr } = await supabase.from(JOBS).select("id", { count: "exact", head: true }).eq("created_by", uid).in("status", ["queued", "running"]);
@@ -31,7 +40,7 @@ export async function enqueueImages(req, res) {
             return res.status(400).json({ success: false, message: "Too many images are already being made. Wait for some to finish, then try again." });
         }
 
-        // only products that have a name and a brand can be generated
+        // only products that have a name and a brand can be searched
         const eligible = [];
         for (const c of chunks(p.ids, 50)) {
             const { data, error } = await supabase.from("admin_catalog_drafts").select("id, data").eq("created_by", uid).in("id", c);
