@@ -2,6 +2,7 @@ import { supabase } from "../config/supabase.js";
 import { notifyAdmins, notifyUser } from "../utils/notify.js";
 import { sendOtp, verifyOtpCode } from "../utils/otp.js";
 import { publishQueuedForUser } from "../services/stagedListings.service.js";
+import { sanitizeStoreTheme } from "../utils/storeTheme.js";
 
 // const REQUIRED_FIELDS = [
 //   "display_name", "business_type", "year_established",
@@ -377,6 +378,9 @@ export async function updateSellerProfile(req, res) {
 
   const gatedUpdate = {};
   for (const key of GATED_FIELDS) if (body[key] !== undefined) gatedUpdate[key] = body[key];
+  // Store look: sanitized server-side, then follows the SAME rules as every other edit below
+  // (live straight away for trusted sellers, staged for sellers an admin has flagged).
+  if (body.store_theme !== undefined) gatedUpdate.store_theme = sanitizeStoreTheme(body.store_theme);
   if (!Object.keys(gatedUpdate).length) return res.status(400).json({ success: false, message: "No fields provided." });
 
   if (seller.status !== "approved") {

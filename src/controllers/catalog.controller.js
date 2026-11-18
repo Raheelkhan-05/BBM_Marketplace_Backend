@@ -17,6 +17,7 @@
 // ordering).
 
 import { supabaseAdmin } from "../config/supabase.js";
+import { sanitizeStoreTheme } from "../utils/storeTheme.js";
 
 function parseIntSafe(v, fallback) {
     const n = parseInt(v, 10);
@@ -318,7 +319,7 @@ export async function getShopPublicInfo(req, res) {
     }
     const { data, error } = await supabaseAdmin
         .from("seller_profiles")
-        .select("shop_slug, display_name, city, state, logo_url")
+        .select("shop_slug, display_name, city, state, logo_url, store_theme, status")
         .eq("shop_slug", slug)
         .is("deleted_at", null)
         .maybeSingle();
@@ -328,8 +329,19 @@ export async function getShopPublicInfo(req, res) {
         return res.status(500).json({ success: false, message: "Couldn't load this store." });
     }
     if (!data) return res.status(404).json({ success: false, message: "Store not found." });
+
+    const { status, store_theme, ...rest } = data;
     res.set("Cache-Control", "public, max-age=60");
-    return res.json({ success: true, shop: data });
+    return res.json({
+        success: true,
+        shop: {
+            ...rest,
+            // Re-sanitized on the way OUT as well, so a bad value written straight into the DB can never reach buyers.
+            store_theme: store_theme ? sanitizeStoreTheme(store_theme) : null,
+            // Only a boolean leaves the server, not the raw status. The header uses it for the automatic "Verified seller" chip.
+            is_verified: status === "approved",
+        },
+    });
 }
 
 // catalog.controller.js
