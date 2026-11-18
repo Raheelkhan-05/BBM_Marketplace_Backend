@@ -1,6 +1,22 @@
 // MUST mirror src/utils/storeTheme.js on the frontend.
 const TEMPLATES = ["letterhead", "solid", "cover", "compact"];
-const ACCENTS = ["#0F63B5", "#1F3A5F", "#B4351B", "#1E6B52", "#0F6E7A", "#8A5A00", "#9C2C5B", "#23272B"];
+const ACCENTS = [
+    "#0F63B5",
+    "#1F3A5F",
+    "#B4351B",
+    "#1E6B52",
+    "#0F6E7A",
+    "#8A5A00",
+    "#9C2C5B",
+    "#23272B",
+
+    // New colors
+    "#F4511E",
+    "#FFD60A",
+    "#1E78D6",
+    "#22A06B",
+    "#0B5563",
+];
 const LEGACY_HIGHLIGHTS = {
     gst: "GST invoice", credit: "Credit available", delivery: "Doorstep delivery",
     bulk: "Bulk pricing", support: "Direct seller support",
