@@ -1,18 +1,18 @@
 // services/catalogProductImage.service.js
 // One product -> one clean 3:4 white-background PNG made from the REAL product photo.
-// Nothing is generated or redrawn by AI.
+// Nothing is generated or redrawn by AI, and nothing is guessed: if the photo cannot be PROVEN to be the exact
+// product, the job fails with a clear message.
 //
-//   1. SEARCH   Two sources, in two rounds (round 1 = exact pack size, round 2 = same product line):
-//                 - Google Images (Serper)
-//                 - shop / brand product pages found by Google (Flipkart, IndiaMART, Amazon ...): their main product photo
-//   2. FILTER   download the best title/URL matches, keep photos with a plain light background
-//   3. VERIFY   a vision model only JUDGES (never edits). Identity can be proven by the printed label OR by the
-//                 listing title, as long as the photo does not visibly contradict it.
-//                 Exact pack size is preferred; otherwise the same product line in the same container class
-//                 (small bottle / bottle / can / drum) is accepted and the file is tagged "-approx".
-//   4. FINISH   plain background -> pure white (only pixels connected to the photo edge), trim, and centre the
-//                 untouched product on a pure white 1200x1600 (3:4) canvas.
-// If nothing reliable exists the job fails with a message that says where the photos were lost.
+//   1. SEARCH   Google Images (Serper) + the main photo of shop / brand pages (Flipkart, IndiaMART, Amazon ...),
+//               round 1 = with the pack size, round 2 = product line only.
+//   2. FILTER   download the best title/URL matches, keep photos with a plain light background.
+//   3. READ     a vision model BLIND-READS each pack (it is not told which product to expect): brand, printed label
+//               text, printed size, container type, photo quality. The CODE then compares that text with the product
+//               name: every identifying word / code (HX8, AX5, R3, 5W-30 ...) must be printed on the pack.
+//   4. CONFIRM  the best photos are read again at higher resolution, and a second, independent check must say "same".
+//               "different" or "unsure" = rejected.
+//   5. FINISH   plain background -> pure white (only pixels connected to the photo edge), trim, and centre the
+//               untouched product on a pure white 1200x1600 (3:4) canvas.
 import OpenAI from "openai";
 import sharp from "sharp";
 import { supabase } from "../config/supabase.js";
@@ -21,16 +21,22 @@ const BUCKET = process.env.CATALOG_IMAGE_BUCKET || "catalog-images";
 const SERPER_KEY = process.env.SERPER_API_KEY || "";                      // https://serper.dev
 const SEARCH_COUNTRY = process.env.CATALOG_SEARCH_COUNTRY || "in";        // Google "gl" parameter
 const VISION_MODEL = process.env.CATALOG_VISION_MODEL || "gpt-4.1-mini";  // any vision-capable chat model
-// pack-size fallback: "class" (default) = same product line + same container class, "any" = same line, any size, "off" = exact size only
-const FALLBACK = (process.env.CATALOG_ALLOW_SIZE_FALLBACK || "class").toLowerCase();
+// How the pack size must be proven:
+//   "label_or_title" (default) = printed on the pack, OR the shop's title says it AND the container type matches
+//   "label"                    = printed on the pack only
+const SIZE_EVIDENCE = (process.env.CATALOG_SIZE_EVIDENCE || "label_or_title").toLowerCase();
 const MAX_BYTES = 15 * 1024 * 1024;
-const MAX_DOWNLOAD = 24;    // candidates downloaded per round
-const MAX_TO_VISION = 10;   // photos shown to the vision model per round
-const MIN_SIDE = 400;       // ignore thumbnails smaller than this
-const MAX_UPSCALE = 3;      // never enlarge a photo more than this (a small photo is placed smaller instead of being rejected)
-const FILL = 0.9;           // the product fills at most 90% of the canvas
-const BG_TOL = 30;          // how far a pixel may differ from the background colour to count as background
-const WORK_MAX = 1800;      // working size of a downloaded photo (the output only needs 1440px)
+const MAX_DOWNLOAD = 24;     // candidates downloaded per round
+const MAX_TO_VISION = 8;     // photos read per round
+const CONFIRM_PER_ROUND = 3; // photos confirmed per round
+const CONFIRM_TOTAL = 4;     // photos confirmed per job
+const MIN_SIDE = 400;        // ignore thumbnails smaller than this
+const MAX_UPSCALE = 3;       // never enlarge a photo more than this (a small photo is placed smaller instead of being rejected)
+const FILL = 0.9;            // the product fills at most 90% of the canvas
+const BG_TOL = 30;           // how far a pixel may differ from the background colour to count as background
+const WORK_MAX = 1800;       // working size of a downloaded photo (the output only needs 1440px)
+const READ_SIDE = 896;       // photo size for the first read
+const CONFIRM_SIDE = 1280;   // photo size for the confirmation read
 const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 export const OUT_W = 1200;
@@ -62,19 +68,32 @@ async function mapLimit(items, limit, fn) {
     return out;
 }
 
-/* ---------------------------------- product names / pack size ---------------------------------- */
+/* ---------------------------------- words / names / pack size ---------------------------------- */
+// words that describe the kind of product but do not identify the line (a pack may or may not print them)
+const GENERIC = new Set([
+    "engine", "oil", "oils", "lubricating", "lubricant", "lubricants", "industrial", "heavy", "duty", "diesel", "petrol", "cng",
+    "motorcycle", "scooter", "car", "cars", "passenger", "vehicle", "vehicles", "synthetic", "fully", "technology", "mineral",
+    "premium", "stroke", "for", "and", "the", "of", "with", "fluid", "gear", "new", "pack", "litre", "liter", "ltr", "l", "ml",
+]);
+
+// lower-case words; "5W-30" / "5w 30" / "5W30" all become "5w30"; "4-Stroke" is dropped
+function words(text) {
+    return String(text || "").toLowerCase()
+        .replace(/&/g, " and ")
+        .replace(/\b(\d{1,2})\s*w\s*[-/]?\s*(\d{2,3})\b/g, " $1w$2 ")
+        .replace(/\b[24]\s*-?\s*stroke\b/g, " ")
+        .replace(/[^a-z0-9]+/g, " ").trim().split(" ").filter(Boolean);
+}
+// what was read from a pack, plus joined neighbours ("hx 8" -> "hx8")
+function wordSet(text) {
+    const w = words(text), s = new Set(w);
+    for (let i = 0; i + 1 < w.length; i++) s.add(w[i] + w[i + 1]);
+    return s;
+}
+
 function productTitle(d) {
     const brand = T(d.b), name = T(d.n);
     return brand && !name.toLowerCase().startsWith(brand.toLowerCase()) ? `${brand} ${name}` : name;
-}
-
-function productFacts(d) {
-    const facts = [];
-    if (T(d.grade)) facts.push(`variant / grade ${T(d.grade)}`);
-    if (T(d.model)) facts.push(`model / part number ${T(d.model)}`);
-    if (Number(d.ps) > 0 && T(d.u)) facts.push(`one retail pack contains ${T(d.ps, 20)} ${T(d.u, 40)}`);
-    (Array.isArray(d.spec) ? d.spec : []).slice(0, 6).forEach((s) => { if (T(s?.key) && T(s?.value)) facts.push(`${T(s.key, 60)}: ${T(s.value, 80)}`); });
-    return facts;
 }
 
 // "5 L", "900 ml", "3.5 Litre" -> litres (or null)
@@ -96,15 +115,15 @@ function nameParts(d) {
     const short = core.replace(/\s+for\s+.*$/i, "").replace(/\s+/g, " ").trim();      // without "for Petrol & Diesel Cars"
     const litres = parseLitres(size);
     const key = litres == null ? "" : (/ml/i.test(size) ? `${Math.round(litres * 1000)}ml` : `${litres}l`);
-    // the words that identify the product line: brand, series, and every code with a digit (HX8, 5W-30, R3, 320 ...)
-    const words = short.split(/\s+/).filter(Boolean);
-    const must = [...new Set(words.filter((w, i) => i <= 1 || /\d/.test(w)).map(flat).filter(Boolean))];
-    const tokens = [...new Set(words.map(flat).filter((t) => t.length >= 2))];
+    const brandWords = new Set(words(T(d.b)));
+    // the words that identify the product line: series names and every code (helix, hx8, 5w30, r3, s2, 320 ...)
+    const must = [...new Set(words(short).filter((w) => !brandWords.has(w) && !GENERIC.has(w)))];
+    const tokens = [...new Set(words(short).filter((t) => t.length >= 2))];
     return { title, brand: T(d.b), core, short, size, litres, cls: classOf(litres), key, must, tokens };
 }
 
-// does this text name the product line / the pack size?
-const lineMatch = (text, n) => n.must.length > 0 && (() => { const h = flat(text); return n.must.every((t) => h.includes(t)); })();
+// does this text (a page title) name the product line / the pack size? Used only to RANK photos, never to approve one.
+const lineMatch = (text, n) => n.must.length > 0 && (() => { const s = wordSet(text); return n.must.every((t) => s.has(t)); })();
 function sizeMatch(text, n) {
     if (!n.key) return false;
     const t = String(text || "").toLowerCase().replace(/\b(litres?|liters?|ltrs?|ltr)\b/g, "l").replace(/\s+/g, "");
@@ -141,7 +160,7 @@ function borderInfo(data, w, h) {
     return { mean, plain: near / n >= 0.8 && luma >= 190 };
 }
 
-// Download one image. Returns { png (max 1800px), jpg (768px for the vision model), w, h, plain } or null.
+// Download one image. Returns { png (max 1800px), jpg (896px for the vision model), w, h, plain } or null.
 async function fetchImage(url, { minSide = 0, timeout = 15000, referer = "" } = {}) {
     if (!url || !safeRemote(url)) return null;
     try {
@@ -167,7 +186,7 @@ async function fetchImage(url, { minSide = 0, timeout = 15000, referer = "" } = 
 
         const base = sharp(buf).rotate().flatten({ background: "#ffffff" });
         const png = await base.clone().resize({ width: WORK_MAX, height: WORK_MAX, fit: "inside", withoutEnlargement: true }).png().toBuffer();
-        const jpg = await base.clone().resize({ width: 768, height: 768, fit: "inside", withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer();
+        const jpg = await base.clone().resize({ width: READ_SIDE, height: READ_SIDE, fit: "inside", withoutEnlargement: true }).jpeg({ quality: 88 }).toBuffer();
         const m2 = await sharp(png).metadata();
         const raw = await sharp(jpg).removeAlpha().raw().toBuffer({ resolveWithObject: true });
         const b = borderInfo(raw.data, raw.info.width, raw.info.height);
@@ -199,10 +218,11 @@ async function downloadCandidate(c) {
 /* ---------------------------------- 1. search ---------------------------------- */
 // Photos from stock sites are watermarked, so they are never used.
 const BAD_DOMAINS = /(alamy|shutterstock|gettyimages|dreamstime|istockphoto|123rf|depositphotos|adobestock|vecteezy|freepik|pngtree|pngwing|clipart|pinimg)/i;
-// Shops and brand sites that usually have clean packshots of technical products.
+// Shops and brand sites that usually have clean packshots of technical products (used for ranking only).
 const GOOD_DOMAINS = /(amazon|flipkart|flixcart|indiamart|shell\.|jiomart|bigbasket|boodmo|tradeindia|moglix|industrybuying|zoro|grainger)/i;
 
-async function serper(path, q, num) {
+async function serper(job, path, q, num) {
+    job.serper += 1;
     const res = await fetch(`https://google.serper.dev/${path}`, {
         method: "POST",
         headers: { "X-API-KEY": SERPER_KEY, "Content-Type": "application/json" },
@@ -213,16 +233,16 @@ async function serper(path, q, num) {
     return res.json();
 }
 
-async function serperImages(q) {
-    const j = await serper("images", q, 10);
+async function serperImages(job, q) {
+    const j = await serper(job, "images", q, 10);
     return (j.images || []).map((i) => ({
         url: i.imageUrl, page: i.link, title: i.title || "", domain: i.domain || i.source || hostOf(i.link),
         w: Number(i.imageWidth) || 0, h: Number(i.imageHeight) || 0,
     }));
 }
 
-async function serperWeb(q) {
-    const j = await serper("search", q, 8);
+async function serperWeb(job, q) {
+    const j = await serper(job, "search", q, 8);
     return (j.organic || []).map((r) => ({ link: r.link, title: r.title || "" }));
 }
 
@@ -277,8 +297,8 @@ async function fetchPageImages(r) {
     } catch { return []; }
 }
 
-async function collectPageCandidates(queries) {
-    const settled = await Promise.allSettled(queries.map(serperWeb));
+async function collectPageCandidates(job, queries) {
+    const settled = await Promise.allSettled(queries.map((q) => serperWeb(job, q)));
     const links = [], seenLinks = new Set();
     for (const s of settled) {
         if (s.status !== "fulfilled") continue;
@@ -292,17 +312,10 @@ async function collectPageCandidates(queries) {
     return pages.flat();
 }
 
-const sizeImageQueries = (n) => [`${n.short} ${n.size}`, `${n.core} ${n.size}`, `${n.short} ${n.size} site:amazon.in`, `${n.short} ${n.size} site:flipkart.com`];
-const lineImageQueries = (n) => [n.short, `${n.short} pack`, `${n.short} site:amazon.in`, `${n.short} site:flipkart.com`, `${n.short} site:indiamart.com`];
-const webQueries = (n, withSize) => {
-    const b = withSize && n.size ? `${n.short} ${n.size}` : n.short;
-    return [`${b} site:flipkart.com`, `${b} site:indiamart.com`, `${b} site:amazon.in`, `${b} buy online india`];
-};
-
-// Score a hit by how many product words it names, whether its title names the product line and the size.
+// Score a hit by how many product words it names, whether its title names the product line and the size (ranking only).
 function scoreHit(c, n) {
     const h = flat(`${c.title} ${c.page || ""} ${c.url}`);
-    let s = n.tokens.length ? n.tokens.filter((t) => h.includes(t)).length / n.tokens.length : 0;
+    let s = n.tokens.length ? n.tokens.filter((t) => h.includes(flat(t))).length / n.tokens.length : 0;
     if (c.titleLine) s += 0.5;
     if (c.titleSize) s += 0.3;
     if (GOOD_DOMAINS.test(c.domain) || GOOD_DOMAINS.test(c.url)) s += 0.15;
@@ -310,10 +323,10 @@ function scoreHit(c, n) {
 }
 
 // Search both sources, rank the hits, download the best, keep photos with a plain light background.
-async function getCandidates(n, imageQueries, pageQueries, seen, stats) {
+async function getCandidates(job, n, imageQueries, pageQueries, seen) {
     const [imgSettled, pageCands] = await Promise.all([
-        Promise.allSettled(imageQueries.map(serperImages)),
-        collectPageCandidates(pageQueries).catch(() => []),
+        Promise.allSettled(imageQueries.map((q) => serperImages(job, q))),
+        collectPageCandidates(job, pageQueries).catch(() => []),
     ]);
     if (imgSettled.every((s) => s.status === "rejected") && !pageCands.length) throw new Error(imgSettled[0].reason?.message || "image search failed");
 
@@ -325,8 +338,7 @@ async function getCandidates(n, imageQueries, pageQueries, seen, stats) {
         if (c.w && c.h && Math.min(c.w, c.h) < MIN_SIDE) continue;
         seen.add(c.url);
         const up = upgradeUrl(c.url);
-        const text = `${c.title} ${c.page || ""}`;
-        const item = { ...c, url: up.url, alt: up.alt, titleLine: lineMatch(text, n), titleSize: sizeMatch(c.title, n) };
+        const item = { ...c, url: up.url, alt: up.alt, titleLine: lineMatch(`${c.title} ${c.page || ""}`, n), titleSize: sizeMatch(c.title, n) };
         item.score = scoreHit(item, n);
         found.push(item);
     }
@@ -336,88 +348,115 @@ async function getCandidates(n, imageQueries, pageQueries, seen, stats) {
     const downloaded = await mapLimit(batch, 8, async (c) => ({ ...c, img: await downloadCandidate(c) }));
     const usable = downloaded.filter((c) => c.img);
     const plain = usable.filter((c) => c.img.plain);
-    stats.found += found.length; stats.tried += batch.length; stats.downloaded += usable.length; stats.plain += plain.length;
+    job.found += found.length; job.tried += batch.length; job.downloaded += usable.length; job.plain += plain.length;
     return plain.slice(0, MAX_TO_VISION);
 }
 
-/* ---------------------------------- 2. verify (judge only, never edits) ---------------------------------- */
-const VISION_INSTRUCTIONS = `You are a product-identification expert for an industrial / automotive e-commerce catalogue (lubricants, coolants, fluids, parts).
-You are given numbered photos found on the web for ONE target product, and sometimes an "owner photo" that is the ground truth.
-Each photo may come with the title of the web page it was found on. The title says what the listing claims to sell; the photo shows what is really there.
-Identity can be established by the printed label OR by a listing title that clearly names the target product, as long as the photo does not visibly contradict it
-(a different brand, a different product family, or a clearly different variant code / viscosity printed on the label).
-
-For EVERY numbered photo decide:
-- brand_family: true if the pack visibly belongs to the target brand and product family (for example Shell Helix), whatever the variant code.
-- variant_conflict: true ONLY if the printed label is readable and clearly shows a different variant code, series, viscosity grade or product type than the target (for example HX5 instead of HX7, 15W-40 instead of 5W-30). If the label is unreadable or matches, false.
-- same_line: true if the label itself matches the target brand, series, every code in the target name and the viscosity grade.
-- same_size: true if the pack size PRINTED on the photo equals the target pack size (1 L = 1000 ml; 900 ml is not 1 L; 3.5 L is not 4 L). If the target has no pack size, true. If you cannot read the size, false.
-- size_conflict: true ONLY if a printed pack size is readable and clearly different from the target.
-- container_class: the kind of container in the photo: "small" (hand-size bottle up to about 1.5 L), "bottle" (2 to 6 L bottle or jerrycan with a handle), "can" (7 to 25 L pail or can), "drum" (large barrel of 50 L or more), "other".
-- clean_view: true if the whole product is visible, not heavily cropped, reasonably sharp, and the main label faces the camera (a slight angle is fine; the label does not have to be readable).
-- single_product: false for collages, multi-pack bundles, sets of different products, or lifestyle scenes.
-- watermark: true if there is a visible watermark, shop logo stamp, price badge, sale sticker or any overlay text that is not part of the pack.
-- quality: 1-10 for sharpness, resolution and how clean the photo is as a catalogue image.
-- reason: a few words.
-
-Return ONLY JSON:
-{"matches":[{"index":0,"brand_family":true,"variant_conflict":false,"same_line":true,"same_size":true,"size_conflict":false,"container_class":"small","clean_view":true,"single_product":true,"watermark":false,"quality":8,"reason":"short"}]}`;
-
-async function judgePhotos(d, n, owner, cands) {
-    const content = [{
-        type: "text",
-        text: `TARGET PRODUCT: "${n.title}"\nTARGET PACK SIZE: ${n.size || "not given"}${n.cls ? ` (container class: ${n.cls})` : ""}` +
-            (productFacts(d).length ? `\nKnown details: ${productFacts(d).join("; ")}` : ""),
-    }];
-    if (owner) {
-        content.push({ type: "text", text: "OWNER PHOTO (ground truth, not numbered):" });
-        content.push({ type: "image_url", image_url: { url: `data:image/jpeg;base64,${owner.jpg.toString("base64")}`, detail: "high" } });
-    }
-    cands.forEach((c, i) => {
-        content.push({ type: "text", text: `Photo ${i} (from ${c.domain || "web"}). Page title: "${T(c.title, 160) || "unknown"}"` });
-        content.push({ type: "image_url", image_url: { url: `data:image/jpeg;base64,${c.img.jpg.toString("base64")}`, detail: "high" } });
-    });
-
+/* ---------------------------------- 2. read + verify ---------------------------------- */
+async function askVision(job, system, content) {
     const res = await client().chat.completions.create({
         model: VISION_MODEL,
         response_format: { type: "json_object" },
-        messages: [{ role: "system", content: VISION_INSTRUCTIONS }, { role: "user", content }],
+        ...(/^gpt-4/.test(VISION_MODEL) ? { temperature: 0 } : {}),
+        messages: [{ role: "system", content: system }, { role: "user", content }],
     });
+    job.calls += 1;
+    job.inTok += res?.usage?.prompt_tokens || 0;
+    job.outTok += res?.usage?.completion_tokens || 0;
     const raw = res?.choices?.[0]?.message?.content || "{}";
     return JSON.parse(raw.replace(/```json|```/g, "").trim());
 }
 
-// Returns { exact: [cand...], approx: [cand...], rej } each list best first. rej counts why photos were dropped.
-async function rankCandidates(d, n, owner, cands) {
-    const verdict = await judgePhotos(d, n, owner, cands);
-    const rej = { brand: 0, variant: 0, notClean: 0, watermark: 0, quality: 0, packType: 0 };
-    const exact = [], approxClass = [], approxAny = [];
-    const rows = (verdict.matches || []).filter((m) => m && cands[Number(m.index)]);
+const dataUrl = (jpg) => `data:image/jpeg;base64,${jpg.toString("base64")}`;
 
-    for (const m of rows) {
-        const c = cands[Number(m.index)];
-        console.log(`[catalogProductImage]   photo ${m.index} ${c.domain}: line=${m.same_line} family=${m.brand_family} conflict=${m.variant_conflict} size=${m.same_size} class=${m.container_class} clean=${m.clean_view} q=${m.quality} titleLine=${c.titleLine} - ${T(m.reason, 80)}`);
-        const q = Number(m.quality) || 0;
-        const lineOk = m.same_line === true || (m.brand_family === true && m.variant_conflict !== true && c.titleLine);
-        if (!lineOk) { if (m.brand_family === false && m.same_line !== true) rej.brand++; else rej.variant++; continue; }
-        if (m.clean_view !== true || m.single_product === false) { rej.notClean++; continue; }
-        if (m.watermark === true) { rej.watermark++; continue; }
+// The model is NOT told which product to expect, so it cannot "see" what it hopes to see.
+const READ_INSTRUCTIONS = `You are an OCR and packaging inspector for a product catalogue. You are NOT told which product to expect.
+For EVERY numbered photo, report only what is actually visible on the pack:
+- brand: the brand name printed on the pack or shown by its logo (for example Shell, Castrol). "" if none.
+- label_text: the words and numbers printed on the FRONT of the pack, in reading order (product name, series, variant codes, viscosity grade, size). Copy exactly what you can read. Never guess, complete or correct partly visible words; leave out anything you cannot read. "" if nothing is readable.
+- printed_size: the pack size printed on the pack (for example "1 L", "900 ml", "209 L"), or "" if you cannot read one.
+- container_class: "small" (hand-size bottle up to about 1.5 L), "bottle" (2 to 6 L bottle or jerrycan with a handle), "can" (7 to 25 L pail or can), "drum" (large barrel of 50 L or more), "other".
+- clean_view: true only if the whole pack is visible, not cropped, reasonably sharp, with the main label facing the camera (a slight angle is fine).
+- single_product: false for a collage, a bundle or multi-pack of different products, or a lifestyle scene.
+- watermark: true if a shop logo stamp, watermark, price badge, sale sticker or any overlay text that is not part of the pack is visible.
+- quality: 1-10 for sharpness and how clean the photo is as a catalogue image.
+Return ONLY JSON: {"photos":[{"index":0,"brand":"","label_text":"","printed_size":"","container_class":"small","clean_view":true,"single_product":true,"watermark":false,"quality":7}]}`;
 
-        const sizeOk = m.same_size === true || (c.titleSize === true && m.size_conflict !== true);
-        const item = { c, q, line: c.titleLine ? 1 : 0, px: c.img.w * c.img.h };
-        if (sizeOk) { if (q >= 4) exact.push(item); else rej.quality++; continue; }
-        if (q < 5) { rej.quality++; continue; }
-        if (FALLBACK === "off") rej.packType++;
-        else if (n.cls && m.container_class === n.cls) approxClass.push(item);
-        else if (FALLBACK === "any") approxAny.push(item);
-        else rej.packType++;
+// items = [{ jpg }]. Returns Map(index -> reading).
+async function readPacks(job, items) {
+    const content = [];
+    items.forEach((it, i) => {
+        content.push({ type: "text", text: `Photo ${i}:` });
+        content.push({ type: "image_url", image_url: { url: dataUrl(it.jpg), detail: "high" } });
+    });
+    const j = await askVision(job, READ_INSTRUCTIONS, content);
+    return new Map((j.photos || []).map((p) => [Number(p.index), p]));
+}
+
+// Compare what was READ from the pack with the product name. Deterministic: the model has no say here.
+function assess(r, c, n) {
+    if (!r) return { ok: false, kind: "unreadable", why: "no reading" };
+    const brandRead = flat(r.brand), brandWant = flat(n.brand);
+    if (!brandRead) return { ok: false, kind: "unreadable", why: "brand not readable" };
+    if (brandWant && !(brandRead.includes(brandWant) || brandWant.includes(brandRead))) return { ok: false, kind: "mismatch", why: `brand is "${T(r.brand, 40)}"` };
+    if (!n.must.length) return { ok: false, kind: "unreadable", why: "product name has no identifying words" };
+
+    const label = wordSet(r.label_text);
+    if (label.size < 2) return { ok: false, kind: "unreadable", why: "label not readable" };
+    const missing = n.must.filter((t) => !label.has(t));
+    if (missing.length) return { ok: false, kind: "mismatch", why: `label does not show: ${missing.join(", ")}` };
+
+    if (r.clean_view !== true || r.single_product === false || r.watermark === true) return { ok: false, kind: "notClean", why: "not a clean single front view" };
+    if ((Number(r.quality) || 0) < 5) return { ok: false, kind: "quality", why: "low quality" };
+
+    if (n.litres != null) {
+        const printed = parseLitres(r.printed_size);
+        if (printed != null) {
+            if (Math.abs(printed - n.litres) > Math.max(0.001, n.litres * 0.005)) return { ok: false, kind: "size", why: `printed size is ${T(r.printed_size, 20)}` };
+        } else if (SIZE_EVIDENCE === "label") {
+            return { ok: false, kind: "size", why: "pack size not readable" };
+        } else if (!(c.titleSize && r.container_class === n.cls)) {
+            return { ok: false, kind: "size", why: "pack size not proven" };
+        }
     }
-    const best = (a, b) => (b.q - a.q) || (b.line - a.line) || (b.px - a.px);
-    return {
-        exact: exact.sort(best).map((i) => i.c),
-        approx: [...approxClass.sort(best), ...approxAny.sort(best)].map((i) => i.c),
-        rej,
-    };
+    return { ok: true, why: "label matches" };
+}
+
+// Second, independent check. It can only confirm; "different" or "unsure" rejects the photo.
+const CHECK_INSTRUCTIONS = `You verify catalogue photos. You get a TARGET product and ONE photo.
+Answer "same" only if the pack in the photo is clearly the target product: same brand, same product series, same variant words and codes and the same viscosity grade as the target name. The pack must not show any extra variant word or code that the target name lacks (for example AH, AZ, ECT, Professional, Ultra, Plus) and must not lack one that the target has. If a pack size is printed it must equal the target size; if no size is printed, ignore the size.
+Answer "different" if the pack is another product, series, variant, viscosity grade, brand or size.
+Answer "unsure" if you cannot read enough of the label to be certain. Never guess.
+Return ONLY JSON: {"verdict":"same|different|unsure","evidence":"the words you can read on the pack that decide it"}`;
+
+async function confirmPhoto(job, n, c) {
+    // 1) blind read again, bigger, and compare in code
+    const big = await sharp(c.img.png).resize({ width: CONFIRM_SIDE, height: CONFIRM_SIDE, fit: "inside", withoutEnlargement: true }).jpeg({ quality: 90 }).toBuffer();
+    const read = (await readPacks(job, [{ jpg: big }])).get(0);
+    const a = assess(read, c, n);
+    if (!a.ok) return { ok: false, why: `second reading: ${a.why}` };
+    // 2) informed check, may only confirm
+    const v = await askVision(job, CHECK_INSTRUCTIONS, [
+        { type: "text", text: `TARGET PRODUCT: "${n.title}"\nTARGET PACK SIZE: ${n.size || "not given"}` },
+        { type: "image_url", image_url: { url: dataUrl(c.img.jpg), detail: "high" } },
+    ]);
+    if (v.verdict !== "same") return { ok: false, why: `second check says ${v.verdict || "unsure"}: ${T(v.evidence, 100)}` };
+    return { ok: true, why: T(v.evidence, 100) };
+}
+
+// First reading of up to 8 photos. Returns the ones that pass, best first.
+async function screenPhotos(job, n, cands) {
+    const reads = await readPacks(job, cands.map((c) => ({ jpg: c.img.jpg })));
+    const good = [];
+    cands.forEach((c, i) => {
+        const r = reads.get(i);
+        const a = assess(r, c, n);
+        console.log(`[catalogProductImage]   photo ${i} ${c.domain}: brand="${T(r?.brand, 20)}" label="${T(r?.label_text, 70)}" size="${T(r?.printed_size, 12)}" -> ${a.ok ? "ok" : a.why}`);
+        if (a.ok) good.push({ c, q: Number(r.quality) || 0 });
+        else job.rej[a.kind] += 1;
+    });
+    good.sort((a, b) => (b.q - a.q) || (Number(b.c.titleLine) - Number(a.c.titleLine)) || (b.c.img.w * b.c.img.h - a.c.img.w * a.c.img.h));
+    return good.map((g) => g.c);
 }
 
 /* ---------------------------------- 3. finish: real photo -> pure white 3:4 canvas ---------------------------------- */
@@ -481,92 +520,100 @@ async function toCatalogPng(img) {
         .toBuffer();
 }
 
-async function firstUsable(list, stats) {
-    for (const c of list) {
-        const png = await toCatalogPng(c.img);
-        if (png) return { png, cand: c };
-        stats.unusable++;
-    }
-    return null;
-}
-
-function summarise(s) {
-    if (!s.tried) return "the web search found no usable photos";
+/* ---------------------------------- main ---------------------------------- */
+function summarise(j) {
+    if (!j.tried) return "the web search found no usable photos";
     const parts = [];
     const add = (k, t) => { if (k > 0) parts.push(`${k} ${t}`); };
-    add(s.tried - s.downloaded, "could not be downloaded");
-    add(s.downloaded - s.plain, "had no plain background");
-    add(s.rej.brand, "were a different brand or product");
-    add(s.rej.variant, "were a different variant");
-    add(s.rej.packType, "had a different pack type");
-    add(s.rej.notClean + s.rej.watermark, "were not clean (cropped, collage or watermark)");
-    add(s.rej.quality, "were low quality");
-    add(s.unusable, "could not be processed");
-    return `tried ${s.tried} photos: ${parts.join(", ") || "none passed"}`;
+    add(j.tried - j.downloaded, "could not be downloaded");
+    add(j.downloaded - j.plain, "had no plain background");
+    add(j.rej.unreadable, "had a label that could not be read clearly");
+    add(j.rej.mismatch, "showed a different product or variant");
+    add(j.rej.size, "had a different or unproven pack size");
+    add(j.rej.notClean, "were not a clean front view");
+    add(j.rej.quality, "were low quality");
+    add(j.rej.confirm, "failed the second check");
+    add(j.unusable, "could not be processed");
+    return `checked ${j.tried} photos: ${parts.join(", ") || "none passed"}`;
 }
 
-// data = cleaned draft data. refUrl = the owner's own photo (or null); it is only used as ground truth
-// to verify the web photos, and as a last resort if it is already clean.
+// data = cleaned draft data. refUrl = the owner's own uploaded photo (or null), used only as a last resort.
 export async function generateProductImage({ data, refUrl }) {
     if (!SERPER_KEY) throw new JobError("Product photo search is not set up on the server.", false);
     if (T(data.n).length < 2 || !T(data.b)) throw new JobError("Add the product name and brand first.", false);
 
     const n = nameParts(data);
-    const owner = refUrl ? await fetchImage(refUrl) : null;
+    const job = {
+        serper: 0, calls: 0, inTok: 0, outTok: 0, confirms: 0,
+        found: 0, tried: 0, downloaded: 0, plain: 0, unusable: 0,
+        rej: { unreadable: 0, mismatch: 0, size: 0, notClean: 0, quality: 0, confirm: 0 },
+    };
     const seen = new Set();
-    const stats = { found: 0, tried: 0, downloaded: 0, plain: 0, unusable: 0, rej: { brand: 0, variant: 0, notClean: 0, watermark: 0, quality: 0, packType: 0 } };
+    const logCost = () => {
+        const usd = job.serper * 0.001 + job.inTok * 0.4e-6 + job.outTok * 1.6e-6;
+        console.log(`[catalogProductImage] "${n.title}": cost ~$${usd.toFixed(4)} (${job.serper} search credits, ${job.calls} vision calls, ${job.inTok} in / ${job.outTok} out tokens)`);
+    };
 
     const rounds = [];
-    if (n.size) rounds.push({ name: "exact size", img: sizeImageQueries(n), web: webQueries(n, true) });
-    rounds.push({ name: "product line", img: lineImageQueries(n), web: webQueries(n, false) });
+    if (n.size) {
+        rounds.push({
+            name: "exact size",
+            img: [`${n.short} ${n.size}`, `${n.core} ${n.size}`, `${n.short} ${n.size} site:amazon.in`, `${n.short} ${n.size} site:flipkart.com`],
+            web: [`${n.short} ${n.size} site:flipkart.com`, `${n.short} ${n.size} site:indiamart.com`, `${n.short} ${n.size} site:amazon.in`, `${n.short} ${n.size} buy online india`],
+        });
+        rounds.push({
+            name: "product line",
+            img: [n.short, `${n.short} site:amazon.in`, `${n.short} site:flipkart.com`],
+            web: [`${n.short} site:indiamart.com`, `${n.short} india`],
+        });
+    } else {
+        rounds.push({
+            name: "product line",
+            img: [n.short, `${n.short} pack`, `${n.short} site:amazon.in`, `${n.short} site:flipkart.com`],
+            web: [`${n.short} site:flipkart.com`, `${n.short} site:indiamart.com`, `${n.short} buy online india`],
+        });
+    }
 
-    let approxPool = [];
     for (const [i, round] of rounds.entries()) {
-        const cands = await getCandidates(n, round.img, round.web, seen, stats);
-        let exact = [], approx = [];
-        if (cands.length) {
-            const r = await rankCandidates(data, n, owner, cands);
-            exact = r.exact; approx = r.approx;
-            Object.keys(stats.rej).forEach((k) => { stats.rej[k] += r.rej[k]; });
-        }
-        console.log(`[catalogProductImage] "${n.title}" round ${i + 1} (${round.name}): ${cands.length} plain-background photos to vision, accepted ${exact.length} exact / ${approx.length} other size`);
+        const cands = await getCandidates(job, n, round.img, round.web, seen);
+        const good = cands.length ? await screenPhotos(job, n, cands) : [];
+        console.log(`[catalogProductImage] "${n.title}" round ${i + 1} (${round.name}): ${cands.length} plain-background photos read, ${good.length} matched the label`);
 
-        const hit = await firstUsable(exact, stats);
-        if (hit) {
-            console.log(`[catalogProductImage] "${n.title}": original photo (exact size) from ${hit.cand.page || hit.cand.url}`);
-            return hit.png;
-        }
-        approxPool = approxPool.concat(approx);
-    }
-
-    // same product line, but not the exact pack size
-    const approxHit = await firstUsable(approxPool, stats);
-    if (approxHit) {
-        console.log(`[catalogProductImage] "${n.title}": original photo of the same line, different pack size, from ${approxHit.cand.page || approxHit.cand.url}`);
-        approxHit.png.sizeApprox = true; // storeProductImage tags the file name with "-approx"
-        return approxHit.png;
-    }
-
-    // last resort: the owner's own photo, if it already has a plain background
-    if (owner?.plain) {
-        const png = await toCatalogPng(owner);
-        if (png) {
-            console.log(`[catalogProductImage] "${n.title}": no web match, used the uploaded photo`);
+        for (const c of good.slice(0, CONFIRM_PER_ROUND)) {
+            if (job.confirms >= CONFIRM_TOTAL) break;
+            job.confirms += 1;
+            const v = await confirmPhoto(job, n, c);
+            if (!v.ok) { job.rej.confirm += 1; console.log(`[catalogProductImage]   rejected ${c.page || c.url}: ${v.why}`); continue; }
+            const png = await toCatalogPng(c.img);
+            if (!png) { job.unusable += 1; continue; }
+            console.log(`[catalogProductImage] "${n.title}": VERIFIED original photo from ${c.page || c.url} (${v.why})`);
+            logCost();
             return png;
         }
     }
 
-    const why = summarise(stats);
-    console.log(`[catalogProductImage] "${n.title}": no usable photo (${why})`);
-    throw new JobError(`Could not find a clean original photo of this exact product (${why}). Please upload one.`, false);
+    // last resort: the owner's own uploaded photo, if it already has a plain background (it is the seller's own photo, not a guess)
+    const owner = refUrl ? await fetchImage(refUrl) : null;
+    if (owner?.plain) {
+        const png = await toCatalogPng(owner);
+        if (png) {
+            console.log(`[catalogProductImage] "${n.title}": no verified web photo, used the uploaded photo`);
+            logCost();
+            return png;
+        }
+    }
+
+    const why = summarise(job);
+    console.log(`[catalogProductImage] "${n.title}": NO photo could be verified (${why})`);
+    logCost();
+    throw new JobError(`Could not verify a photo of this exact product, so none was used (${why}). Please upload one.`, false);
 }
 
 /* ---------------------------------- storage ---------------------------------- */
 // Swap this for your existing uploader if you prefer. It only has to return a public https URL
 // that contains "/catalog-ai/" so the review screen can mark it.
-// Photos of the same product line in a different pack size get "-approx" in the file name.
 export async function storeProductImage(png, draftId) {
-    const path = `${AI_FOLDER}/${draftId}-${Date.now()}${png.sizeApprox ? "-approx" : ""}.png`;
+    const path = `${AI_FOLDER}/${draftId}-${Date.now()}.png`;
     const { error } = await supabase.storage.from(BUCKET).upload(path, png, { contentType: "image/png", cacheControl: "31536000", upsert: false });
     if (error) throw new JobError(`Could not save the image (${error.message}).`, true);
     const { data } = supabase.storage.from(BUCKET).getPublicUrl(path);
