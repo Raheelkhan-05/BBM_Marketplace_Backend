@@ -15,6 +15,11 @@ import { getTeamContext } from "../services/team.service.js";
 import { isUuid } from "../services/rfqValidation.js";
 import { STATUSES as ORDER_STATUSES } from "../services/orderBook.service.js";
 
+// Data client. Access is already restricted to company admins and every query is scoped to the company,
+// so the service client is used to make sure RLS never hides teammates' records from the admin.
+// Switch to `supabase` if you want RLS to apply again.
+const db = supabaseAdmin || supabase;
+
 const fail = (res, status, message) => res.status(status).json({ success: false, message });
 
 const HEAT_KEYS = ["hot", "warm", "cold", "dead"];
@@ -97,32 +102,50 @@ export async function requireSalesMonitorAdmin(req, res, next) {
 // -----------------------------------------------------------------------------
 
 // Distinct record ids that have at least one activity entry inside the selected dates (paged past the 1000-row cap).
-async function getActivityRecordIds(table, foreignKey, dates) {
+// scope = { parentTable, parentColumn, companyId } limits the lookup to this company's records via an inner join,
+// so other companies' activity never ends up in the id list. If the join isn't available it falls back to unscoped.
+async function getActivityRecordIds(table, foreignKey, dates, scope) {
     if (!dates.start && !dates.endExclusive) return [];
 
-    const ids = new Set();
-    let offset = 0;
+    const run = async (scoped) => {
+        const ids = new Set();
+        let offset = 0;
 
-    while (true) {
-        let query = supabase.from(table).select(`${foreignKey}, id, created_at`).not(foreignKey, "is", null);
-        if (dates.start) query = query.gte("created_at", dates.start);
-        if (dates.endExclusive) query = query.lt("created_at", dates.endExclusive);
+        while (true) {
+            const select = scoped
+                ? `${foreignKey}, id, created_at, ${scope.parentTable}!inner(${scope.parentColumn})`
+                : `${foreignKey}, id, created_at`;
 
-        const { data, error } = await query
-            .order("created_at", { ascending: true })
-            .order("id", { ascending: true })
-            .range(offset, offset + ACTIVITY_PAGE_SIZE - 1);
-        if (error) throw error;
+            let query = db.from(table).select(select).not(foreignKey, "is", null);
+            if (scoped) query = query.eq(`${scope.parentTable}.${scope.parentColumn}`, scope.companyId);
+            if (dates.start) query = query.gte("created_at", dates.start);
+            if (dates.endExclusive) query = query.lt("created_at", dates.endExclusive);
 
-        const rows = data || [];
-        for (const row of rows) {
-            const recordId = row[foreignKey];
-            if (recordId && isUuid(recordId)) ids.add(recordId);
+            const { data, error } = await query
+                .order("created_at", { ascending: true })
+                .order("id", { ascending: true })
+                .range(offset, offset + ACTIVITY_PAGE_SIZE - 1);
+            if (error) throw error;
+
+            const rows = data || [];
+            for (const row of rows) {
+                const recordId = row[foreignKey];
+                if (recordId && isUuid(recordId)) ids.add(recordId);
+            }
+            if (rows.length < ACTIVITY_PAGE_SIZE) break;
+            offset += ACTIVITY_PAGE_SIZE;
         }
-        if (rows.length < ACTIVITY_PAGE_SIZE) break;
-        offset += ACTIVITY_PAGE_SIZE;
+        return [...ids];
+    };
+
+    if (scope) {
+        try {
+            return await run(true);
+        } catch (e) {
+            console.error("[sales monitor lists] scoped activity lookup failed, falling back:", e?.message || e);
+        }
     }
-    return [...ids];
+    return run(false);
 }
 
 function timestampRangeCondition(column, dates) {
@@ -256,28 +279,34 @@ export async function listMonitorEnquiries(req, res) {
         const heat = [...HEAT_KEYS, "none"].includes(req.query.heat) ? req.query.heat : "";
 
         const activityIds = dates.start || dates.endExclusive
-            ? await getActivityRecordIds("sales_thread_entries", "enquiry_id", dates)
+            ? await getActivityRecordIds("sales_thread_entries", "enquiry_id", dates, {
+                parentTable: "rfq_enquiries",
+                parentColumn: "buyer_id",
+                companyId: scope.companyId,
+            })
             : [];
 
         const filters = { companyId: scope.companyId, actorId: actorFilter, search, dates, activityIds };
 
-        let listQuery = supabase.from("rfq_enquiries").select("*", { count: "exact" });
+        let listQuery = db.from("rfq_enquiries").select("*", { count: "exact" });
         listQuery = applyEnquiryCommon(listQuery, filters);
         listQuery = applyHeat(applyEnquiryStatus(listQuery, status), heat)
             .order("last_activity_at", { ascending: false })
             .order("id", { ascending: true })
             .range(offset, offset + limit - 1);
 
-        // Status tab counts: same filters as the list, except the selected status (and heat).
+        // Status tab counts: same filters as the list (including heat), except the selected status.
+        // Including heat keeps the tab numbers consistent with the rows the person actually sees.
         const countsQuery = (nextStatus = "") => {
-            let q = supabase.from("rfq_enquiries").select("id", { count: "exact", head: true });
+            let q = db.from("rfq_enquiries").select("id", { count: "exact", head: true });
             q = applyEnquiryCommon(q, filters);
+            q = applyHeat(q, heat);
             return applyEnquiryStatus(q, nextStatus);
         };
 
         // Heat chip counts: same company / person / search / date / status filters, but not the heat filter itself.
         const heatCountQuery = (h) => {
-            let q = supabase.from("rfq_enquiries").select("id", { count: "exact", head: true });
+            let q = db.from("rfq_enquiries").select("id", { count: "exact", head: true });
             q = applyEnquiryCommon(q, filters);
             q = applyEnquiryStatus(q, status);
             return applyHeat(q, h);
@@ -310,8 +339,8 @@ export async function listMonitorEnquiries(req, res) {
         const empty = { data: [], error: null };
         const [quoteRows, latestEntries] = ids.length
             ? await Promise.all([
-                supabase.from("sales_quotes").select("enquiry_id").in("enquiry_id", ids),
-                supabase.from("sales_thread_entries")
+                db.from("sales_quotes").select("enquiry_id").in("enquiry_id", ids),
+                db.from("sales_thread_entries")
                     .select("enquiry_id, author_id, author_name, created_at, id")
                     .in("enquiry_id", ids)
                     .order("created_at", { ascending: false })
@@ -352,7 +381,10 @@ export async function listMonitorEnquiries(req, res) {
                 unit: r.unit || "",
                 hasProduct: !!r.product_name,
                 kind: r.sales_kind || "enquiry",
-                status: r.status === "closed" ? (r.sales_outcome || "closed") : "open",
+                // "open" | "closed" only. The won / lost result lives in `outcome`.
+                // (The page checks status === "closed" and then outcome, so sending "won"/"lost"
+                // here made every closed enquiry look open.)
+                status: r.status === "closed" ? "closed" : "open",
                 outcome: r.sales_outcome || null,
                 heat: r.sales_heat || null,
                 reminderAt: r.reminder_at || null,
@@ -429,12 +461,16 @@ export async function listMonitorOrders(req, res) {
         const status = ORDER_STATUSES.includes(req.query.status) ? req.query.status : "";
 
         const activityIds = dates.start || dates.endExclusive
-            ? await getActivityRecordIds("order_book_events", "order_id", dates)
+            ? await getActivityRecordIds("order_book_events", "order_id", dates, {
+                parentTable: "order_book_orders",
+                parentColumn: "company_id",
+                companyId: scope.companyId,
+            })
             : [];
 
         const filters = { companyId: scope.companyId, actorId: actorFilter, search, dates, activityIds };
 
-        let listQuery = supabase
+        let listQuery = db
             .from("order_book_orders")
             .select(
                 [
@@ -453,7 +489,7 @@ export async function listMonitorOrders(req, res) {
             .range(offset, offset + limit - 1);
 
         const countQuery = (nextStatus = "") => {
-            let q = supabase.from("order_book_orders").select("id", { count: "exact", head: true });
+            let q = db.from("order_book_orders").select("id", { count: "exact", head: true });
             q = applyOrderCommon(q, filters);
             return nextStatus ? q.eq("status", nextStatus) : q;
         };
@@ -475,7 +511,7 @@ export async function listMonitorOrders(req, res) {
 
         // Latest order events: fallback for historical rows without updater fields.
         const latestEvents = ids.length
-            ? await supabase
+            ? await db
                 .from("order_book_events")
                 .select("order_id, actor_id, actor_name, created_at, id")
                 .in("order_id", ids)
