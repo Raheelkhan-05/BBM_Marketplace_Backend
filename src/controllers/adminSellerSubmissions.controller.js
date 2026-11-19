@@ -39,6 +39,7 @@
 import { supabase } from "../config/supabase.js";
 import { notifyUser, notifySellerSubmissionsChanged, notifyAdminSubmissionsChanged } from "../services/notifications.service.js";
 import { computeFinalPrice, computeMarketplaceFigures } from "../services/pricing.service.js";
+import { logProductImageEvent } from "../services/productImages.service.js";
 
 const PAGE_DEFAULT = 100;
 const PAGE_MAX = 300;
@@ -483,12 +484,28 @@ export async function updateSellerSubmission(req, res) {
         const { error } = await supabase.from("seller_product_submissions").update(submissionUpdate).eq("id", id);
         if (error) return res.status(500).json({ success: false, message: error.message });
     }
+
+    let imagesBefore = null;
+    if (Array.isArray(b.images) && existing.generic_product_brand_id) {
+        const { data: prev } = await supabase.from("hs_generic_product_brands")
+            .select("image, images").eq("id", existing.generic_product_brand_id).maybeSingle();
+        imagesBefore = Array.isArray(prev?.images) && prev.images.length ? prev.images : (prev?.image ? [prev.image] : []);
+    }
+
     if (Object.keys(brandUpdate).length && existing.generic_product_brand_id) {
         const { error } = await supabase.from("hs_generic_product_brands").update(brandUpdate).eq("id", existing.generic_product_brand_id);
         if (error) {
             if (error.code === "23505") return res.status(409).json({ success: false, message: "That product + brand name already exists." });
             return res.status(500).json({ success: false, message: error.message });
         }
+    }
+
+    if (imagesBefore && JSON.stringify(imagesBefore) !== JSON.stringify(b.images)) {
+        void logProductImageEvent({
+            brandItemId: existing.generic_product_brand_id, event: "admin_direct_edit",
+            actorId: req.user?.id || null, actorRole: "admin", sellerId: existing.seller_id, submissionId: id,
+            imagesBefore, imagesAfter: b.images, ip: req.ip || null,
+        });
     }
 
     const { data, error } = await supabase

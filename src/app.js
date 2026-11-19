@@ -49,6 +49,8 @@ import { captureServerException } from "./services/analytics.service.js";
 import salesChatRoutes from "./routes/salesChat.routes.js";
 import partnerRoutes from "./routes/partner.routes.js";
 import gstAccessRoutes from "./routes/gstAccess.routes.js";
+import adminProductImageRequestsRouter from "./routes/adminProductImageRequests.routes.js";
+
 
 export function createApp() {
   const app = express();
@@ -132,6 +134,7 @@ export function createApp() {
   app.use("/api/seller/wallet", sellerWalletRoutes);
   app.use("/api/seller/custom-pricing", customPricingRoutes);
   app.use("/api/admin/seller-listings", adminSellerListingsRoutes);
+  app.use("/api/admin/product-image-requests", adminProductImageRequestsRouter);
   app.use("/api/admin/seller-submissions", adminSellerSubmissionsRouter);
   app.use("/api/seller", sellerRoutes);
   app.use("/api/admin/auth", adminAuthRoutes);

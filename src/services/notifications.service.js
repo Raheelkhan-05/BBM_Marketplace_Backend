@@ -1,3 +1,5 @@
+//notifications.service.js
+
 import { supabase } from "../config/supabase.js";
 import { resend } from "../config/mailer.js";
 import { getIO } from "../socket/io.js";

@@ -34,6 +34,9 @@ import {
     updateTemplate,
     deleteTemplate,
 } from "../controllers/sellerListingTemplates.controller.js";
+import { listImageRequests, createImageRequest, cancelImageRequest } from "../controllers/sellerProductImageRequests.controller.js";
+import { authWriteLimiter } from "../middleware/rateLimiter.js";
+
 import { searchBrandNames, findBrandItemMatch } from "../controllers/sellerBrands.controller.js";
 import { listPickerBrands, listPickerItems } from "../controllers/sellerCatalogPicker.controller.js";
 import { listAllMySubmissions } from "../controllers/sellerCatalogListAll.controller.js";
@@ -55,6 +58,10 @@ router.get("/commission-info", getCommissionInfo);
 
 
 router.get("/submissions/all", requireAuth, requireApprovedSeller, listAllMySubmissions);   // must be ABOVE "/submissions/:id"
+
+router.get("/submissions/:id/image-requests", requireAuth, requireApprovedSeller, listImageRequests);
+router.post("/submissions/:id/image-requests", requireAuth, requireApprovedSeller, authWriteLimiter, createImageRequest);
+router.delete("/submissions/:id/image-requests/:requestId", requireAuth, requireApprovedSeller, authWriteLimiter, cancelImageRequest);
 
 router.post("/submissions", requireAuth, requireApprovedSeller, createSubmission);
 router.get("/submissions", requireAuth, requireApprovedSeller, listMySubmissions);

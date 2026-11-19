@@ -99,6 +99,7 @@ import { SUBMISSION_LIST_COLUMNS, shapeListRow } from "./sellerCatalogListAll.co
 import { resolveCompanyIds } from "../services/team.service.js";
 import { resolveMarketingFields } from "../services/marketing.service.js";
 import { resolveEffectiveBasePrice } from "../../shared/customPricing.js";
+import { logProductImageEvent } from "../services/productImages.service.js";
 
 export const ALLOWED_UNITS = [
     "Pieces", "Kg", "Grams", "Litres", "Millilitres", "Meters",
@@ -525,6 +526,13 @@ export async function createSubmission(req, res) {
                 approved: fromEnquiry || forceApprove,
             });
             isNewBrandItem = true;
+
+            void logProductImageEvent({
+                brandItemId: brand.id, event: "initial_upload",
+                actorId: req.user?.id || null, actorRole: forceApprove ? "admin" : "seller", sellerId,
+                imagesAfter: Array.isArray(body.images) ? body.images : [], ip: req.ip || null,
+                detail: { product: body.productName, brand: body.brandNotApplicable ? null : body.brandName },
+            });
         }
         if (forceApprove && brand.review_status !== "approved") {
             const { error: apErr } = await supabase.from("hs_generic_product_brands")
