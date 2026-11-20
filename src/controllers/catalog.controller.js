@@ -296,18 +296,29 @@ export async function getSellersPage(req, res) {
 }
 
 // GET /api/catalog/brands?q=&limit=&offset=
+// GET /api/catalog/brands?q=&limit=&offset=
+// Per-viewer: guests see public-only counts, logged-in buyers see counts for
+// exactly the listings they can see (same rules as the Home feed).
 export async function getBrandsPage(req, res) {
     const q = String(req.query.q || "").trim().slice(0, 100);
     const limit = Math.min(Math.max(parseIntSafe(req.query.limit, 24), 1), 60);
     const offset = Math.max(parseIntSafe(req.query.offset, 0), 0);
+    const buyerId = req.user?.id || null;
+
     const { data, error } = await supabaseAdmin.rpc("catalog_brands_page", {
-        p_q: q, p_limit: limit, p_offset: offset,
+        p_q: q,
+        p_limit: limit,
+        p_offset: offset,
+        p_seller_id: req.sellerProfileId || null,
+        p_buyer_id: buyerId,
     });
     if (error) {
         console.error("[catalog] getBrandsPage failed:", error.message);
         return res.status(500).json({ success: false, message: "Couldn't load brands." });
     }
-    res.set("Cache-Control", "public, max-age=60");
+    // Guests share one public-only result; logged-in results are per user.
+    res.set("Cache-Control", buyerId ? "private, max-age=30" : "public, max-age=60");
+    res.set("Vary", "Authorization");
     return res.json({ success: true, ...data });
 }
 

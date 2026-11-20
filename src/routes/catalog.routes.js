@@ -41,7 +41,7 @@ router.get("/shops/:shopSlug", getShopPublicInfo);
 router.post("/price-trends/observe", requireAuth, observePriceTrends);
 router.get("/brand-items/:brandItemId", optionalAuth, optionalSellerProfile, getBrandItemDetail);
 
-router.get("/brands", getBrandsPage);
+router.get("/brands", optionalAuth, optionalSellerProfile, getBrandsPage);
 router.get("/sellers", optionalAuth, optionalSellerProfile, getSellersPage);
 
 // Admin-curated banners for product groups (public, tiny, ETag-revalidated).
