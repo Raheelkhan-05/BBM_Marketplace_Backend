@@ -9,6 +9,7 @@ import {
     BUCKET, str, threadDto, hydrateEntries, clipPreview,
     entryPreview, validReplyTo,
 } from "../services/salesThreads.service.js";
+import { syncThreadViews } from "../services/salesThreadSync.service.js";
 import {
     namesOf, participantsOf, ensureParticipants, cleanMentions, afterMessage, markRead,
     audienceOf, emitParticipantsChanged, notifyAdded, firstName,
@@ -98,8 +99,7 @@ function cleanAttachments(list, enquiryId) {
     for (const f of list) {
         const path = typeof f?.path === "string" ? f.path : "";
         if (!path.startsWith(`${enquiryId}/`) || path.includes("..") || path.length > 200) return null;
-        out.push({ path, name: str(f.name, 150) || "file", type: str(f.type, 100), size: Math.max(0, Math.min(Number(f.size) || 0, MAX_BYTES)), ...(Number(a.duration) > 0 ? { duration: Math.min(Math.round(Number(a.duration)), 900) } : {}) });
-
+        out.push({ path, name: str(f.name, 150) || "file", type: str(f.type, 100), size: Math.max(0, Math.min(Number(f.size) || 0, MAX_BYTES)), ...(Number(f.duration) > 0 ? { duration: Math.min(Math.round(Number(f.duration)), 900) } : {}) });
     }
     return out;
 }
@@ -129,6 +129,7 @@ export async function postMessage(req, res) {
             row, companyId: ctx.companyId, entry, senderId: actorId, senderName: name,
             preview: entryPreview(body, attachments), touch: true,
         });
+        await syncThreadViews({ enquiryId: row.id, creatorId: row.created_by_actor_id, userIds: [actorId] });
         res.json({ success: true, entry });
     } catch (e) { oops(res, e, "postMessage"); }
 }
@@ -152,17 +153,18 @@ export async function getCandidates(req, res) {
         const ids = new Set([String(ctx.companyId)]);
         const roles = new Map();
         if (ctx.teamId) {
-            const { data } = await db.from("team_members").select("user_id, role").eq("team_id", ctx.teamId).neq("role", "salesperson");
+            const { data } = await db.from("team_members").select("user_id, role").eq("team_id", ctx.teamId);
             (data || []).forEach((m) => { ids.add(String(m.user_id)); roles.set(String(m.user_id), m.role); });
         }
         const inChat = new Set((await participantsOf(row, ctx)).map((p) => p.userId));
+        inChat.add(String(row.created_by_actor_id));
         const free = [...ids].filter((i) => !inChat.has(i));
         const names = await namesOf(free);
+        const roleOf = (id) => (id === String(ctx.companyId) || roles.get(id) === "admin" ? "admin" : roles.get(id) === "salesperson" ? "salesperson" : "member");
         res.json({
             success: true,
             candidates: free.map((id) => ({
-                userId: id, name: names.get(id)?.name || "Teammate", isOwner: id === String(ctx.companyId),
-                role: id === String(ctx.companyId) || roles.get(id) === "admin" ? "admin" : "member",
+                userId: id, name: names.get(id)?.name || "Teammate", isOwner: id === String(ctx.companyId), role: roleOf(id),
             })).sort((x, y) => x.name.localeCompare(y.name)),
         });
     } catch (e) { oops(res, e, "getCandidates"); }
@@ -184,16 +186,19 @@ export async function addParticipant(req, res) {
         const { row, ctx, actorId } = a;
         const userId = String(req.body?.userId || "");
         if (!isUuid(userId)) return fail(res, 400, "Choose a teammate to add.");
+        if (userId === String(row.created_by_actor_id)) return fail(res, 409, "Already in this chat.");
 
         let ok = userId === String(ctx.companyId);
         if (!ok && ctx.teamId) {
             const { data } = await db.from("team_members").select("role").eq("team_id", ctx.teamId).eq("user_id", userId).maybeSingle();
-            ok = !!data && data.role !== "salesperson";
+            ok = !!data;   // any member of this team, salespeople included
         }
         if (!ok) return fail(res, 400, "This person can't be added to the chat.");
 
         const { error } = await db.from("sales_thread_participants").insert({ enquiry_id: row.id, user_id: userId, added_by: actorId });
         if (error) return error.code === "23505" ? fail(res, 409, "Already in this chat.") : oops(res, error, "addParticipant");
+
+        await syncThreadViews({ enquiryId: row.id, creatorId: row.created_by_actor_id, userIds: [userId, actorId] });
 
         const names = await namesOf([actorId, userId]);
         const by = names.get(actorId)?.name || "Someone", who = names.get(userId)?.name || "a teammate";
@@ -221,6 +226,7 @@ export async function removeParticipant(req, res) {
             .eq("enquiry_id", row.id).eq("user_id", target).select("user_id");
         if (error) throw error;
         if (!data?.length) return fail(res, 404, "Person not found.");
+        await syncThreadViews({ enquiryId: row.id, creatorId: row.created_by_actor_id, userIds: [target, actorId] });
 
         const names = await namesOf([actorId, target]);
         const by = names.get(actorId)?.name || "Someone", who = names.get(target)?.name || "a teammate";

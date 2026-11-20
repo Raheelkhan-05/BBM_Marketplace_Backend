@@ -83,6 +83,15 @@ async function describe(req, out) {
                 meta: {},
             };
         }
+        if (M === "PATCH" && seg[1] === "heat") {
+            const h = typeof b.heat === "string" && b.heat ? b.heat : null;
+            const label = h ? h[0].toUpperCase() + h.slice(1) : "";
+            return {
+                ...base, kind: "enquiry.heat_set",
+                title: h ? `Rated the lead ${label}` : "Cleared the lead rating",
+                subtitle, meta: { heat: h },
+            };
+        }
         if (M === "POST" && seg[1] === "entries" && seg.length === 2) {
             const files = Array.isArray(b.attachments) ? b.attachments.length : 0;
             const text = clip(b.body, 200);

@@ -30,6 +30,8 @@ import { saveContactsForCustomer } from "../services/sellerCustomerContact.servi
 import { parseContact, parseContactList } from "../services/customerContacts.service.js";
 import { cleanMentions, afterMessage } from "../services/salesChat.service.js";
 
+import { syncThreadViews } from "../services/salesThreadSync.service.js";
+
 import {
     BUCKET, GSTIN_RE, getSalesActor, str, safeSearch, cleanGstin, cleanPhone, cleanEmail, round4,
     saleUnits, priceLine, listingProblem, listingDescription, productUrl, clipPreview, ping,
@@ -159,12 +161,13 @@ const flatSub = ({ hs_generic_product_brands, ...rest }) => ({
 
 // A change happened: invalidate cached reads and tell live pages.
 async function notify(ownerId, actorId, enquiryId) {
-    await bumpVer(
-        `sa:${actorId}`,
-        enquiryId ? `st:${enquiryId}` : null
-    );
-
-    ping([ownerId, actorId], { enquiryId });
+    if (!enquiryId) {
+        await bumpVer(`sa:${actorId}`, null);
+        ping([ownerId, actorId], {});
+        return;
+    }
+    await syncThreadViews({ enquiryId, userIds: [actorId] });   // owner + every collaborator
+    ping([ownerId], { enquiryId });                              // company Save page
 }
 
 // The company name as the GST records / customer list know it.
@@ -210,28 +213,16 @@ async function canonicalCustomerName({
 
 // Adds the quoted customer to the salesperson's customer list.
 // Never fails the quotation.
-async function ensureCustomer({
-    sellerId,
-    companyId,
-    actorId,
-    teamId,
-    thread,
-    contacts = [],
-}) {
+async function ensureCustomer({ sellerId, companyId, actorId, ownerActorId, teamId, thread, contacts = [] }) {
+    const assignee = ownerActorId || actorId;
     try {
-        const out = await addOne(
-            sellerId,
-            companyId,
-            thread.customer_gstin,
-            "gst",
-            {
-                assigned_to: actorId,
-                assigned_by: actorId,
-                assigned_kind: "self",
-                assigned_at: new Date().toISOString(),
-                contacts,
-            }
-        );
+        const out = await addOne(sellerId, companyId, thread.customer_gstin, "gst", {
+            assigned_to: assignee,
+            assigned_by: actorId,
+            assigned_kind: "self",
+            assigned_at: new Date().toISOString(),
+            contacts,
+        });
 
         if (
             out?.result === "added" ||
@@ -265,13 +256,7 @@ async function ensureCustomer({
             };
         }
 
-        await saveContactsForCustomer({
-            sellerId,
-            companyId,
-            actorId,
-            gstin: thread.customer_gstin,
-            contacts,
-        });
+        await saveContactsForCustomer({ sellerId, companyId, actorId: assignee, gstin: thread.customer_gstin, contacts });
 
         return {
             status: out?.result === "exists" ? "exists" : "skipped",
@@ -395,41 +380,32 @@ async function readProduct(b, sellerId) {
 
 // ---- loading -------------------------------------------------------------------------------------------
 
-async function loadOwnThread(req, res) {
+async function loadThread(req, res) {
     const { actorId, ownerId } = getSalesActor(req);
     const { id } = req.params;
 
-    if (!isUuid(id)) {
-        fail(res, 404, "Enquiry not found.");
-        return null;
-    }
+    if (!isUuid(id)) { fail(res, 404, "Enquiry not found."); return null; }
 
     const ver = await getVer(`st:${id}`);
 
-    const row = await cached(
-        `sto:${id}:${actorId}:${ver}`,
-        60,
-        async () => {
-            const { data, error } = await supabase
-                .from("rfq_enquiries")
-                .select("*")
-                .eq("id", id)
-                .eq("source", "sales")
-                .eq("created_by_actor_id", actorId)
-                .eq("buyer_id", ownerId)
-                .maybeSingle();
+    const row = await cached(`stx:${id}:${ownerId}:${ver}`, 60, async () => {
+        const { data, error } = await supabase.from("rfq_enquiries").select("*")
+            .eq("id", id).eq("source", "sales").eq("buyer_id", ownerId).maybeSingle();
+        if (error) throw error;
+        return data || null;
+    });
+    if (!row) { fail(res, 404, "Enquiry not found."); return null; }
 
+    // not the owner: must have been added to the thread
+    if (String(row.created_by_actor_id) !== String(actorId)) {
+        const member = await cached(`stm:${id}:${actorId}:${ver}`, 60, async () => {
+            const { data, error } = await supabase.from("sales_thread_participants").select("user_id")
+                .eq("enquiry_id", id).eq("user_id", actorId).maybeSingle();
             if (error) throw error;
-
-            return data || null;
-        }
-    );
-
-    if (!row) {
-        fail(res, 404, "Enquiry not found.");
-        return null;
+            return !!data;
+        });
+        if (!member) { fail(res, 404, "Enquiry not found."); return null; }
     }
-
     return row;
 }
 
@@ -460,19 +436,59 @@ async function touch(
 }
 
 // ---- GET /sales/threads -------------------------------------------------------------------------------
-
 const NIL_UUID = "00000000-0000-0000-0000-000000000000";
 const UNREAD_IDS_MAX = 500;
+const SHARED_MAX = 200;
 
-// { enquiryId -> { unread, mentions } } for threads the signed-in salesperson owns. Never cached:
-// it changes with every message and every read, per person.
-async function unreadFor(actorId, ownerId) {
-    const { data, error } = await supabase.rpc("sales_enquiry_unread", { p_user: actorId, p_owner: ownerId });
-    if (error) {
-        console.error("[sales threads] unread lookup failed:", error.message);
-        return new Map();
+// Threads of other salespeople I was added to. Falls back to [] if the SQL function isn't installed yet.
+async function sharedIdsOf(actorId, ownerId) {
+    try {
+        const { data, error } = await supabase.rpc("sales_shared_thread_ids", { p_user: actorId, p_owner: ownerId });
+        if (error) throw error;
+        return [...new Set((data || []).map((r) => r.n_enquiry_id).filter(Boolean))].slice(0, SHARED_MAX);
+    } catch (e) {
+        console.error("[sales threads] shared lookup failed:", e?.message || e);
+        return [];
     }
-    return new Map((data || []).map((r) => [r.n_enquiry_id, { unread: r.n_unread || 0, mentions: r.n_mentions || 0 }]));
+}
+
+// Live, per-person state (never cached): unread numbers for my own + shared threads, and the shared thread ids.
+async function liveState(actorId, ownerId) {
+    const [own, shared] = await Promise.all([
+        supabase.rpc("sales_enquiry_unread", { p_user: actorId, p_owner: ownerId }),
+        sharedIdsOf(actorId, ownerId),
+    ]);
+    const unread = new Map();
+    if (own.error) console.error("[sales threads] unread lookup failed:", own.error.message);
+    else for (const r of own.data || []) unread.set(r.n_enquiry_id, { unread: r.n_unread || 0, mentions: r.n_mentions || 0 });
+
+    if (shared.length) {
+        const set = new Set(shared);
+        const chat = await supabase.rpc("sales_chat_unread", { p_user: actorId });
+        if (chat.error) console.error("[sales threads] shared unread failed:", chat.error.message);
+        else for (const r of chat.data || []) {
+            if (set.has(r.n_enquiry_id) && (r.n_unread || 0) > 0 && !unread.has(r.n_enquiry_id)) {
+                unread.set(r.n_enquiry_id, { unread: r.n_unread || 0, mentions: r.n_mentions || 0 });
+            }
+        }
+    }
+    return { unread, shared };
+}
+
+// Heat chip numbers for the shared threads (added to the SQL function's numbers for my own threads).
+async function sharedHeatCounts(ids, status) {
+    const hc = { hot: 0, warm: 0, cold: 0, dead: 0, none: 0 };
+    if (!ids.length) return hc;
+    let query = supabase.from("rfq_enquiries").select("sales_heat").eq("source", "sales").in("id", ids);
+    if (status === "open") query = query.neq("status", "closed");
+    else if (status === "won") query = query.eq("status", "closed").eq("sales_outcome", "won");
+    else if (status === "lost") query = query.eq("status", "closed").eq("sales_outcome", "lost");
+    else if (status === "reminder") query = query.not("reminder_at", "is", null).neq("status", "closed");
+    else if (status === "cold") query = query.eq("sales_kind", KIND_COLD);
+    const { data, error } = await query;
+    if (error) { console.error("[sales threads] shared heat counts failed:", error.message); return hc; }
+    for (const r of data || []) { const k = r.sales_heat || "none"; if (k in hc) hc[k] += 1; }
+    return hc;
 }
 
 export async function listThreads(req, res) {
@@ -486,77 +502,62 @@ export async function listThreads(req, res) {
         const q = safeSearch(req.query.q);
         const status = STATUS_FILTERS.includes(req.query.status) ? req.query.status : "";
         const heat = [...HEATS, "none"].includes(req.query.heat) ? req.query.heat : "";
+        const heatStatus = ["open", "won", "lost", "reminder", "cold"].includes(status) ? status : "";
 
-
-        // Live, per-person unread (outside the cache).
-        const unread = await unreadFor(actorId, ownerId);
-        const unreadIds = status === "unread"
-            ? [...unread.keys()].slice(0, UNREAD_IDS_MAX).sort()
-            : [];
+        const { unread, shared } = await liveState(actorId, ownerId);
+        const unreadIds = status === "unread" ? [...unread.keys()].slice(0, UNREAD_IDS_MAX).sort() : [];
 
         const ver = await getVer(`sa:${actorId}`);
 
         const body = await cached(
-            `stl:${actorId}:${ver}:${hashKey([q, status, heat, limit, offset, unreadIds.join(",")])}`,
+            `stl:${actorId}:${ver}:${hashKey([q, status, heat, limit, offset, unreadIds.join(","), shared.join(",")])}`,
             45,
             async () => {
-                const scoped = (qb) =>
-                    qb.eq("source", "sales").eq("created_by_actor_id", actorId).eq("buyer_id", ownerId);
+                // my own threads + the ones I was added to
+                const scoped = (qb) => {
+                    const base = qb.eq("source", "sales").eq("buyer_id", ownerId);
+                    return shared.length
+                        ? base.or(`created_by_actor_id.eq.${actorId},id.in.(${shared.join(",")})`)
+                        : base.eq("created_by_actor_id", actorId);
+                };
 
-                const count = () =>
-                    scoped(supabase.from("rfq_enquiries").select("id", { count: "exact", head: true }));
+                const count = () => scoped(supabase.from("rfq_enquiries").select("id", { count: "exact", head: true }));
 
                 let query = scoped(supabase.from("rfq_enquiries").select("*", { count: "exact" }));
 
-                if (status === "open") {
-                    query = query.neq("status", "closed");
-                } else if (status === "won") {
-                    query = query.eq("status", "closed").eq("sales_outcome", "won");
-                } else if (status === "lost") {
-                    query = query.eq("status", "closed").eq("sales_outcome", "lost");
-                } else if (status === "reminder") {
-                    query = query.not("reminder_at", "is", null).neq("status", "closed");
-                } else if (status === "cold") {
-                    query = query.eq("sales_kind", KIND_COLD);
-                } else if (status === "unread") {
-                    query = query.in("id", unreadIds.length ? unreadIds : [NIL_UUID]);
-                }
+                if (status === "open") query = query.neq("status", "closed");
+                else if (status === "won") query = query.eq("status", "closed").eq("sales_outcome", "won");
+                else if (status === "lost") query = query.eq("status", "closed").eq("sales_outcome", "lost");
+                else if (status === "reminder") query = query.not("reminder_at", "is", null).neq("status", "closed");
+                else if (status === "cold") query = query.eq("sales_kind", KIND_COLD);
+                else if (status === "unread") query = query.in("id", unreadIds.length ? unreadIds : [NIL_UUID]);
 
                 if (heat === "none") query = query.is("sales_heat", null);
                 else if (heat) query = query.eq("sales_heat", heat);
 
-
                 if (q) {
-                    // customers (by GST number) whose city matches the search
                     let cityGst = "";
                     if (sellerId) {
                         const { data: hit, error: cErr } = await supabase
-                            .from("seller_customers")
-                            .select("gstin")
-                            .eq("seller_id", sellerId)
-                            .ilike("city", `%${q}%`)
-                            .not("gstin", "is", null)
-                            .limit(300);
+                            .from("seller_customers").select("gstin")
+                            .eq("seller_id", sellerId).ilike("city", `%${q}%`).not("gstin", "is", null).limit(300);
                         if (cErr) throw cErr;
                         const g = [...new Set((hit || []).map((h) => h.gstin).filter((x) => GSTIN_RE.test(x)))];
                         if (g.length) cityGst = `,customer_gstin.in.(${g.join(",")})`;
                     }
-                    query = query.or(
-                        `product_name.ilike.%${q}%,customer_name.ilike.%${q}%,customer_gstin.ilike.%${q}%${cityGst}`
-                    );
+                    // a second .or() is AND-ed with the scope .or() above
+                    query = query.or(`product_name.ilike.%${q}%,customer_name.ilike.%${q}%,customer_gstin.ilike.%${q}%${cityGst}`);
                 }
 
-                query = (
-                    status === "reminder"
-                        ? query.order("reminder_at", { ascending: true })
-                        : query.order("last_activity_at", { ascending: false })
-                )
+                query = (status === "reminder"
+                    ? query.order("reminder_at", { ascending: true })
+                    : query.order("last_activity_at", { ascending: false }))
                     .order("id", { ascending: true })
                     .range(offset, offset + limit - 1);
 
                 const first = offset === 0;
 
-                const [list, all, open, won, lost, rem, cold, heatRes] = await Promise.all([
+                const [list, all, open, won, lost, rem, cold, heatRes, sharedHeat] = await Promise.all([
                     query,
                     first ? count() : null,
                     first ? count().neq("status", "closed") : null,
@@ -564,10 +565,8 @@ export async function listThreads(req, res) {
                     first ? count().eq("status", "closed").eq("sales_outcome", "lost") : null,
                     first ? count().neq("status", "closed").not("reminder_at", "is", null) : null,
                     first ? count().eq("sales_kind", KIND_COLD) : null,
-                    first ? supabase.rpc("sales_heat_counts", {
-                        p_actor: actorId, p_owner: ownerId,
-                        p_status: ["open", "won", "lost", "reminder", "cold"].includes(status) ? status : "",
-                    }) : null,
+                    first ? supabase.rpc("sales_heat_counts", { p_actor: actorId, p_owner: ownerId, p_status: heatStatus }) : null,
+                    first ? sharedHeatCounts(shared, heatStatus) : null,
                 ]);
 
                 if (list.error) throw list.error;
@@ -579,19 +578,14 @@ export async function listThreads(req, res) {
                 const gsts = [...new Set(rows.map((r) => r.customer_gstin).filter(Boolean))];
                 if (sellerId && gsts.length) {
                     const { data: cs, error: csErr } = await supabase
-                        .from("seller_customers")
-                        .select("gstin, city")
-                        .eq("seller_id", sellerId)
-                        .in("gstin", gsts);
+                        .from("seller_customers").select("gstin, city").eq("seller_id", sellerId).in("gstin", gsts);
                     if (csErr) throw csErr;
                     for (const c of cs || []) if (c.city) cityBy.set(c.gstin, c.city);
                 }
 
                 if (rows.length) {
                     const { data: qs, error: qErr } = await supabase
-                        .from("sales_quotes")
-                        .select("enquiry_id")
-                        .in("enquiry_id", rows.map((r) => r.id));
+                        .from("sales_quotes").select("enquiry_id").in("enquiry_id", rows.map((r) => r.id));
                     if (qErr) throw qErr;
                     for (const x of qs || []) qCount.set(x.enquiry_id, (qCount.get(x.enquiry_id) || 0) + 1);
                 }
@@ -599,6 +593,7 @@ export async function listThreads(req, res) {
                 const items = rows.map((r) => ({
                     ...dtoOf(r, { quotesCount: qCount.get(r.id) || 0 }),
                     city: cityBy.get(r.customer_gstin) || null,
+                    shared: String(r.created_by_actor_id) !== String(actorId),   // a colleague's thread I was added to
                 }));
 
                 const out = {
@@ -610,24 +605,19 @@ export async function listThreads(req, res) {
 
                 if (first) {
                     out.counts = {
-                        all: all?.count || 0,
-                        open: open?.count || 0,
-                        won: won?.count || 0,
-                        lost: lost?.count || 0,
-                        reminder: rem?.count || 0,
-                        cold: cold?.count || 0,
+                        all: all?.count || 0, open: open?.count || 0, won: won?.count || 0,
+                        lost: lost?.count || 0, reminder: rem?.count || 0, cold: cold?.count || 0,
                     };
                     const hc = { hot: 0, warm: 0, cold: 0, dead: 0, none: 0 };
                     if (heatRes?.error) console.error("[sales threads] heat counts failed:", heatRes.error.message);
                     for (const r of heatRes?.data || []) if (r.n_heat in hc) hc[r.n_heat] = Number(r.n_count) || 0;
+                    for (const k of Object.keys(hc)) hc[k] += sharedHeat?.[k] || 0;
                     out.heatCounts = hc;
                 }
-
                 return out;
-            }
+            },
         );
 
-        // Overlay the live unread numbers on the (possibly cached) body, without mutating the cached object.
         const out = {
             ...body,
             items: body.items.map((it) => ({ ...it, ...(unread.get(it.id) || { unread: 0, mentions: 0 }) })),
@@ -640,13 +630,12 @@ export async function listThreads(req, res) {
     }
 }
 
-// ---- GET /sales/threads/unread-count ------------------------------------------------------------------
-// Tiny, uncached summary for the red dot on the RFQs tab: how many of MY enquiries have messages I haven't read.
+// Tiny, uncached summary for the red dot on the RFQs tab (own + shared threads).
 export async function unreadSummary(req, res) {
     try {
         res.set("Cache-Control", "no-store");
         const { actorId, ownerId } = getSalesActor(req);
-        const map = await unreadFor(actorId, ownerId);
+        const { unread: map } = await liveState(actorId, ownerId);
         let unread = 0, mentions = 0;
         for (const v of map.values()) { unread += v.unread; mentions += v.mentions; }
         res.json({ success: true, threads: map.size, unread, mentions });
@@ -1085,45 +1074,24 @@ export async function createThread(req, res) {
 
         if (error) throw error;
 
+        // Every row must have EXACTLY the same columns. supabase-js sends missing columns of a bulk insert
+        // as NULL, and attachments is NOT NULL, so mixed shapes made the whole insert fail (note never saved).
+        const entry = (kind, text, at) => ({
+            enquiry_id: data.id, author_id: actorId, author_name: actorName,
+            kind, body: text, attachments: [], created_at: at,
+        });
         const entries = cold
-            ? [
-                {
-                    enquiry_id: data.id,
-                    author_id: actorId,
-                    author_name: actorName,
-                    kind: "system",
-                    body: "Cold call logged",
-                    created_at: now,
-                },
-                {
-                    enquiry_id: data.id,
-                    author_id: actorId,
-                    author_name: actorName,
-                    kind: "note",
-                    body: note,
-                    attachments: [],
-                    created_at: new Date(t0 + 1).toISOString(),
-                },
-            ]
-            : [
-                {
-                    enquiry_id: data.id,
-                    author_id: actorId,
-                    author_name: actorName,
-                    kind: "system",
-                    body: `Enquiry created: ${productName} · ${quantity} ${unit}`,
-                },
-            ];
+            ? [entry("system", "Cold call logged", now), entry("note", note, new Date(t0 + 1).toISOString())]
+            : [entry("system", `Enquiry created: ${productName} · ${quantity} ${unit}`, now)];
 
-        const { error: eErr } = await supabase
-            .from("sales_thread_entries")
-            .insert(entries);
-
+        const { error: eErr } = await supabase.from("sales_thread_entries").insert(entries);
         if (eErr) {
-            console.error(
-                "[sales threads] first entries failed:",
-                eErr.message
-            );
+            console.error("[sales threads] first entries failed:", eErr.message);
+            if (cold) {
+                // never leave a cold call without its note
+                await supabase.from("rfq_enquiries").delete().eq("id", data.id);
+                return fail(res, 500, "Couldn't log this call. Please try again.");
+            }
         }
 
         await notify(ownerId, actorId, data.id);
@@ -1148,7 +1116,8 @@ export async function getThread(req, res) {
     try {
         res.set("Cache-Control", "no-store");
 
-        const row = await loadOwnThread(req, res);
+        const { actorId } = getSalesActor(req);
+        const row = await loadThread(req, res);
         if (!row) return;
 
         const limit = Math.min(
@@ -1273,7 +1242,10 @@ export async function getThread(req, res) {
             }
         );
 
-        res.json(body);
+        res.json({
+            ...body,
+            thread: { ...body.thread, viewerId: String(actorId), isOwner: String(row.created_by_actor_id) === String(actorId) },
+        });
     } catch (e) {
         oops(res, e);
     }
@@ -1290,7 +1262,7 @@ export async function updateThread(req, res) {
             sellerId,
         } = getSalesActor(req);
 
-        const row = await loadOwnThread(req, res);
+        const row = await loadThread(req, res);
         if (!row) return;
 
         const b = req.body || {};
@@ -1475,7 +1447,7 @@ export async function setThreadProduct(req, res) {
             sellerId,
         } = getSalesActor(req);
 
-        const row = await loadOwnThread(req, res);
+        const row = await loadThread(req, res);
         if (!row) return;
 
         if (row.product_name) {
@@ -1606,7 +1578,7 @@ export async function setThreadStatus(req, res) {
             ownerId,
         } = getSalesActor(req);
 
-        const row = await loadOwnThread(req, res);
+        const row = await loadThread(req, res);
         if (!row) return;
 
         const next = req.body?.status;
@@ -1691,13 +1663,16 @@ export async function setThreadStatus(req, res) {
 export async function setThreadHeat(req, res) {
     try {
         const { actorId, actorName, ownerId } = getSalesActor(req);
-        const row = await loadOwnThread(req, res);
+        const row = await loadThread(req, res);
         if (!row) return;
 
         const raw = req.body?.heat;
         const next = raw === null || raw === "" || raw === undefined ? null : String(raw);
         if (next !== null && !HEATS.includes(next)) return fail(res, 400, "Invalid heat.");
-        if ((row.sales_heat || null) === next) return res.json({ success: true, thread: dtoOf(row) });
+
+        // Rating a cold call means it is a real lead now: drop the cold-call classification (history stays in the thread).
+        const promote = next !== null && row.sales_kind === KIND_COLD;
+        if ((row.sales_heat || null) === next && !promote) return res.json({ success: true, thread: dtoOf(row) });
 
         // A label only: deliberately does NOT touch last_activity_at, so the list order doesn't jump.
         const { data, error } = await supabase
@@ -1707,6 +1682,7 @@ export async function setThreadHeat(req, res) {
                 sales_heat_at: next ? new Date().toISOString() : null,
                 last_updated_by_actor_id: actorId,
                 last_updated_by_actor_name: actorName,
+                ...(promote ? { sales_kind: "enquiry" } : {}),
             })
             .eq("id", row.id).select("*").single();
         if (error) throw error;
@@ -1728,7 +1704,7 @@ export async function setReminder(req, res) {
             ownerId,
         } = getSalesActor(req);
 
-        const row = await loadOwnThread(req, res);
+        const row = await loadThread(req, res);
         if (!row) return;
 
         if (row.status === "closed") {
@@ -1888,7 +1864,7 @@ export async function setReminder(req, res) {
 
 export async function signAttachment(req, res) {
     try {
-        const row = await loadOwnThread(req, res);
+        const row = await loadThread(req, res);
         if (!row) return;
 
         const name = str(req.body?.name, 150);
@@ -1971,7 +1947,7 @@ export async function addEntry(req, res) {
             ownerId,
         } = getSalesActor(req);
 
-        const row = await loadOwnThread(req, res);
+        const row = await loadThread(req, res);
         if (!row) return;
 
         if (row.status === "closed") {
@@ -2043,7 +2019,7 @@ export async function listQuoteProducts(req, res) {
             return fail(res, 409, NO_SELLER);
         }
 
-        const row = await loadOwnThread(req, res);
+        const row = await loadThread(req, res);
         if (!row) return;
 
         const limit = Math.min(
@@ -2460,7 +2436,7 @@ export async function sendQuote(req, res) {
             sellerId,
         } = getSalesActor(req);
 
-        const loaded = await loadOwnThread(req, res);
+        const loaded = await loadThread(req, res);
         if (!loaded) return;
 
         if (loaded.status === "closed") {
@@ -2658,12 +2634,8 @@ export async function sendQuote(req, res) {
         ]).list;
 
         const ensured = await ensureCustomer({
-            sellerId,
-            companyId,
-            actorId,
-            teamId: req.sales?.teamId,
-            thread: loaded,
-            contacts: saveList,
+            sellerId, companyId, actorId, teamId: req.sales?.teamId, thread: loaded, contacts: saveList,
+            ownerActorId: String(loaded.created_by_actor_id),
         });
 
         let thread = loaded;
@@ -2900,7 +2872,7 @@ export async function resendQuote(req, res) {
             sellerId,
         } = getSalesActor(req);
 
-        const thread = await loadOwnThread(req, res);
+        const thread = await loadThread(req, res);
         if (!thread) return;
 
         if (!isUuid(req.params.quoteId)) {

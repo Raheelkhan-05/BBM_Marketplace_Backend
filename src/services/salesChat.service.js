@@ -12,9 +12,9 @@
 // This file only sends the one-off "you were added to the chat" WhatsApp (notifyAdded).
 import { supabaseAdmin as db } from "../config/supabase.js";
 import { emitToUser } from "./realtimeBroadcast.js";
-import { bumpVer } from "./cache.service.js";
 import { isUuid } from "./rfqValidation.js";
 import { APP_URL, ping } from "./salesThreads.service.js";
+import { syncThreadViews } from "./salesThreadSync.service.js";
 import { sendSalesChatWhatsApp } from "./whatsapp.service.js";
 
 const GENERIC = new Set(["", "salesperson", "sales person", "sales", "user", "unnamed", "unknown", "team member"]);
@@ -69,13 +69,20 @@ export async function participantsOf(row, ctx) {
         (data || []).forEach((m) => roles.set(String(m.user_id), m.role));
     }
     const names = await namesOf(ids);
+    const creator = String(row.created_by_actor_id);
     const rank = { salesperson: 0, admin: 1, member: 2 };
+    const roleOf = (id) => {
+        if (id === creator) return "salesperson";
+        if (id === String(ctx.companyId) || roles.get(id) === "admin") return "admin";
+        return roles.get(id) === "salesperson" ? "salesperson" : "member";
+    };
     return ids.map((id) => ({
         userId: id,
         name: names.get(id)?.name || "Teammate",
-        role: id === String(row.created_by_actor_id) ? "salesperson" : (id === String(ctx.companyId) || roles.get(id) === "admin") ? "admin" : "member",
-        isOwner: id === String(ctx.companyId),
-    })).sort((a, b) => rank[a.role] - rank[b.role] || a.name.localeCompare(b.name));
+        role: roleOf(id),
+        isOwner: id === String(ctx.companyId),   // company owner
+        isCreator: id === creator,               // the salesperson who owns this enquiry
+    })).sort((a, b) => (Number(b.isCreator) - Number(a.isCreator)) || rank[a.role] - rank[b.role] || a.name.localeCompare(b.name));
 }
 
 // Inserts missing participants. Returns the ids that were newly added.
@@ -158,9 +165,21 @@ export function registerSalesChatSocket(io) {
     });
 }
 
+
+// Salespeople work in /sales; admins and other team members use the home inbox.
+export const salesLinkFor = (enquiryId, isSalesperson) =>
+    isSalesperson ? `${APP_URL}/sales/enquiries/${enquiryId}` : `${APP_URL}/home?enquiry=${enquiryId}`;
+
+// Which of these users are salespeople (one query for a whole batch).
+export async function salespeopleAmong(ids) {
+    const uniq = [...new Set((ids || []).filter(Boolean).map(String))];
+    if (!uniq.length) return new Set();
+    const { data, error } = await db.from("team_members").select("user_id").eq("role", "salesperson").in("user_id", uniq);
+    if (error) { console.error("[sales chat] role lookup failed:", error.message); return new Set(); }
+    return new Set((data || []).map((m) => String(m.user_id)));
+}
+
 /* ------------------------------ WhatsApp ------------------------------ */
-const linkFor = (row, uid) => (String(uid) === String(row.created_by_actor_id)
-    ? `${APP_URL}/sales/enquiries/${row.id}` : `${APP_URL}/home?enquiry=${row.id}`);
 
 // One-off message when someone is added to the chat. Sent through the retrying WhatsApp queue; the result is logged.
 export async function notifyAdded({ row, userId, byName }) {
@@ -170,15 +189,15 @@ export async function notifyAdded({ row, userId, byName }) {
             console.warn(`[sales chat] SKIPPED added-notice enquiry=${row.id} user=${userId}: no mobile number on file`);
             return;
         }
+        const sales = await salespeopleAmong([userId]);
+        const link = salesLinkFor(row.id, String(userId) === String(row.created_by_actor_id) || sales.has(String(userId)));
         const r = await sendSalesChatWhatsApp({
             to: me.phone, name: firstName(me.name), kind: "added", customer: row.customer_name || "a customer",
-            product: row.product_name || "", from: byName, link: linkFor(row, userId),
+            product: row.product_name || "", from: byName, link,
         });
         if (!r?.success) console.error(`[sales chat] FAILED added-notice enquiry=${row.id} user=${userId}: ${r?.error || "unknown error"}`);
     } catch (e) { console.error("[sales chat] added WhatsApp failed:", e?.message || e); }
 }
-
-export const reminderLink = linkFor;
 
 /* ------------------------------ after a message is saved ------------------------------ */
 // touch:true  -> also bumps last_activity / preview (used for teammates' messages; the salesperson's own
@@ -199,8 +218,8 @@ export async function afterMessage({ row, companyId, entry, senderId, senderName
         }).eq("id", row.id));
     }
     await Promise.all(jobs);
-    await bumpVer(`sa:${row.created_by_actor_id}`, `st:${row.id}`);
-    ping([companyId, row.created_by_actor_id], { enquiryId: row.id });
+    await syncThreadViews({ enquiryId: row.id, creatorId: row.created_by_actor_id, userIds: [senderId] });
+    ping([companyId], { enquiryId: row.id });
 
     if (added.some((i) => i !== String(row.created_by_actor_id))) await emitParticipantsChanged(row, companyId);
     const audience = await audienceOf(row, companyId);

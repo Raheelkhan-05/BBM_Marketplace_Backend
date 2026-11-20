@@ -26,7 +26,7 @@
 // NOTE: leave SALES_CHAT_NEW_NUDGE off until the immediate "new message" WhatsApp inside afterMessage()
 // (services/salesChat.service.js) is removed, otherwise people would get the "new" message twice.
 import { supabaseAdmin as db } from "../config/supabase.js";
-import { namesOf, firstName, reminderLink } from "./salesChat.service.js";
+import { namesOf, firstName, salesLinkFor, salespeopleAmong } from "./salesChat.service.js";
 import { sendSalesChatWhatsApp } from "./whatsapp.service.js";
 
 const NEW_ENABLED = String(process.env.SALES_CHAT_NEW_NUDGE || "").toLowerCase() === "on";
@@ -82,6 +82,7 @@ async function claimAndDeliver(kind) {
     if (!data?.length) return;
 
     const people = await namesOf([...data.map((r) => r.n_user_id), ...data.map((r) => r.n_last_author_id)]);
+    const sales = await salespeopleAmong(data.map((r) => r.n_user_id));
     let sent = 0, failed = 0, skipped = 0;
 
     for (const r of data) {
@@ -99,7 +100,7 @@ async function claimAndDeliver(kind) {
                 customer: r.n_customer || "a customer", product: r.n_product || "",
                 from: people.get(String(r.n_last_author_id))?.name || "", preview: r.n_last_body || "",
                 unread: r.n_unread || 1, mentioned: (r.n_mentions || 0) > 0,
-                link: reminderLink({ id: r.n_enquiry_id, created_by_actor_id: r.n_is_creator ? r.n_user_id : null }, r.n_user_id),
+                link: salesLinkFor(r.n_enquiry_id, !!r.n_is_creator || sales.has(String(r.n_user_id))),
             });
 
             if (result?.success) {
