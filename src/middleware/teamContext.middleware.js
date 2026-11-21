@@ -10,6 +10,8 @@ const KEEP_REAL_USER = ["/api/auth", "/api/team"];
  * - A team member's req.user.id becomes the COMPANY id, so every existing controller works
  *   as the company with no changes. The real person stays in req.actor.
  * - Every successful write by a team member is recorded in the activity log.
+ * - During an admin "act as user" session (req.impersonation), writes are recorded against the ADMIN,
+ *   clearly marked, so the company's own team log shows who really did it.
  */
 export async function applyTeamContext(req, res) {
     if (!req.user?.id || req.actor) return;
@@ -33,10 +35,16 @@ export async function applyTeamContext(req, res) {
                 let d = describeRequest(req);
                 if (!d) return;
                 d = await enrichActivity(d, req, ctx, resBody);
+                const imp = req.impersonation;
                 await logActivity({
-                    teamId: ctx.teamId, actorId: ctx.actorId, actorRole: ctx.role,
-                    category: d.category, action: d.action, label: d.label,
-                    entityType: d.entityType, entityId: d.entityId, meta: d.meta, collapseMs: d.collapseMs,
+                    teamId: ctx.teamId,
+                    actorId: imp ? imp.adminId : ctx.actorId,
+                    actorRole: imp ? "admin" : ctx.role,
+                    category: d.category, action: d.action,
+                    label: imp ? `[BBM admin] ${d.label}` : d.label,
+                    entityType: d.entityType, entityId: d.entityId,
+                    meta: imp ? { ...d.meta, impersonationSessionId: imp.sessionId } : d.meta,
+                    collapseMs: d.collapseMs,
                     ip: (req.headers["x-forwarded-for"] || req.ip || "").toString().split(",")[0].trim() || null,
                 });
             } catch (e) {

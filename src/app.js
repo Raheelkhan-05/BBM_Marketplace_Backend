@@ -42,6 +42,7 @@ import teamRoutes from "./routes/team.routes.js";
 import adminSellerListingsRoutes from "./routes/adminSellerListings.routes.js";
 import salesRoutes from "./routes/sales.routes.js";
 import { impersonationGuard } from "./middleware/impersonationGuard.middleware.js";
+import { impersonationEnforcer } from "./middleware/impersonationEnforcer.middleware.js";
 import orderBookTeamRoutes from "./routes/orderBookTeam.routes.js";
 import salesMonitorRoutes from "./routes/salesMonitor.routes.js";
 import { apiAnalytics } from "./middleware/apiAnalytics.middleware.js";
@@ -50,6 +51,8 @@ import salesChatRoutes from "./routes/salesChat.routes.js";
 import partnerRoutes from "./routes/partner.routes.js";
 import gstAccessRoutes from "./routes/gstAccess.routes.js";
 import adminProductImageRequestsRouter from "./routes/adminProductImageRequests.routes.js";
+import impersonationRoutes from "./routes/impersonation.routes.js";
+import adminImpersonationRoutes from "./routes/adminImpersonation.routes.js";
 
 
 export function createApp() {
@@ -111,6 +114,9 @@ export function createApp() {
   // Admin "act as seller" sessions only. Normal tokens pass straight through (no signature check, no cost).
   // Must stay BEFORE every /api router below, so a restricted session can never reach an unlisted route.
   app.use("/api", impersonationGuard);
+  // Full admin "act as user" sessions (tokens carrying an `ims` claim). Validates the session on every request,
+  // blocks identity/money actions, skips read receipts and logs every write. Normal tokens pass straight through.
+  app.use("/api", impersonationEnforcer);
 
   app.get("/health", (req, res) => res.json({ ok: true }));
   app.get("/api/my-ip", async (req, res) => {
@@ -123,6 +129,7 @@ export function createApp() {
   });
 
   app.use("/api/auth", authRoutes);
+  app.use("/api/impersonation", impersonationRoutes);
   app.use("/api/seo", seoRoutes);
   app.use("/api/sales", salesRoutes);
   app.use("/api/seller/gst-access", gstAccessRoutes);
@@ -139,6 +146,7 @@ export function createApp() {
   app.use("/api/seller", sellerRoutes);
   app.use("/api/admin/auth", adminAuthRoutes);
   // Must stay BEFORE "/api/admin" so it is matched first.
+  app.use("/api/admin/impersonation", adminImpersonationRoutes);
   app.use("/api/admin/finance", adminFinanceRoutes);
   app.use("/api/admin/payments", adminPaymentsRoutes);
   app.use("/api/admin", adminRoutes);

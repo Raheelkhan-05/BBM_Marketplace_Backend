@@ -6,6 +6,7 @@ import { createApp } from "./app.js";
 import { verifyMailer } from "./config/mailer.js";
 import { verifyAuthToken } from "./middleware/auth.middleware.js";
 import { registerChatSocket } from "./socket/chatSocket.js";
+import { rejectImpersonationSockets } from "./socket/rejectImpersonation.js";
 import { setIO, attachRedisAdapter } from "./socket/io.js";
 import { startListingExpiryScheduler } from "./services/listingExpiry.service.js";
 import { startSettlementScheduler } from "./services/settlement.service.js";
@@ -44,6 +45,9 @@ const io = new SocketIOServer(httpServer, {
 if (!allowedOrigins.length) {
   console.error("[server] CLIENT_ORIGINS is not set — all socket connections will be CORS-rejected.");
 }
+
+// Admin "act as user" sessions never get a live socket. Must stay BEFORE the auth middleware below.
+rejectImpersonationSockets(io);
 
 io.use((socket, next) => {
   try {
