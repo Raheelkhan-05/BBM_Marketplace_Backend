@@ -53,6 +53,7 @@ const KINDS = {
     },
 };
 
+
 let timer = null;
 let running = false;
 const releases = new Map();   // "kind:enquiry:user" -> how many times the claim was released after a failed send
