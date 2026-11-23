@@ -153,10 +153,11 @@ export async function applySavedTransportAgreement(ctx) {
     const agreement = await findAgreement(key);
     if (!agreement) return null;
 
-    // If the two sides are already discussing transport on THIS order, that discussion wins: don't override it.
-    const { data: openReq } = await supabase.from("order_transport_requests")
-        .select("id").eq("order_id", order.id).eq("status", "proposed").limit(1).maybeSingle();
-    if (openReq) return null;
+    // If the two sides have EVER discussed transport on THIS order, that discussion wins:
+    // never (re)apply the saved agreement over it (e.g. after a suggestion was declined or withdrawn).
+    const { data: anyReq } = await supabase.from("order_transport_requests")
+        .select("id").eq("order_id", order.id).limit(1).maybeSingle();
+    if (anyReq) return null;
 
     const options = await buildOptions(seller, route);
     if (!agreementStillValid(agreement, options)) {
@@ -498,6 +499,18 @@ export const proposeOrderTransport = wrap(async (req, res) => {
         if (error.code === "23505") return res.status(409).json({ success: false, message: "This order's transport was just updated. Please review and try again." });
         console.error("[orderTransport] insert failed:", error.message);
         return res.status(500).json({ success: false, message: "Couldn't send your suggestion." });
+    }
+
+    // Before payment, suggesting something else REPLACES the auto-applied saved transport on this order.
+    // (Only this order. The saved agreement itself is replaced only when the new transport is accepted.)
+    if (order.transport_mode && isUnpaid(order)) {
+        const { error: clearErr } = await supabase.from("orders")
+            .update({
+                transport_mode: null, transport_fields: {}, transport_route_option_id: null,
+                transport_agreement_id: null, transport_confirmed_at: null,
+            })
+            .eq("id", order.id).eq("status", "awaiting_payment");
+        if (clearErr) console.error("[orderTransport] couldn't clear old transport:", clearErr.message);
     }
 
     const label = routeOptionSummary(mode, cleanFields);
