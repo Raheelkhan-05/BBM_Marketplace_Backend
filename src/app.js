@@ -53,6 +53,7 @@ import gstAccessRoutes from "./routes/gstAccess.routes.js";
 import adminProductImageRequestsRouter from "./routes/adminProductImageRequests.routes.js";
 import impersonationRoutes from "./routes/impersonation.routes.js";
 import adminImpersonationRoutes from "./routes/adminImpersonation.routes.js";
+import orderTransportRoutes from "./routes/orderTransport.routes.js";
 
 
 export function createApp() {
@@ -171,6 +172,7 @@ export function createApp() {
   app.use("/api/cart", cartRoutes);
   app.use("/api/help", helpRoutes);
   app.use("/api/transport-library", transportLibraryRoutes);
+  app.use("/api/order-transport", orderTransportRoutes);
   app.use("/api/team", teamRoutes);
   app.use("/api/sales-monitor", salesMonitorRoutes);
   app.use("/api/sales-chat", salesChatRoutes);
