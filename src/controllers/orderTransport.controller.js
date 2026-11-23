@@ -2,6 +2,12 @@
 //
 // Post-payment, OPTIONAL transport agreement between buyer and seller for ONE order.
 // Either side suggests; the other accepts / declines / counter-suggests; the suggester can withdraw.
+//
+// SAVED AGREEMENTS: when a transport is accepted, it is remembered for seller + buyer + route
+// (origin city/state -> destination city/state) in transport_agreements. On the NEXT order for the same
+// seller + buyer + route, that agreed transport is applied automatically (no choosing, no approving).
+// Either side can still change it for one order; accepting the change becomes the new saved agreement.
+//
 // Accepting writes the agreed transport onto the order (orders.transport_mode / transport_fields /
 // transport_route_option_id), which the ship sheet and TransportInfoCard already read.
 //
@@ -41,7 +47,7 @@ async function loadContext(orderId, userId) {
 
     const { data: order, error } = await supabase
         .from("orders")
-        .select("id, order_number, status, buyer_id, seller_id, shipping_address_snapshot, transport_mode, transport_fields, transport_route_option_id, seller_response_due_at")
+        .select("id, order_number, status, buyer_id, seller_id, shipping_address_snapshot, transport_mode, transport_fields, transport_route_option_id, transport_agreement_id, seller_response_due_at")
         .eq("id", orderId).maybeSingle();
     if (error) throw new Error(error.message);
     if (!order) return { fail: [404, "Order not found."] };
@@ -68,6 +74,105 @@ async function loadContext(orderId, userId) {
 }
 
 const phaseOf = (order) => (order.transport_mode ? "agreed" : NEGOTIABLE.includes(order.status) ? "open" : "closed");
+const isNegotiable = (order) => NEGOTIABLE.includes(order.status);
+
+// ---- saved agreements (seller + buyer + route) -------------------------------------------------------
+// Key parts are stored normalised (trimmed, single-spaced, lower-case) so "Rajkot " and "rajkot" are the same route.
+const agreementKey = (order, seller, route) => {
+    const k = {
+        seller_id: order.seller_id, buyer_id: order.buyer_id,
+        origin_city: norm(route.originCity), origin_state: norm(route.originState),
+        dest_city: norm(route.destCity), dest_state: norm(route.destState),
+    };
+    // Without a real origin and destination city there is no route to remember.
+    return k.origin_city && k.dest_city ? k : null;
+};
+
+async function findAgreement(key) {
+    if (!key) return null;
+    const { data, error } = await supabase.from("transport_agreements").select("*")
+        .match({ ...key, status: "active" }).maybeSingle();
+    if (error) throw new Error(error.message);
+    return data || null;
+}
+
+// Remember (or replace) the agreed transport for this seller + buyer + route.
+async function saveAgreement(ctx, req) {
+    const { order, seller, route } = ctx;
+    const key = agreementKey(order, seller, route);
+    if (!key) return null;
+    const now = new Date().toISOString();
+    const values = {
+        mode: req.mode, fields: req.fields || {}, route_option_id: req.route_option_id || null,
+        source_order_id: order.id, agreed_at: now, updated_at: now,
+    };
+    const existing = await findAgreement(key);
+    if (existing) {
+        const { data, error } = await supabase.from("transport_agreements").update(values).eq("id", existing.id).select("id").maybeSingle();
+        if (error) throw new Error(error.message);
+        return data?.id || existing.id;
+    }
+    const { data, error } = await supabase.from("transport_agreements").insert({ ...key, ...values, status: "active" }).select("id").maybeSingle();
+    if (error) {
+        if (error.code === "23505") return (await findAgreement(key))?.id || null; // created at the same moment by the other side
+        throw new Error(error.message);
+    }
+    return data?.id || null;
+}
+
+// Is the remembered transport still something the seller offers? (They may have removed the route or the mode since.)
+function agreementStillValid(agreement, options) {
+    if (agreement.route_option_id) return options.routeOptions.some((r) => r.id === agreement.route_option_id);
+    return options.modes.includes(agreement.mode);
+}
+
+// If this seller + buyer + route already has an agreed transport, apply it to the order (once, atomically).
+// Safe to call any number of times and from anywhere (e.g. right after payment succeeds): it only acts on an
+// order that is paid, not yet shipped and has no transport yet. Returns the updated order fields, or null.
+export async function applySavedTransportAgreement(ctx) {
+    const { order, seller, route } = ctx;
+    if (order.transport_mode || !isNegotiable(order)) return null;
+    const key = agreementKey(order, seller, route);
+    const agreement = await findAgreement(key);
+    if (!agreement) return null;
+
+    const options = await buildOptions(seller, route);
+    if (!agreementStillValid(agreement, options)) {
+        // The seller no longer offers it: retire it so the normal "choose transport" flow takes over.
+        await supabase.from("transport_agreements").update({ status: "ended", updated_at: new Date().toISOString() }).eq("id", agreement.id);
+        return null;
+    }
+
+    const now = new Date().toISOString();
+    const patch = {
+        transport_mode: agreement.mode, transport_fields: agreement.fields || {},
+        transport_route_option_id: agreement.route_option_id || null,
+        transport_agreement_id: agreement.id, transport_confirmed_at: now,
+    };
+    const { data: upd, error } = await supabase.from("orders").update(patch)
+        .eq("id", order.id).is("transport_mode", null).in("status", NEGOTIABLE).select("id").maybeSingle();
+    if (error) throw new Error(error.message);
+    if (!upd) return null; // someone else set transport first; nothing to do
+
+    // Tell the seller (the buyer is the one looking at the screen); also refresh both order screens.
+    try {
+        const label = routeOptionSummary(agreement.mode, agreement.fields || {});
+        if (seller.user_id) {
+            await notifyUser(seller.user_id, {
+                type: "order_transport_auto_applied",
+                title: `Transport already agreed for order ${order.order_number}`,
+                body: `Same route as before, so the agreed transport was applied: ${label}.`,
+                link: `/sell/orders/${order.id}`,
+            });
+        }
+        await notifyOrderChanged(order.id, { transport: "updated" });
+        await notifyUserOrdersChanged(order.buyer_id);
+        if (seller.user_id) await notifyUserOrdersChanged(seller.user_id);
+    } catch (e) {
+        console.error("[orderTransport] auto-apply notify failed:", e?.message || e);
+    }
+    return { ...patch };
+}
 
 async function buildOptions(seller, route) {
     const modes = (Array.isArray(seller.transport_options) ? seller.transport_options : [])
@@ -140,12 +245,12 @@ export const summaryOrderTransport = wrap(async (req, res) => {
         if (seen.has(r.order_id)) continue; // newest row per order decides
         seen.add(r.order_id);
         const o = Array.isArray(r.order) ? r.order[0] : r.order;
-        if (!o || o.transport_mode || !NEGOTIABLE.includes(o.status)) continue;
+        if (!o || !NEGOTIABLE.includes(o.status)) continue;
 
         const base = { mode: r.mode, fields: r.fields || {}, summary: routeOptionSummary(r.mode, r.fields || {}) };
         if (r.status === "proposed") {
             summary[r.order_id] = { ...base, state: r.proposed_by_role === as ? "waiting" : "needs_you" };
-        } else if (r.status === "declined" && r.proposed_by_role === as) {
+        } else if (r.status === "declined" && r.proposed_by_role === as && !o.transport_mode) {
             summary[r.order_id] = { ...base, state: "declined" };
         }
     }
@@ -157,7 +262,20 @@ export const getOrderTransport = wrap(async (req, res) => {
     const ctx = await loadContext(req.params.orderId, req.user.id);
     if (ctx.fail) return res.status(ctx.fail[0]).json({ success: false, message: ctx.fail[1] });
     const { order, seller, role, route } = ctx;
+
+    // Same seller + buyer + route as an earlier agreement? Apply it now, so nobody has to choose or approve again.
+    if (!order.transport_mode && isNegotiable(order)) {
+        const applied = await applySavedTransportAgreement(ctx).catch((e) => { console.error("[orderTransport] auto-apply failed:", e?.message || e); return null; });
+        if (applied) Object.assign(order, applied);
+    }
     const phase = phaseOf(order);
+    const canChange = phase === "agreed" && isNegotiable(order);
+
+    let agreement = null;
+    if (order.transport_agreement_id) {
+        const { data: ag } = await supabase.from("transport_agreements").select("id, agreed_at").eq("id", order.transport_agreement_id).maybeSingle();
+        agreement = ag || null;
+    }
 
     const { data: rows, error } = await supabase
         .from("order_transport_requests").select(REQ_COLS)
@@ -175,6 +293,9 @@ export const getOrderTransport = wrap(async (req, res) => {
         orderNumber: order.order_number,
         sellerName: seller.display_name,
         responseDueAt: order.status === "pending_confirmation" ? order.seller_response_due_at : null,
+        canChange,
+        agreedVia: order.transport_mode ? (order.transport_agreement_id ? "saved" : "order") : null,
+        agreementAt: agreement?.agreed_at || null,
         route,
         agreed: order.transport_mode
             ? {
@@ -184,7 +305,7 @@ export const getOrderTransport = wrap(async (req, res) => {
             }
             : null,
         active, lastDeclined, history,
-        options: phase === "open" ? await buildOptions(seller, route) : null,
+        options: phase === "open" || canChange ? await buildOptions(seller, route) : null,
     });
 });
 
@@ -193,7 +314,7 @@ export const proposeOrderTransport = wrap(async (req, res) => {
     const ctx = await loadContext(req.params.orderId, req.user.id);
     if (ctx.fail) return res.status(ctx.fail[0]).json({ success: false, message: ctx.fail[1] });
     const { order, seller, role, route } = ctx;
-    if (phaseOf(order) !== "open") {
+    if (!isNegotiable(order)) {
         return res.status(400).json({ success: false, message: "Transport can no longer be changed for this order." });
     }
 
@@ -269,7 +390,7 @@ export const acceptOrderTransport = wrap(async (req, res) => {
     const { r, ctx } = loaded;
     const { order, role } = ctx;
     if (r.proposed_by_role === role) return res.status(403).json({ success: false, message: "The other side needs to accept your suggestion." });
-    if (phaseOf(order) !== "open") return res.status(400).json({ success: false, message: "Transport can no longer be changed for this order." });
+    if (!isNegotiable(order)) return res.status(400).json({ success: false, message: "Transport can no longer be changed for this order." });
 
     const now = new Date().toISOString();
     const { data: won } = await supabase.from("order_transport_requests")
@@ -281,8 +402,9 @@ export const acceptOrderTransport = wrap(async (req, res) => {
         .update({
             transport_mode: r.mode, transport_fields: r.fields || {},
             transport_route_option_id: r.route_option_id || null, transport_confirmed_at: now,
+            transport_agreement_id: null, // set again below once the new agreement is saved
         })
-        .eq("id", order.id).is("transport_mode", null).in("status", NEGOTIABLE)
+        .eq("id", order.id).in("status", NEGOTIABLE)
         .select("id").maybeSingle();
     if (error || !upd) {
         await supabase.from("order_transport_requests")
@@ -291,10 +413,18 @@ export const acceptOrderTransport = wrap(async (req, res) => {
         return res.status(error ? 500 : 409).json({ success: false, message: "Couldn't save the agreed transport. Please try again." });
     }
 
+    // Remember it for this seller + buyer + route, so the next order on this route needs no suggesting or approving.
+    try {
+        const agreementId = await saveAgreement(ctx, r);
+        if (agreementId) await supabase.from("orders").update({ transport_agreement_id: agreementId }).eq("id", order.id);
+    } catch (e) {
+        console.error("[orderTransport] save agreement failed:", e?.message || e); // the order itself is already agreed
+    }
+
     await notifyOther(ctx, role, {
         type: "order_transport_accepted",
         title: `Transport agreed for order ${order.order_number}`,
-        body: `${role === "buyer" ? "The buyer" : "The seller"} accepted: ${routeOptionSummary(r.mode, r.fields || {})}.`,
+        body: `${role === "buyer" ? "The buyer" : "The seller"} accepted: ${routeOptionSummary(r.mode, r.fields || {})}. This will be used automatically for future orders on this route.`,
     });
     res.json({ success: true });
 });
