@@ -207,6 +207,15 @@ export async function confirmOrder(req, res) {
         return res.status(400).json({ success: false, message: "This order isn't awaiting confirmation." });
     }
 
+    const { data: openReq } = await supabase.from("order_transport_requests")
+        .select("id").eq("order_id", orderId).eq("status", "proposed").eq("proposed_by_role", "buyer").maybeSingle();
+    if (openReq) {
+        return res.status(409).json({
+            success: false, code: "TRANSPORT_REPLY_REQUIRED",
+            message: "The buyer suggested a transport option. Please accept, decline or suggest another before confirming.",
+        });
+    }
+
     // if (!order.transport_mode) {
     //     const { mode } = req.body || {};
     //     if (!mode) {

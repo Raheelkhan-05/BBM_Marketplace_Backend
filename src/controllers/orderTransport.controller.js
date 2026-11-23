@@ -23,8 +23,9 @@ import { notifyUser, notifyOrderChanged, notifyUserOrdersChanged } from "../serv
 import { sendOrderUpdateWhatsApp } from "../services/whatsapp.service.js";
 import { ROUTE_TRANSPORT_FIELDS, ROUTE_TRANSPORT_MODE_LABELS, routeOptionSummary } from "../../shared/routeTransportFields.js";
 
-// Transport can be discussed from "paid & waiting for the seller" until the seller ships.
-const NEGOTIABLE = ["pending_confirmation", "confirmed"];
+// Transport can be discussed from "order created (unpaid)" until the seller ships.
+// While unpaid only the BUYER can see/act on it; the seller is told after payment.
+const NEGOTIABLE = ["awaiting_payment", "pending_confirmation", "confirmed"];
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const REQ_COLS = "id, order_id, proposed_by_role, route_option_id, mode, fields, note, status, decline_reason, resolved_by_role, created_at, resolved_at";
 
@@ -42,7 +43,7 @@ function wrap(fn) {
 }
 
 // Loads the order + seller and works out who the caller is. Returns { fail: [status, message] } if not allowed.
-async function loadContext(orderId, userId) {
+async function loadBase(orderId) {
     if (!UUID_RE.test(String(orderId || ""))) return { fail: [404, "Order not found."] };
 
     const { data: order, error } = await supabase
@@ -59,9 +60,6 @@ async function loadContext(orderId, userId) {
     if (sErr) throw new Error(sErr.message);
     if (!seller) return { fail: [404, "Order not found."] };
 
-    const role = order.buyer_id === userId ? "buyer" : seller.user_id === userId ? "seller" : null;
-    if (!role) return { fail: [404, "Order not found."] };
-
     const away = seller.dispatch_same_as_registered === false;
     const addr = order.shipping_address_snapshot || {};
     const route = {
@@ -70,11 +68,24 @@ async function loadContext(orderId, userId) {
         destCity: addr.city || "",
         destState: addr.state || "",
     };
-    return { order, seller, role, route };
+    return { order, seller, route };
+}
+
+// Works out who the caller is. Returns { fail: [status, message] } if not allowed.
+async function loadContext(orderId, userId) {
+    const base = await loadBase(orderId);
+    if (base.fail) return base;
+    const { order, seller } = base;
+    const role = order.buyer_id === userId ? "buyer" : seller.user_id === userId ? "seller" : null;
+    if (!role) return { fail: [404, "Order not found."] };
+    // A seller never sees an order until it is paid.
+    if (role === "seller" && order.status === "awaiting_payment") return { fail: [404, "Order not found."] };
+    return { ...base, role };
 }
 
 const phaseOf = (order) => (order.transport_mode ? "agreed" : NEGOTIABLE.includes(order.status) ? "open" : "closed");
 const isNegotiable = (order) => NEGOTIABLE.includes(order.status);
+const isUnpaid = (order) => order.status === "awaiting_payment";
 
 // ---- saved agreements (seller + buyer + route) -------------------------------------------------------
 // Key parts are stored normalised (trimmed, single-spaced, lower-case) so "Rajkot " and "rajkot" are the same route.
@@ -168,7 +179,8 @@ export async function applySavedTransportAgreement(ctx) {
     // Tell the seller (the buyer is the one looking at the screen); also refresh both order screens.
     try {
         const label = routeOptionSummary(agreement.mode, agreement.fields || {});
-        if (seller.user_id) {
+        // Unpaid: the seller doesn't know about this order yet. announceTransportAfterPayment() tells them later.
+        if (seller.user_id && !isUnpaid(order)) {
             await notifyUser(seller.user_id, {
                 type: "order_transport_auto_applied",
                 title: `Transport already agreed for order ${order.order_number}`,
@@ -178,7 +190,7 @@ export async function applySavedTransportAgreement(ctx) {
         }
         await notifyOrderChanged(order.id, { transport: "updated" });
         await notifyUserOrdersChanged(order.buyer_id);
-        if (seller.user_id) await notifyUserOrdersChanged(seller.user_id);
+        if (seller.user_id && !isUnpaid(order)) await notifyUserOrdersChanged(seller.user_id);
     } catch (e) {
         console.error("[orderTransport] auto-apply notify failed:", e?.message || e);
     }
@@ -206,6 +218,11 @@ async function buildOptions(seller, route) {
 async function notifyOther(ctx, actorRole, { type, title, body, whatsapp = null }) {
     try {
         const { order, seller } = ctx;
+        if (isUnpaid(order)) { // buyer-only phase: refresh the buyer's screens, tell nobody else
+            await notifyOrderChanged(order.id, { transport: "updated" });
+            await notifyUserOrdersChanged(order.buyer_id);
+            return;
+        }
         const toUserId = actorRole === "buyer" ? seller.user_id : order.buyer_id;
         const link = actorRole === "buyer" ? `/sell/orders/${order.id}` : `/buy/orders/${order.id}`;
         if (toUserId) await notifyUser(toUserId, { type, title, body, link });
@@ -213,18 +230,57 @@ async function notifyOther(ctx, actorRole, { type, title, body, whatsapp = null 
         await notifyUserOrdersChanged(order.buyer_id);
         if (seller.user_id) await notifyUserOrdersChanged(seller.user_id);
 
-        if (whatsapp && toUserId) {
-            const { data: p } = await supabase.from("profiles").select("name, phone").eq("id", toUserId).maybeSingle();
-            if (p?.phone) {
-                void sendOrderUpdateWhatsApp({
-                    to: p.phone, name: p.name,
-                    headline: whatsapp.headline, detail: whatsapp.detail,
-                    footer: "Open the order in the app to respond.",
-                }).catch((e) => console.error("[orderTransport] whatsapp failed:", e?.message || e));
-            }
-        }
+        if (whatsapp && toUserId) await whatsappTo(toUserId, whatsapp);
     } catch (e) {
         console.error("[orderTransport] notify failed:", e?.message || e);
+    }
+}
+
+async function whatsappTo(userId, { headline, detail }) {
+    const { data: p } = await supabase.from("profiles").select("name, phone").eq("id", userId).maybeSingle();
+    if (!p?.phone) return;
+    void sendOrderUpdateWhatsApp({
+        to: p.phone, name: p.name, headline, detail,
+        footer: "Open the order in the app to respond.",
+    }).catch((e) => console.error("[orderTransport] whatsapp failed:", e?.message || e));
+}
+
+// Call this once an order becomes PAID (see step 4). Tells the seller what the buyer chose/suggested before paying.
+export async function announceTransportAfterPayment(orderId) {
+    try {
+        const base = await loadBase(orderId);
+        if (base.fail) return;
+        const { order, seller } = base;
+        if (isUnpaid(order) || !seller.user_id) return;
+
+        const { data: open } = await supabase.from("order_transport_requests")
+            .select(REQ_COLS).eq("order_id", order.id).eq("status", "proposed").maybeSingle();
+
+        if (open?.proposed_by_role === "buyer") {
+            const label = routeOptionSummary(open.mode, open.fields || {});
+            await notifyUser(seller.user_id, {
+                type: "order_transport_requested",
+                title: `Transport suggested for order ${order.order_number}`,
+                body: `The buyer suggested ${label}. Review it before confirming the order.`,
+                link: `/sell/orders/${order.id}`,
+            });
+            await whatsappTo(seller.user_id, {
+                headline: `The buyer suggested a transport option for order #${order.order_number}.`,
+                detail: `Suggested: ${label}. Accept it or suggest another option before confirming.`,
+            });
+        } else if (order.transport_mode) {
+            const label = routeOptionSummary(order.transport_mode, order.transport_fields || {});
+            await notifyUser(seller.user_id, {
+                type: "order_transport_auto_applied",
+                title: `Transport already agreed for order ${order.order_number}`,
+                body: `Same route as before, so the agreed transport was applied: ${label}.`,
+                link: `/sell/orders/${order.id}`,
+            });
+        }
+        await notifyOrderChanged(order.id, { transport: "updated" });
+        await notifyUserOrdersChanged(seller.user_id);
+    } catch (e) {
+        console.error("[orderTransport] announce after payment failed:", e?.message || e);
     }
 }
 
@@ -245,7 +301,7 @@ export const summaryOrderTransport = wrap(async (req, res) => {
 
     const { data, error } = await supabase
         .from("order_transport_requests")
-        .select("order_id, proposed_by_role, mode, fields, status, created_at, order:orders ( status, transport_mode )")
+        .select("id, order_id, proposed_by_role, mode, fields, status, created_at, order:orders ( order_number, status, transport_mode )")
         .eq(col, id).in("status", ["proposed", "declined"])
         .order("created_at", { ascending: false }).limit(300);
     if (error) return res.status(500).json({ success: false, message: "Couldn't load transport updates." });
@@ -258,7 +314,8 @@ export const summaryOrderTransport = wrap(async (req, res) => {
         const o = Array.isArray(r.order) ? r.order[0] : r.order;
         if (!o || !NEGOTIABLE.includes(o.status)) continue;
 
-        const base = { mode: r.mode, fields: r.fields || {}, summary: routeOptionSummary(r.mode, r.fields || {}) };
+        const base = { requestId: r.id, orderNumber: o.order_number, mode: r.mode, fields: r.fields || {}, summary: routeOptionSummary(r.mode, r.fields || {}) };
+
         if (r.status === "proposed") {
             summary[r.order_id] = { ...base, state: r.proposed_by_role === as ? "waiting" : "needs_you" };
         } else if (r.status === "declined" && r.proposed_by_role === as && !o.transport_mode) {
@@ -269,9 +326,7 @@ export const summaryOrderTransport = wrap(async (req, res) => {
 });
 
 // GET /api/order-transport/:orderId
-export const getOrderTransport = wrap(async (req, res) => {
-    const ctx = await loadContext(req.params.orderId, req.user.id);
-    if (ctx.fail) return res.status(ctx.fail[0]).json({ success: false, message: ctx.fail[1] });
+async function buildView(ctx) {
     const { order, seller, role, route } = ctx;
 
     // Same seller + buyer + route as an earlier agreement? Apply it now, so nobody has to choose or approve again.
@@ -284,7 +339,6 @@ export const getOrderTransport = wrap(async (req, res) => {
 
     let agreement = null;
     if (order.transport_agreement_id) {
-        // Looked up by id (the row this order was agreed under, even if it has since been ended / replaced).
         const { data: ag } = await supabase.from("transport_agreements").select("id, agreed_at").eq("id", order.transport_agreement_id).maybeSingle();
         agreement = ag || null;
     }
@@ -292,15 +346,16 @@ export const getOrderTransport = wrap(async (req, res) => {
     const { data: rows, error } = await supabase
         .from("order_transport_requests").select(REQ_COLS)
         .eq("order_id", order.id).order("created_at", { ascending: false }).limit(20);
-    if (error) return res.status(500).json({ success: false, message: "Couldn't load transport details." });
+    if (error) throw new Error(error.message);
 
     const history = rows || [];
     const active = history.find((r) => r.status === "proposed") || null;
     const lastDeclined = !active ? (history.find((r) => r.status === "declined") || null) : null;
 
-    res.json({
-        success: true,
+    return {
         role, phase,
+        orderId: order.id,
+        unpaid: isUnpaid(order),
         orderStatus: order.status,
         orderNumber: order.order_number,
         sellerName: seller.display_name,
@@ -318,7 +373,84 @@ export const getOrderTransport = wrap(async (req, res) => {
             : null,
         active, lastDeclined, history,
         options: phase === "open" || canChange ? await buildOptions(seller, route) : null,
-    });
+    };
+}
+
+// GET /api/order-transport/:orderId
+export const getOrderTransport = wrap(async (req, res) => {
+    const ctx = await loadContext(req.params.orderId, req.user.id);
+    if (ctx.fail) return res.status(ctx.fail[0]).json({ success: false, message: ctx.fail[1] });
+    res.json({ success: true, ...(await buildView(ctx)) });
+});
+
+// GET /api/order-transport/group/:groupId   (buyer) — one view per seller order of a cart checkout
+export const getGroupTransport = wrap(async (req, res) => {
+    const { groupId } = req.params;
+    if (!UUID_RE.test(String(groupId || ""))) return res.status(404).json({ success: false, message: "Order not found." });
+    const { data: rows, error } = await supabase.from("orders").select("id")
+        .eq("order_group_id", groupId).eq("buyer_id", req.user.id);
+    if (error) return res.status(500).json({ success: false, message: "Couldn't load transport details." });
+    const orders = [];
+    for (const r of rows || []) {
+        const ctx = await loadContext(r.id, req.user.id);
+        if (!ctx.fail) orders.push(await buildView(ctx));
+    }
+    res.json({ success: true, orders });
+});
+
+// GET /api/order-transport/agreements?as=buyer|seller — saved agreements (seller + buyer + route)
+export const listAgreements = wrap(async (req, res) => {
+    const as = req.query.as === "seller" ? "seller" : "buyer";
+    let col, id;
+    if (as === "buyer") { col = "buyer_id"; id = req.user.id; }
+    else {
+        const { data: s } = await supabase.from("seller_profiles").select("id").eq("user_id", req.user.id).maybeSingle();
+        if (!s) return res.json({ success: true, agreements: [] });
+        col = "seller_id"; id = s.id;
+    }
+    const { data, error } = await supabase.from("transport_agreements")
+        .select("id, seller_id, buyer_id, origin_city, dest_city, mode, fields, agreed_at")
+        .eq(col, id).eq("status", "active").order("agreed_at", { ascending: false }).limit(200);
+    if (error) return res.status(500).json({ success: false, message: "Couldn't load agreements." });
+
+    const rows = data || [];
+    const names = new Map();
+    if (rows.length) {
+        if (as === "buyer") {
+            const ids = [...new Set(rows.map((r) => r.seller_id))];
+            const { data: s } = await supabase.from("seller_profiles").select("id, display_name").in("id", ids);
+            (s || []).forEach((x) => names.set(x.id, x.display_name));
+        } else {
+            const ids = [...new Set(rows.map((r) => r.buyer_id))];
+            const { data: p } = await supabase.from("profiles").select("id, name").in("id", ids);
+            (p || []).forEach((x) => names.set(x.id, x.name));
+        }
+    }
+    const agreements = rows.map((r) => ({
+        id: r.id,
+        counterparty: names.get(as === "buyer" ? r.seller_id : r.buyer_id) || (as === "buyer" ? "Seller" : "Buyer"),
+        originCity: r.origin_city, destCity: r.dest_city,
+        mode: r.mode, fields: r.fields || {},
+        summary: routeOptionSummary(r.mode, r.fields || {}),
+        modeLabel: ROUTE_TRANSPORT_MODE_LABELS[r.mode] || r.mode,
+        agreedAt: r.agreed_at,
+    }));
+    res.json({ success: true, agreements });
+});
+
+// POST /api/order-transport/agreements/:id/end — either side. Past orders keep what they were agreed under;
+// the NEXT order on that route simply negotiates afresh.
+export const endAgreement = wrap(async (req, res) => {
+    const { id } = req.params;
+    if (!UUID_RE.test(String(id || ""))) return res.status(404).json({ success: false, message: "Agreement not found." });
+    const { data: ag } = await supabase.from("transport_agreements").select("id, buyer_id, seller_id, status").eq("id", id).maybeSingle();
+    if (!ag) return res.status(404).json({ success: false, message: "Agreement not found." });
+    const { data: s } = await supabase.from("seller_profiles").select("user_id").eq("id", ag.seller_id).maybeSingle();
+    if (ag.buyer_id !== req.user.id && s?.user_id !== req.user.id) return res.status(404).json({ success: false, message: "Agreement not found." });
+    const { error } = await supabase.from("transport_agreements")
+        .update({ status: "ended", updated_at: new Date().toISOString() }).eq("id", id).eq("status", "active");
+    if (error) return res.status(500).json({ success: false, message: "Couldn't end the agreement." });
+    res.json({ success: true });
 });
 
 // POST /api/order-transport/:orderId/propose   { routeOptionId? | mode, fields?, note? }
