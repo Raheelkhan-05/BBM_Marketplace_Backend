@@ -108,9 +108,15 @@ async function saveAgreement(ctx, req) {
     };
     const existing = await findAgreement(key);
     if (existing) {
-        const { data, error } = await supabase.from("transport_agreements").update(values).eq("id", existing.id).select("id").maybeSingle();
-        if (error) throw new Error(error.message);
-        return data?.id || existing.id;
+        const same = existing.mode === req.mode
+            && (existing.route_option_id || null) === (req.route_option_id || null)
+            && JSON.stringify(existing.fields || {}) === JSON.stringify(req.fields || {});
+        if (same) return existing.id; // same transport accepted again: nothing to change
+        // A different transport was agreed: end the old agreement (kept as history, past orders still point at it)
+        // and start a new one. This only ever affects the NEXT orders on this route.
+        const { error: endErr } = await supabase.from("transport_agreements")
+            .update({ status: "ended", updated_at: now }).eq("id", existing.id);
+        if (endErr) throw new Error(endErr.message);
     }
     const { data, error } = await supabase.from("transport_agreements").insert({ ...key, ...values, status: "active" }).select("id").maybeSingle();
     if (error) {
@@ -135,6 +141,11 @@ export async function applySavedTransportAgreement(ctx) {
     const key = agreementKey(order, seller, route);
     const agreement = await findAgreement(key);
     if (!agreement) return null;
+
+    // If the two sides are already discussing transport on THIS order, that discussion wins: don't override it.
+    const { data: openReq } = await supabase.from("order_transport_requests")
+        .select("id").eq("order_id", order.id).eq("status", "proposed").limit(1).maybeSingle();
+    if (openReq) return null;
 
     const options = await buildOptions(seller, route);
     if (!agreementStillValid(agreement, options)) {
@@ -273,6 +284,7 @@ export const getOrderTransport = wrap(async (req, res) => {
 
     let agreement = null;
     if (order.transport_agreement_id) {
+        // Looked up by id (the row this order was agreed under, even if it has since been ended / replaced).
         const { data: ag } = await supabase.from("transport_agreements").select("id, agreed_at").eq("id", order.transport_agreement_id).maybeSingle();
         agreement = ag || null;
     }
