@@ -11,6 +11,7 @@
 //   6. While the gateway/relay is blocked (circuit open) we make NO gateway calls: no new attempt rows,
 //      no status checks, and refunds are not claimed (claiming burns their retry counter).
 //   7. A gateway REJECTION (e.g. merchant limit breached) is reported as such, not as an outage.
+//   8. Only ONE status check per reference runs at a time (return, poll, webhook-confirm and reconciler share it).
 import crypto from "crypto";
 import { supabase } from "../config/supabase.js";
 import { jiopayConfig as cfg, assertJiopayConfigured } from "../config/jiopay.js";
@@ -89,7 +90,7 @@ async function targetStillUnpaid(purpose, targetId) {
 // Finds a payment session this buyer already opened for the SAME order / cart that can still be
 // completed, and rebuilds its gateway URL from what we stored (redirect_uri + tranCtx).
 // No call to JioPay is made. Returns null when there is nothing to resume.
-// 3) findResumableAttempt: accept expectedPaise and only resume a session for exactly that amount
+// Accepts expectedPaise and only resumes a session for exactly that amount.
 async function findResumableAttempt({ purpose, userId, targetId, expectedPaise = null, alreadyVerifiedUnpaid = false }) {
     if (purpose !== "order" && purpose !== "order_group") return null;
 
@@ -112,7 +113,6 @@ async function findResumableAttempt({ purpose, userId, targetId, expectedPaise =
     }
     if (!a) return null;
     if (!alreadyVerifiedUnpaid && !(await targetStillUnpaid(purpose, targetId))) return null;
-
 
     try {
         const target = new URL(String(a.redirect_uri));
@@ -172,7 +172,7 @@ async function repriceForPayment({ purpose, userId, targetId, expectedTotal }) {
 }
 
 // purpose: 'order' | 'order_group' | 'wallet_topup'
-// 4) createCheckout: reprice first; final guard after the attempt row is created
+// Reprices first; final guard after the attempt row is created.
 export async function createCheckout({ purpose, userId, targetId, amountPaise = null, expectedTotal = null }) {
     assertJiopayConfigured();
 
@@ -266,7 +266,8 @@ export async function createCheckout({ purpose, userId, targetId, amountPaise = 
         throw new PaymentError(502, "The payment gateway isn't reachable right now. Please try again in a moment.", "GATEWAY_UNAVAILABLE");
     }
 
-    // REPLACE the awaited update after initiateSale with:
+    // Not awaited on purpose (saves a round trip before the redirect).
+    // .then() is required: Supabase builders only execute when awaited/thenned.
     void supabase.from("payment_attempts")
         .update({ status: "initiated", tran_ctx: init.tranCtx, redirect_uri: init.redirectUri })
         .eq("id", attemptId).eq("status", "created") // never regress a status a fast webhook already advanced
@@ -504,7 +505,7 @@ export async function handleWebhook(payload) {
         }
         const confirmed = s.hashValid && classifyCode(s.code) === "success" && s.txnStatus === "SUC";
         if (!confirmed) {
-            console.warn("[payments] webhook claimed success but the status API did not confirm:", ref, s.code);
+            console.warn("[payments] webhook claimed success but the status API did not confirm:", ref, s.code, "txnStatus=", s.txnStatus, "hashValid=", s.hashValid);
             await alertAdmins("Webhook success not confirmed by status API", `Attempt ${ref}: webhook said success, status API said "${s.code || "unknown"}". Not applied; it will be re-checked automatically.`);
             outcome = "pending";
         } else if (s.amountPaise != null && n.amountPaise != null && s.amountPaise !== n.amountPaise) {
@@ -553,10 +554,15 @@ export async function reconcileAttempt({ id, ref, amountPaise, status, expiresAt
         outcome = "pending";
     }
 
-    // Only an explicit rejection (REJ) counts as final before expiry. Anything else stays provisional.
+    // Only an explicit rejection (REJ) counts as final before expiry, unless the buyer has already
+    // come back from the gateway (then a verified "failed" is final). Anything else stays provisional.
     const explicitReject = s.txnStatus === "REJ";
     if (outcome === "failed" && !expired && status !== "expired" && !explicitReject && !buyerReturned) {
         outcome = "pending";
+    }
+
+    if (outcome === "pending") {
+        console.log("[payments] still pending:", ref, "code=", s.code, "txnStatus=", s.txnStatus, "hashValid=", s.hashValid);
     }
 
     const amount = outcome === "success" ? (s.amountPaise ?? amountPaise) : (s.amountPaise ?? null);
@@ -572,6 +578,35 @@ export async function reconcileAttempt({ id, ref, amountPaise, status, expiresAt
     return result;
 }
 
+// De-dupe: one status check per ref at a time, shared by return, poll and reconciler.
+const inflight = new Map();
+export function reconcileAttemptOnce(args) {
+    const running = inflight.get(args.ref);
+    if (running) return running;
+    const p = reconcileAttempt(args).finally(() => inflight.delete(args.ref));
+    inflight.set(args.ref, p);
+    return p;
+}
+
+// B2B browser return: log + start the authoritative check immediately (never awaited by the caller).
+// Nothing is credited from the return payload itself; only the status API result is applied.
+export function handleBrowserReturn(ref, payload) {
+    (async () => {
+        await Promise.allSettled([
+            logReturnEvent(ref, payload),
+            (async () => {
+                if (isGatewayBlocked()) return;
+                const a = await loadAttempt(ref);
+                if (!a || !(LIVE.includes(a.status) || a.status === "expired")) return;
+                await reconcileAttemptOnce({
+                    id: a.id, ref, amountPaise: Number(a.amount_paise),
+                    status: a.status, expiresAt: a.expires_at, buyerReturned: true,
+                });
+            })(),
+        ]);
+    })().catch((e) => console.error("[payments] return handling failed:", ref, e?.message || e));
+}
+
 async function inChunks(items, size, fn) {
     for (let i = 0; i < items.length; i += size) {
         await Promise.allSettled(items.slice(i, i + size).map(fn));
@@ -583,7 +618,7 @@ export async function reconcileTick() {
     if (!isGatewayBlocked()) {
         const { data: rows, error } = await supabase.rpc("payment_claim_for_reconcile", { p_limit: 25 });
         if (error) console.error("[payments] claim for reconcile failed:", error.message);
-        await inChunks(rows || [], 5, (r) => reconcileAttempt({
+        await inChunks(rows || [], 5, (r) => reconcileAttemptOnce({
             id: r.r_id, ref: r.r_merchant_txn_no, amountPaise: Number(r.r_amount_paise),
             status: r.r_status, expiresAt: r.r_expires_at,
         }).catch((e) => console.error("[payments] reconcile error:", r.r_merchant_txn_no, e?.message || e)));
@@ -597,7 +632,9 @@ export async function reconcileTick() {
 
 /* ============================================================ buyer polling */
 
-export async function getAttemptStatusForUser(ref, userId) {
+const STATUS_CHECK_MIN_GAP_MS = 1500;
+
+export async function getAttemptStatusForUser(ref, userId, { returned = false } = {}) {
     const cols = "id, merchant_txn_no, purpose, order_id, order_group_id, seller_id, amount_paise, status, apply_outcome, last_status_check_at, expires_at, created_at";
     const load = () => supabase.from("payment_attempts").select(cols).eq("merchant_txn_no", ref).eq("user_id", userId).maybeSingle();
 
@@ -605,25 +642,29 @@ export async function getAttemptStatusForUser(ref, userId) {
     if (!a) return null;
 
     const now = Date.now();
-    const stale = !a.last_status_check_at || now - new Date(a.last_status_check_at).getTime() > 5000;
-    if (!isGatewayBlocked() && (LIVE.includes(a.status) || a.status === "expired") && stale && now - new Date(a.created_at).getTime() > 3000) {
-        await supabase.from("payment_attempts").update({ last_status_check_at: new Date().toISOString() }).eq("id", a.id);
-        await reconcileAttempt({
-            id: a.id, ref: a.merchant_txn_no, amountPaise: Number(a.amount_paise), status: a.status, expiresAt: a.expires_at,
+    const open = LIVE.includes(a.status) || a.status === "expired";
+    const stale = !a.last_status_check_at || now - new Date(a.last_status_check_at).getTime() > STATUS_CHECK_MIN_GAP_MS;
+    const running = inflight.get(ref); // join a check already started by the return or the reconciler
+
+    if (open && !isGatewayBlocked() && now - new Date(a.created_at).getTime() > 3000 && (running || stale)) {
+        if (!running) {
+            // .then() is required: Supabase builders only execute when awaited/thenned. Not awaited on purpose.
+            supabase.from("payment_attempts").update({ last_status_check_at: new Date().toISOString() })
+                .eq("id", a.id).then(() => { }, () => { });
+        }
+        await reconcileAttemptOnce({
+            id: a.id, ref: a.merchant_txn_no, amountPaise: Number(a.amount_paise),
+            status: a.status, expiresAt: a.expires_at, buyerReturned: returned,
         }).catch((e) => console.error("[payments] on-demand reconcile failed:", ref, e?.message || e));
         ({ data: a } = await load());
     }
 
-    let orderNumber = null;
-    let groupNumber = null;
-    if (a.order_id) {
-        const { data } = await supabase.from("orders").select("order_number").eq("id", a.order_id).maybeSingle();
-        orderNumber = data?.order_number || null;
-    }
-    if (a.order_group_id) {
-        const { data } = await supabase.from("order_groups").select("group_number").eq("id", a.order_group_id).maybeSingle();
-        groupNumber = data?.group_number || null;
-    }
+    const [orderRes, groupRes] = await Promise.all([
+        a.order_id ? supabase.from("orders").select("order_number").eq("id", a.order_id).maybeSingle() : null,
+        a.order_group_id ? supabase.from("order_groups").select("group_number").eq("id", a.order_group_id).maybeSingle() : null,
+    ]);
+    const orderNumber = orderRes?.data?.order_number || null;
+    const groupNumber = groupRes?.data?.group_number || null;
 
     let status;
     if (a.status === "success") status = a.apply_outcome === "applied" ? "success" : "refunded";
@@ -637,7 +678,7 @@ export async function getAttemptStatusForUser(ref, userId) {
         purpose: a.purpose,
         amount: Number(a.amount_paise) / 100,
         status,
-        final: a.status === "success" || a.status === "failed" || a.status === "needs_review" || a.status === "expired",
+        final: ["success", "failed", "needs_review", "expired"].includes(a.status),
         orderId: a.order_id,
         orderNumber,
         groupId: a.order_group_id,

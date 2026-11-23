@@ -1,6 +1,6 @@
 // src/controllers/payments.controller.js
 import {
-    createCheckout, handleWebhook, getAttemptStatusForUser, logReturnEvent, isValidRef, PaymentError,
+    createCheckout, handleWebhook, getAttemptStatusForUser, handleBrowserReturn, isValidRef, PaymentError,
 } from "../services/payments.service.js";
 import { amountToPaise } from "../services/jiopay.client.js";
 import { jiopayConfig as cfg } from "../config/jiopay.js";
@@ -61,12 +61,12 @@ export async function checkoutWallet(req, res) {
 
 /* ------------------------------------------------------------------- polling */
 
-// GET /api/payments/attempts/:ref  (owner only)
+// GET /api/payments/attempts/:ref[?returned=1]  (owner only)
 export async function attemptStatus(req, res) {
     try {
         const { ref } = req.params;
         if (!isValidRef(ref)) return res.status(400).json({ success: false, message: "Invalid payment reference." });
-        const view = await getAttemptStatusForUser(ref, req.user.id);
+        const view = await getAttemptStatusForUser(ref, req.user.id, { returned: req.query.returned === "1" });
         if (!view) return res.status(404).json({ success: false, message: "Payment not found." });
         res.json({ success: true, payment: view });
     } catch (e) { fail(res, e, "attemptStatus"); }
@@ -105,8 +105,9 @@ export async function jiopayWebhook(req, res) {
 /* --------------------------------------------------------------- browser return */
 
 // GET|POST /pay/return — JioPay sends the buyer's browser here (often as a form POST, which a
-// static SPA page cannot receive). We only log it, then 303-redirect to the frontend page, which
-// polls GET /api/payments/attempts/:ref. Nothing is credited from this request.
+// static SPA page cannot receive). We start the authoritative status check in the background and
+// 303-redirect to the frontend page immediately, which polls GET /api/payments/attempts/:ref.
+// Nothing is credited from this request's own payload.
 export async function payReturn(req, res) {
     if (req.method !== "GET" && req.method !== "POST") return res.status(405).end();
 
@@ -114,6 +115,6 @@ export async function payReturn(req, res) {
     const ref = String(src.merchantTxnNo || "");
     if (!isValidRef(ref)) return res.redirect(303, `${cfg.frontendUrl}/buy/orders`);
 
-    await logReturnEvent(ref, src);
+    handleBrowserReturn(ref, src); // fire-and-forget
     return res.redirect(303, `${cfg.frontendUrl}/payment/return?ref=${encodeURIComponent(ref)}`);
 }
