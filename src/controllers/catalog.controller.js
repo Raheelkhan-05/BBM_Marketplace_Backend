@@ -164,6 +164,12 @@ export async function getBrandItemSellers(req, res) {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// Optional subcategory filter: a valid UUID or null (anything else is ignored).
+function uuidOrNull(v) {
+    const s = String(v || "").trim();
+    return UUID_RE.test(s) ? s : null;
+}
+
 // GET /api/catalog/followed-ids
 export async function getFollowedIds(req, res) {
     const { data, error } = await supabaseAdmin
@@ -245,6 +251,7 @@ export async function getBrandItemsFeed(req, res) {
     const groupId = groupRaw || null;
 
     const { data, error } = await supabaseAdmin.rpc("catalog_browse_feed", {
+        p_subcategory_id: uuidOrNull(req.query.subcategoryId),
         p_category_id: categoryId || null,
         p_q: q,
         p_sort: sort,
@@ -284,6 +291,8 @@ export async function getSellersPage(req, res) {
         return res.status(400).json({ success: false, message: "Invalid category." });
     }
     const { data, error } = await supabaseAdmin.rpc("catalog_sellers_page", {
+        p_subcategory_id: uuidOrNull(req.query.subcategoryId),
+
         p_q: q,
         p_limit: limit,
         p_offset: offset,
@@ -314,6 +323,8 @@ export async function getBrandsPage(req, res) {
     }
 
     const { data, error } = await supabaseAdmin.rpc("catalog_brands_page", {
+        p_subcategory_id: uuidOrNull(req.query.subcategoryId),
+
         p_q: q,
         p_limit: limit,
         p_offset: offset,
@@ -597,4 +608,31 @@ export async function observePriceTrends(req, res) {
         return res.status(500).json({ success: false, message: "Couldn't update price trends." });
     }
     return res.json({ success: true, trends: data || {} });
+}
+
+// GET /api/catalog/category-tree?shop=<slug>&brand=<name>
+// Categories with their subcategories, limited to what THIS viewer can see in the feed
+// (wallet / visibility / expiry rules), and optionally to one seller and/or brand(s).
+// Per-viewer, so never publicly cached.
+export async function getCategoryTree(req, res) {
+    const shop = String(req.query.shop || "").trim().slice(0, 100) || null;
+    const brands = [].concat(req.query.brand || [])
+        .map((s) => String(s).trim().slice(0, 100))
+        .filter(Boolean)
+        .slice(0, 20);
+
+    const { data, error } = await supabaseAdmin.rpc("catalog_category_tree", {
+        p_seller_id: req.sellerProfileId || null,
+        p_buyer_id: req.user?.id || null,
+        p_shop_slug: shop,
+        ...(brands.length ? { p_brand_names: brands } : {}),
+    });
+
+    if (error) {
+        console.error("[catalog] getCategoryTree failed:", error.message);
+        return res.status(500).json({ success: false, message: "Couldn't load categories." });
+    }
+    res.set("Cache-Control", "private, max-age=30");
+    res.set("Vary", "Authorization");
+    return res.json({ success: true, categories: data?.categories || [] });
 }

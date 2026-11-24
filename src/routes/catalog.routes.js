@@ -25,6 +25,7 @@ import {
     getShopPublicInfo,
     observePriceTrends,
     getSellersPage,
+    getCategoryTree,
 } from "../controllers/catalog.controller.js";
 import { getGroupBanners } from "../controllers/groupBanners.controller.js";
 import { getEntityBanners } from "../controllers/entityBanners.controller.js";
@@ -43,6 +44,10 @@ router.get("/brand-items/:brandItemId", optionalAuth, optionalSellerProfile, get
 
 router.get("/brands", optionalAuth, optionalSellerProfile, getBrandsPage);
 router.get("/sellers", optionalAuth, optionalSellerProfile, getSellersPage);
+
+// Categories + subcategories visible to this viewer (optionally scoped to a seller / brand).
+router.get("/category-tree", optionalAuth, optionalSellerProfile, getCategoryTree);
+
 
 // Admin-curated banners for product groups (public, tiny, ETag-revalidated).
 router.get("/group-banners", getGroupBanners);
