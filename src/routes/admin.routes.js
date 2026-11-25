@@ -66,8 +66,10 @@ import {
   revertItem as studioRevert, discardBatch as studioDiscard, proxyImage as studioProxy, cutoutUpload,
 } from "../controllers/imageStudio.controller.js";
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
+import { adminAdsRoutes } from "./ads.routes.js";
 
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
 
 const router = Router();
 
@@ -138,6 +140,8 @@ router.post("/rfq/:id/reject", requireAuth, requireAdmin, authWriteLimiter, admi
 // NEW — full-hierarchy bulk upload with review: /catalog-bulk/meta, /check and /drafts/*.
 // Mounted before the older /catalog-bulk routes below (their paths do not overlap).
 router.use("/catalog-bulk", adminCatalogDraftsRoutes);
+
+router.use("/ads", requireAuth, requireAdmin, adminAdsRoutes);
 
 router.get("/catalog-bulk/excel-template", requireAuth, requireAdmin, downloadFullCatalogTemplate);
 router.post("/catalog-bulk/excel-upload", requireAuth, requireAdmin, upload.single("file"), bulkUploadFullCatalog);

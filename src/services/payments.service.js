@@ -425,7 +425,7 @@ async function notifyRefund(refundId, kind) {
         if (!ctx?.userId) return;
         const amount = inr(ctx.refund.amount_paise);
         const forOrder = ctx.orderNumber ? ` for order ${ctx.orderNumber}` : "";
-        const link = ctx.purpose === "wallet_topup" ? "/seller/wallet" : ctx.refund.order_id ? `/orders/${ctx.refund.order_id}` : "/orders";
+        const link = ctx.purpose === "wallet_topup" ? "/sell/wallet" : ctx.refund.order_id ? `/buy/orders/${ctx.refund.order_id}` : "/buy/orders";
 
         const copy = {
             initiated: {

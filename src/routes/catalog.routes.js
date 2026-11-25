@@ -28,6 +28,7 @@ import {
     getCategoryTree,
 } from "../controllers/catalog.controller.js";
 import { getGroupBanners } from "../controllers/groupBanners.controller.js";
+import { getHomeSections } from "../controllers/homeSections.controller.js"; // NEW (Stage 4)
 import { getEntityBanners } from "../controllers/entityBanners.controller.js";
 
 const router = Router();
@@ -53,6 +54,9 @@ router.get("/category-tree", optionalAuth, optionalSellerProfile, getCategoryTre
 router.get("/group-banners", getGroupBanners);
 
 router.get("/entity-banners/:type", getEntityBanners);
+
+// NEW (Stage 4) — Home shelves: Deal of the Day, Featured, Limited stock, New arrivals.
+router.get("/home-sections", optionalAuth, optionalSellerProfile, getHomeSections);
 
 router.get("/brand-items-feed", optionalAuth, optionalSellerProfile, getBrandItemsFeed);
 router.get("/brand-items/:brandItemId/sellers", optionalAuth, optionalSellerProfile, getBrandItemSellers);

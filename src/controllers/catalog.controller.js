@@ -15,9 +15,17 @@
 // inside the SQL function itself, not in the frontend — see that
 // function's own comments for why (pagination-stable "fastest delivery"
 // ordering).
+//
+// CHANGED (slug fix): the :brandItemId param on brand-item detail / sellers /
+// seller-offer may be a UUID OR a slug (the frontend route is :idOrSlug).
+// resolveBrandItemId() turns either into the UUID before any RPC runs, so a
+// slug can never reach a uuid column (that was the 500 "invalid input syntax
+// for type uuid"). Unknown slug -> 404 instead of 500.
 
 import { supabaseAdmin } from "../config/supabase.js";
 import { sanitizeStoreTheme } from "../utils/storeTheme.js";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function parseIntSafe(v, fallback) {
     const n = parseInt(v, 10);
@@ -26,6 +34,25 @@ function parseIntSafe(v, fallback) {
 
 // A generic product with >= this many visible variants is collapsed into one group card.
 const GROUP_THRESHOLD = Math.max(0, parseIntSafe(process.env.CATALOG_GROUP_THRESHOLD, 6));
+
+// Accepts a brand item UUID or slug and returns the UUID (or null if there is no such
+// approved, non-deleted brand item). Throws only on a real database error.
+async function resolveBrandItemId(idOrSlug) {
+    const s = String(idOrSlug || "").trim();
+    if (!s || s.length > 200) return null;
+    if (UUID_RE.test(s)) return s;
+
+    const { data, error } = await supabaseAdmin
+        .from("hs_generic_product_brands")
+        .select("id")
+        .eq("slug", s)
+        .eq("review_status", "approved")
+        .is("deleted_at", null)
+        .limit(1);
+
+    if (error) throw error;
+    return data?.[0]?.id || null;
+}
 
 // GET /api/catalog/categories/:categoryId/generic-products?q=&subcategoryIds=&sort=&limit=&offset=
 export async function getCategoryGenericProducts(req, res) {
@@ -110,9 +137,17 @@ export async function getGenericProductBrands(req, res) {
     return res.json({ success: true, ...data });
 }
 
-// GET /api/catalog/brand-items/:brandItemId
+// GET /api/catalog/brand-items/:brandItemId   (UUID or slug)
 export async function getBrandItemDetail(req, res) {
-    const { brandItemId } = req.params;
+    let brandItemId;
+    try {
+        brandItemId = await resolveBrandItemId(req.params.brandItemId);
+    } catch (e) {
+        console.error("[catalog] getBrandItemDetail resolve failed:", e?.message);
+        return res.status(500).json({ success: false, message: "Couldn't load this product's details." });
+    }
+    if (!brandItemId) return res.status(404).json({ success: false, message: "Product not found." });
+
     const { data, error } = await supabaseAdmin.rpc("catalog_brand_item_detail", {
         p_brand_item_id: brandItemId,
         p_buyer_id: req.user?.id || null,
@@ -127,6 +162,7 @@ export async function getBrandItemDetail(req, res) {
 }
 
 // GET /api/catalog/brand-items/:brandItemId/sellers?sort=&limit=&offset=&destPincode=&destState=
+// (:brandItemId may be a UUID or a slug)
 //
 // `sort` accepts: 'relevance' (default), 'price_asc', 'price_desc',
 // 'moq_asc', or 'fastest_delivery'. The last one requires destPincode +
@@ -139,10 +175,18 @@ export async function getBrandItemDetail(req, res) {
 // can DISPLAY an estimate even while sorting by price or MOQ.
 export async function getBrandItemSellers(req, res) {
     // console.log("[catalog-debug]", { actor: req.actor?.id, user: req.user?.id, team: req.team?.companyId, route: req.originalUrl });
-    const { brandItemId } = req.params;
     const { sort = "relevance", destPincode, destState } = req.query;
     const limit = parseIntSafe(req.query.limit, 24);
     const offset = parseIntSafe(req.query.offset, 0);
+
+    let brandItemId;
+    try {
+        brandItemId = await resolveBrandItemId(req.params.brandItemId);
+    } catch (e) {
+        console.error("[catalog] getBrandItemSellers resolve failed:", e?.message);
+        return res.status(500).json({ success: false, message: "Couldn't load sellers right now." });
+    }
+    if (!brandItemId) return res.status(404).json({ success: false, message: "Product not found." });
 
     const { data, error } = await supabaseAdmin.rpc("catalog_brand_item_sellers", {
         p_brand_item_id: brandItemId,
@@ -161,8 +205,6 @@ export async function getBrandItemSellers(req, res) {
     }
     return res.json({ success: true, ...data });
 }
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Optional subcategory filter: a valid UUID or null (anything else is ignored).
 function uuidOrNull(v) {
@@ -374,11 +416,19 @@ export async function getShopPublicInfo(req, res) {
     });
 }
 
-// catalog.controller.js
+// GET /api/catalog/brand-items/:brandItemId/seller-offer?shopSlug=   (UUID or slug)
 export async function getBrandItemSellerOffer(req, res) {
-    const { brandItemId } = req.params;
     const { shopSlug } = req.query;
     if (!shopSlug) return res.status(400).json({ success: false, message: "shopSlug is required." });
+
+    let brandItemId;
+    try {
+        brandItemId = await resolveBrandItemId(req.params.brandItemId);
+    } catch (e) {
+        console.error("[catalog] getBrandItemSellerOffer resolve failed:", e?.message);
+        return res.status(500).json({ success: false, message: "Couldn't load this offer right now." });
+    }
+    if (!brandItemId) return res.status(404).json({ success: false, message: "Product not found." });
 
     const { data, error } = await supabaseAdmin.rpc("catalog_brand_item_seller_offer", {
         p_brand_item_id: brandItemId,

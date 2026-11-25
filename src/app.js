@@ -54,6 +54,7 @@ import adminProductImageRequestsRouter from "./routes/adminProductImageRequests.
 import impersonationRoutes from "./routes/impersonation.routes.js";
 import adminImpersonationRoutes from "./routes/adminImpersonation.routes.js";
 import orderTransportRoutes from "./routes/orderTransport.routes.js";
+import adsRoutes from "./routes/ads.routes.js";
 
 
 export function createApp() {
@@ -176,6 +177,7 @@ export function createApp() {
   app.use("/api/team", teamRoutes);
   app.use("/api/sales-monitor", salesMonitorRoutes);
   app.use("/api/sales-chat", salesChatRoutes);
+  app.use("/api/ads", adsRoutes);
 
   app.use((err, req, res, next) => {
     console.error(err);
