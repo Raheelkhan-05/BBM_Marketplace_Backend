@@ -26,6 +26,9 @@ export const getPlacements = wrap("placements", async (req, res) => {
             id: p.id, key: p.key, kind: p.kind, name: p.name, description: p.description, aspectKeys: p.aspect_keys,
             lanes: p.lanes, minHours: p.min_hours, maxHours: p.max_hours, maxDaysAhead: p.max_days_ahead,
             fromRate: Math.round(Number(p.base_rate_per_hour) * Number(p.min_multiplier) * 100) / 100,
+            // priority bidding (the seller screen only shows the bid box when biddable is true)
+            biddable: !!p.biddable, bidStep: Number(p.bid_step) || 5, bidMax: Number(p.bid_max) || 1000,
+            unlimited: !!p.unlimited,
         })),
     });
 });
@@ -35,7 +38,10 @@ export const getAvailability = wrap("availability", async (req, res) => {
 });
 
 export const getQuote = wrap("quote", async (req, res) => {
-    res.json({ success: true, quote: await ads.quote({ sellerId: req.sellerId, key: req.params.key, start: req.query.start, hours: req.query.hours }) });
+    res.json({
+        success: true,
+        quote: await ads.quote({ sellerId: req.sellerId, key: req.params.key, start: req.query.start, hours: req.query.hours, bid: req.query.bid }),
+    });
 });
 
 export const uploadCreative = wrap("uploadCreative", async (req, res) => {
@@ -51,6 +57,7 @@ export const postBooking = wrap("book", async (req, res) => {
     const out = await ads.book({
         sellerId: req.sellerId, userId: req.user.id, key: b.placementKey, start: b.start, hours: b.hours,
         expectedTotal: b.expectedTotal, creativeInput: b.creative, idempotencyKey: b.idempotencyKey,
+        bidPerHour: b.bidPerHour,
     });
     res.json({ success: true, booking: out });
 });

@@ -1,4 +1,11 @@
 // services/ads.service.js — every money/slot decision happens in SQL (ad_book_slot / ad_admin_remove).
+//
+// Priority bidding (extra rupees PER HOUR above the slot price, product placements only):
+//   * placement.biddable / bid_step / bid_max live on ad_placements (see ads_bidding_migration.sql).
+//   * quote()  asks ad_quote_bid (wraps ad_quote, adds the bid and the seller's rank) for biddable placements.
+//   * book()   with a bid > 0 calls ad_book_slot_bid. Until that SQL function is installed the service answers
+//              BID_UNAVAILABLE and charges nothing; bookings without a bid keep using ad_book_slot unchanged.
+//   * A DB trigger refuses biddable = true while ad_book_slot_bid is missing, so bidding cannot be half-enabled.
 import { supabase } from "../config/supabase.js";
 import { getIO } from "../socket/io.js";
 import { notifyUser } from "./realtimeBroadcast.js";
@@ -28,6 +35,10 @@ const RPC_ERRORS = {
     BOOKING_NOT_FOUND: [404, "Booking not found."],
     ALREADY_REMOVED: [409, "This booking was already removed."],
     LANES_IN_USE: [409, "Active or upcoming bookings use the lanes you are removing."],
+    // priority bidding
+    INVALID_BID: [400, "That priority bid isn't allowed for this placement."],
+    BID_UNAVAILABLE: [503, "Priority bidding isn't available yet. Book without a bid, or try again later."],
+    BID_NOT_READY: [409, "Priority bidding can't be switched on until the bid booking function is installed in the database."],
 };
 
 function rpcFail(error, label) {
@@ -47,12 +58,34 @@ function rpcFail(error, label) {
     throw new AdError(500, "Something went wrong. Please try again.", "AD_ERROR");
 }
 
+// PostgREST says PGRST202 (or Postgres 42883) when an RPC function doesn't exist.
+const isMissingFn = (error) => error?.code === "PGRST202" || error?.code === "42883";
+
 const isoOrThrow = (v, what = "start") => {
     const d = new Date(String(v || ""));
     if (Number.isNaN(d.getTime())) throw new AdError(400, `Invalid ${what}.`, "INVALID_START");
     return d;
 };
 const hourAligned = (d) => (d.getTime() + IST_OFFSET_MS) % 3600000 === 0;
+
+// Whole rupees per hour, 0 = no bid. Only biddable placements accept a bid > 0, capped at bid_max.
+function normBid(placement, raw) {
+    const n = Math.floor(Number(raw) || 0);
+    if (n <= 0) return 0;
+    if (!placement.biddable) throw new AdError(400, RPC_ERRORS.INVALID_BID[1], "INVALID_BID");
+    const max = Number(placement.bid_max) || 1000;
+    if (n > max) throw new AdError(400, `The highest priority bid is ${inr(max)} per hour.`, "INVALID_BID");
+    return n;
+}
+
+// Adds the camelCase fields the seller screen reads, next to the raw columns.
+const withBidFields = (p) => ({
+    ...p,
+    biddable: !!p.biddable,
+    bidStep: Number(p.bid_step) || 5,
+    bidMax: Number(p.bid_max) || 1000,
+    unlimited: !!p.unlimited,
+});
 
 /* ------------------------------------------------------------------ catalogue */
 
@@ -66,7 +99,7 @@ export async function listPlacements({ includeInactive = false } = {}) {
     if (!includeInactive) q = q.eq("is_active", true);
     const { data, error } = await q;
     if (error) rpcFail(error, "listPlacements");
-    return data || [];
+    return (data || []).map(withBidFields);
 }
 
 async function placementByKey(key) {
@@ -97,12 +130,25 @@ async function walletBalance(sellerId) {
     return Number(data?.balance_due) || 0;
 }
 
-export async function quote({ sellerId, key, start, hours }) {
+// `bid` = extra rupees per hour (0 = none). The returned total already includes the bid and its GST.
+export async function quote({ sellerId, key, start, hours, bid = 0 }) {
     const p = await placementByKey(key);
     const s = isoOrThrow(start);
     const n = Number(hours);
     if (!Number.isInteger(n)) throw new AdError(400, "Invalid duration.", "INVALID_DURATION");
-    const { data, error } = await supabase.rpc("ad_quote", { p_placement: p.id, p_start: s.toISOString(), p_hours: n });
+    const b = normBid(p, bid);
+
+    const args = { p_placement: p.id, p_start: s.toISOString(), p_hours: n };
+    let res = null;
+    if (p.biddable) {
+        res = await supabase.rpc("ad_quote_bid", { ...args, p_bid: b });
+        if (res.error && isMissingFn(res.error)) {
+            if (b > 0) throw new AdError(503, RPC_ERRORS.BID_UNAVAILABLE[1], "BID_UNAVAILABLE");
+            res = null; // bid SQL not installed and no bid asked: price it the old way
+        }
+    }
+    if (!res) res = await supabase.rpc("ad_quote", args);
+    const { data, error } = res;
     if (error) rpcFail(error, "quote");
 
     const out = { ...data, placement: { key: p.key, name: p.name, kind: p.kind } };
@@ -161,7 +207,8 @@ function broadcast() {
     try { getIO().emit("ads:changed", { t: Date.now() }); } catch { /* sockets optional */ }
 }
 
-export async function book({ sellerId, userId, key, start, hours, expectedTotal, creativeInput, idempotencyKey }) {
+// `bidPerHour` = extra rupees per hour; `expectedTotal` is the bid-inclusive total the seller confirmed.
+export async function book({ sellerId, userId, key, start, hours, expectedTotal, creativeInput, idempotencyKey, bidPerHour = 0 }) {
     if (!/^[\w-]{8,80}$/.test(String(idempotencyKey || ""))) throw new AdError(400, "Missing request id. Please try again.", "BAD_REQUEST");
     const total = Number(expectedTotal);
     if (!Number.isFinite(total) || total < 0) throw new AdError(400, "Missing the price you confirmed.", "BAD_REQUEST");
@@ -171,16 +218,23 @@ export async function book({ sellerId, userId, key, start, hours, expectedTotal,
     if (!hourAligned(s)) throw new AdError(400, RPC_ERRORS.INVALID_START[1], "INVALID_START");
     const n = Number(hours);
     if (!Number.isInteger(n)) throw new AdError(400, "Invalid duration.", "INVALID_DURATION");
+    const bid = normBid(p, bidPerHour);
 
     const creative = await buildCreative({ placement: p, sellerId, input: creativeInput });
 
-    const { data, error } = await supabase.rpc("ad_book_slot", {
+    const args = {
         p_seller: sellerId, p_placement: p.id, p_start: s.toISOString(), p_hours: n,
         p_expected_total: total, p_creative: creative, p_idem: idempotencyKey,
-    });
+    };
+    // No bid: the original, unchanged booking function. A bid: the bid-aware one (never silently dropped).
+    const { data, error } = bid > 0
+        ? await supabase.rpc("ad_book_slot_bid", { ...args, p_bid: bid })
+        : await supabase.rpc("ad_book_slot", args);
+
     if (error) {
+        if (bid > 0 && isMissingFn(error)) throw new AdError(503, RPC_ERRORS.BID_UNAVAILABLE[1], "BID_UNAVAILABLE");
         if (String(error.message || "").startsWith("PRICE_CHANGED")) {
-            const fresh = await quote({ sellerId, key, start, hours: n }).catch(() => null);
+            const fresh = await quote({ sellerId, key, start, hours: n, bid }).catch(() => null);
             try { rpcFail(error, "book"); } catch (e) { if (e instanceof AdError) e.details = { ...e.details, quote: fresh }; throw e; }
         }
         rpcFail(error, "book");
@@ -200,7 +254,7 @@ export async function book({ sellerId, userId, key, start, hours, expectedTotal,
 
 export async function listMyBookings(sellerId) {
     const { data, error } = await supabase.from("ad_bookings")
-        .select("id, lane, starts_at, ends_at, status, subtotal, gst_amount, amount, refund_amount, removed_reason, removed_at, creative, created_at, placement:ad_placements(key, name, kind)")
+        .select("id, lane, starts_at, ends_at, status, subtotal, gst_amount, amount, refund_amount, bid_per_hour, removed_reason, removed_at, creative, created_at, placement:ad_placements(key, name, kind)")
         .eq("seller_id", sellerId).order("starts_at", { ascending: false }).limit(200);
     if (error) rpcFail(error, "listMyBookings");
     return data || [];
@@ -228,19 +282,24 @@ export async function adminUpdatePlacement(id, body, adminId) {
     if (body.baseRatePerHour !== undefined) patch.base_rate_per_hour = num(body.baseRatePerHour, 0, 1e6, "base rate");
     if (body.minMultiplier !== undefined) patch.min_multiplier = num(body.minMultiplier, 0.1, 50, "minimum multiplier");
     if (body.maxMultiplier !== undefined) patch.max_multiplier = num(body.maxMultiplier, 0.1, 50, "maximum multiplier");
-    if (body.lanes !== undefined) patch.lanes = Math.trunc(num(body.lanes, 1, 20, "lanes"));
+    if (body.lanes !== undefined) patch.lanes = Math.trunc(num(body.lanes, 1, 500, "lanes")); // open (bidding) shelves need many lanes
     if (body.minHours !== undefined) patch.min_hours = Math.trunc(num(body.minHours, 1, 720, "minimum hours"));
     if (body.maxHours !== undefined) patch.max_hours = Math.trunc(num(body.maxHours, 1, 720, "maximum hours"));
     if (body.maxDaysAhead !== undefined) patch.max_days_ahead = Math.trunc(num(body.maxDaysAhead, 1, 365, "days ahead"));
     if (body.isActive !== undefined) patch.is_active = !!body.isActive;
+    // priority bidding (the DB refuses biddable = true until ad_book_slot_bid exists)
+    if (body.biddable !== undefined) patch.biddable = !!body.biddable;
+    if (body.bidStep !== undefined) patch.bid_step = Math.trunc(num(body.bidStep, 1, 10000, "bid step"));
+    if (body.unlimited !== undefined) patch.unlimited = !!body.unlimited;
+    if (body.bidMax !== undefined) patch.bid_max = Math.trunc(num(body.bidMax, 0, 100000, "bid maximum"));
     const { data, error } = await supabase.from("ad_placements").update(patch).eq("id", id).select().maybeSingle();
     if (error) {
-        if (error.code === "23514") throw new AdError(400, "Those values aren't allowed (check min/max multipliers and hours).", "BAD_REQUEST");
+        if (error.code === "23514") throw new AdError(400, "Those values aren't allowed (check min/max multipliers, hours and bid limits).", "BAD_REQUEST");
         rpcFail(error, "adminUpdatePlacement");
     }
     if (!data) throw new AdError(404, "Placement not found.", "NOT_FOUND");
     broadcast();
-    return data;
+    return withBidFields(data);
 }
 
 export async function adminUpdateSettings(body, adminId) {
@@ -297,7 +356,7 @@ export async function adminPricing({ placementId, day }) {
 
 export async function adminListBookings({ status, placementId, sellerId, liveOnly, limit = 100, offset = 0 }) {
     let q = supabase.from("ad_bookings")
-        .select("id, lane, starts_at, ends_at, status, subtotal, gst_amount, amount, refund_amount, price_breakdown, creative, removed_reason, removed_at, created_at, placement:ad_placements(id, key, name, kind), seller:seller_profiles(id, display_name, shop_slug)", { count: "exact" })
+        .select("id, lane, starts_at, ends_at, status, subtotal, gst_amount, amount, refund_amount, bid_per_hour, price_breakdown, creative, removed_reason, removed_at, created_at, placement:ad_placements(id, key, name, kind), seller:seller_profiles(id, display_name, shop_slug)", { count: "exact" })
         .order("starts_at", { ascending: false }).range(offset, offset + Math.min(limit, 200) - 1);
     if (status === "active" || status === "removed") q = q.eq("status", status);
     if (UUID_RE.test(placementId || "")) q = q.eq("placement_id", placementId);
