@@ -8,6 +8,7 @@ import {
 } from "../controllers/adminSellerListings.controller.js";
 import { setListingImages, setStagedImages, setDraftImages } from "../controllers/adminListingImages.controller.js";
 import { deleteDraftsBulk, deleteStagedBulk, softDeleteListings, setStagedMapping } from "../controllers/adminListingBulk.controller.js";
+import { renewListingsBulk } from "../controllers/adminListingRenew.controller.js";
 
 const router = express.Router();
 router.use(requireAuth, requireAdmin);
@@ -33,5 +34,6 @@ router.delete("/drafts/:id", deleteDraft);
 
 router.post("/listings/images", setListingImages);
 router.post("/listings/delete", softDeleteListings);
+router.post("/listings/renew", renewListingsBulk);
 
 export default router;
