@@ -264,6 +264,74 @@ export async function unfollowBrandItem(req, res) {
     return res.json({ success: true, following: false });
 }
 
+// ── Pinned-only feed ─────────────────────────────────────────────────────────
+// Pins are a small per-user list, so we read the buyer's pins (newest first),
+// pull the matching feed rows from the same RPC (so prices / visibility / wallet
+// rules are identical to Home), order them by pin date, then paginate ourselves.
+const PINNED_CAP = 300;
+const PINNED_CHUNK = 100;
+
+async function getPinnedFeed(req, res, { categoryId, q, sort, destPincode, destState, limit, offset }) {
+    const userId = req.user.id;
+
+    let pins = await supabaseAdmin
+        .from("buyer_followed_items")
+        .select("brand_item_id, created_at")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false })
+        .limit(PINNED_CAP);
+    if (pins.error?.code === "42703") {
+        // created_at column not added yet: still works, order is just arbitrary.
+        pins = await supabaseAdmin.from("buyer_followed_items").select("brand_item_id").eq("user_id", userId).limit(PINNED_CAP);
+    }
+    if (pins.error) {
+        console.error("[catalog] getPinnedFeed pins failed:", pins.error.message);
+        return res.status(500).json({ success: false, message: "Couldn't load your pinned products." });
+    }
+
+    const pinnedAt = new Map(
+        (pins.data || []).map((r, i) => [String(r.brand_item_id), r.created_at ? Date.parse(r.created_at) : -i])
+    );
+    res.set("Cache-Control", "private, no-store");
+    if (!pinnedAt.size) return res.json({ success: true, items: [], total: 0, hasMore: false });
+
+    // The RPC may clamp its page size, so read in chunks until everything is in.
+    const byId = new Map();
+    for (let o = 0, guard = 0; guard < 6 && byId.size < PINNED_CAP; guard++) {
+        const { data, error } = await supabaseAdmin.rpc("catalog_browse_feed", {
+            p_subcategory_id: uuidOrNull(req.query.subcategoryId),
+            p_category_id: categoryId || null,
+            p_q: q,
+            p_sort: sort,
+            p_limit: PINNED_CHUNK,
+            p_offset: o,
+            p_seller_id: req.sellerProfileId || null,
+            p_buyer_id: userId,
+            p_followed_only: true,
+            p_shop_slug: null,
+            p_dest_pincode: destPincode || null,
+            p_dest_state: destState || null,
+            p_group_threshold: 0,
+            p_generic_product_id: null,
+        });
+        if (error) {
+            console.error("[catalog] getPinnedFeed rpc failed:", error.message);
+            return res.status(500).json({ success: false, message: "Couldn't load your pinned products." });
+        }
+        const got = data?.items || [];
+        got.forEach((it) => { if (it.row_type !== "group") byId.set(String(it.id), it); });
+        if (!data?.hasMore || !got.length) break;
+        o += got.length;
+    }
+
+    const rows = [...byId.values()].sort(
+        (a, b) => (pinnedAt.get(String(b.id)) ?? 0) - (pinnedAt.get(String(a.id)) ?? 0)
+    );
+    const page = rows.slice(offset, offset + limit);
+    const items = await attachPriceTrends({ buyerId: userId, scope: "", items: page });
+    return res.json({ success: true, items, total: rows.length, hasMore: offset + limit < rows.length });
+}
+
 // GET /api/catalog/brand-items-feed?categoryId=&q=&sort=&limit=&offset=
 // Home feed, one level flatter than getGenericProductsFeed — returns
 // hs_generic_product_brands rows directly (same shape as
@@ -284,6 +352,9 @@ export async function getBrandItemsFeed(req, res) {
 
     if (followedOnly && !req.user?.id) {
         return res.status(401).json({ success: false, message: "Login required." });
+    }
+    if (followedOnly) {
+        return getPinnedFeed(req, res, { categoryId, q, sort, destPincode, destState, limit, offset });
     }
 
     const groupRaw = String(req.query.group || "").trim();
